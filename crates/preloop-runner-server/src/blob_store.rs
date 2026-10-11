@@ -56,11 +56,13 @@ pub fn is_valid_blob_token(token: &str) -> bool {
 /// Verify a `/twirp-blob` path token as a server-signed blob JWT.
 ///
 /// Blob tokens are `local_jwt`s minted at signed-URL creation: `sub` is
-/// `preloop-blob`, `kind` pins the blob kind, `job` records the owning job
-/// ("" for system-minted URLs), and `jti` is the on-disk staging directory
-/// name. Verification is stateless — signature + `exp` — so a minted URL
-/// survives an engine restart, unlike the pending-registration maps (which
-/// remain for reservation bookkeeping, not credential validity).
+/// `preloop-blob`, `kind` pins the blob kind, `op` pins the exact operation
+/// (`read` for download URLs, `write` for upload URLs), `job` records the
+/// owning job (the `system` owner for system-minted URLs — never empty), and
+/// `jti` is the on-disk staging directory name. Verification is stateless —
+/// signature + `exp` — so a minted URL survives an engine restart, unlike
+/// the pending-registration maps (which remain for reservation bookkeeping,
+/// not credential validity).
 ///
 /// Returns the decoded claims, or `None` when the token is not a valid blob
 /// JWT for `kind`.
@@ -83,10 +85,95 @@ pub fn blob_token_jti(claims: &serde_json::Value) -> Option<String> {
     is_valid_blob_token(jti).then(|| jti.to_owned())
 }
 
-/// The `job` claim of a verified blob JWT: `Some("")` for system-minted
-/// tokens, `Some(job_uuid)` for job-owned ones, `None` when absent.
+/// The `job` claim of a verified blob JWT: `Some("system")` for
+/// system-minted (control-plane) tokens, `Some(job_uuid)` for job-owned
+/// ones, `None` when absent. The claim is never the empty string: empty
+/// owners used to skip the write-liveness gate, which is exactly what let a
+/// signed download URL be PUT to.
 pub fn blob_token_job(claims: &serde_json::Value) -> Option<&str> {
     claims.get("job").and_then(|v| v.as_str())
+}
+
+/// Decode a blob JWT's claims verifying the signature but NOT the expiry.
+///
+/// For the upload-URL refresh path: the presented token is expected to be
+/// expired (that is why the caller is refreshing), but it must still be a
+/// server-minted blob JWT — signature, `sub`, and `kind` are all verified.
+/// The returned claims are an identifier for a pending upload session, not
+/// an authorization grant: refresh callers re-verify pending membership,
+/// job ownership, and liveness independently.
+pub fn decode_blob_token_claims_unchecked_exp(
+    state: &AppState,
+    kind: &str,
+    token: &str,
+) -> Option<serde_json::Value> {
+    let claims = state.verify_local_jwt_claims_unchecked_exp(token)?;
+    if claims.get("sub").and_then(|v| v.as_str()) != Some("preloop-blob") {
+        return None;
+    }
+    if claims.get("kind").and_then(|v| v.as_str()) != Some(kind) {
+        return None;
+    }
+    Some(claims)
+}
+
+/// Mint a fresh upload (write-op) blob JWT for a pending upload session.
+///
+/// Uses the exact claims shape and TTL the create endpoints mint with
+/// (`blob_jwt_claims` + `SIGNED_BLOB_URL_TTL`), so a refreshed URL carries
+/// the same 20-minute bound, write-only op, and job binding as the
+/// original. The `jti` names the existing on-disk staging directory —
+/// refresh never creates a new session, it only re-credentials the live one.
+pub fn mint_upload_blob_token(
+    state: &AppState,
+    kind: &str,
+    job_owner: &str,
+    jti: &str,
+) -> Result<String, ApiError> {
+    state.local_jwt_with_lifetime(
+        blob_jwt_claims(kind, BLOB_OP_WRITE, job_owner, jti),
+        crate::memory_caps::SIGNED_BLOB_URL_TTL,
+    )
+}
+
+/// The exact operation a blob JWT authorizes: `"write"` for upload URLs
+/// (PUT), `"read"` for download URLs (GET). Serve-time enforcement binds the
+/// HTTP method to this claim — cross-operation use is 403 (round-3
+/// finding 3: a signed *download* URL used to accept PUTs and overwrite the
+/// finalized blob).
+pub const BLOB_OP_READ: &str = "read";
+pub const BLOB_OP_WRITE: &str = "write";
+
+/// Owner recorded for system-minted (control-plane) blob URLs. Never the
+/// empty string — see [`blob_token_job`].
+pub const BLOB_SYSTEM_OWNER: &str = "system";
+
+/// The `op` claim of a verified blob JWT: `Some("read" | "write")`, `None`
+/// when absent (legacy tokens minted before op binding, always rejected at
+/// serve time).
+pub fn blob_token_op(claims: &serde_json::Value) -> Option<&str> {
+    claims.get("op").and_then(|v| v.as_str())
+}
+
+/// Build the claim object for a minted blob JWT: `sub: preloop-blob`,
+/// `kind`, `op` (read/write), `job` (never empty — `system` when no job
+/// identity mints it), and `jti` naming the on-disk staging directory.
+/// Extra claims (e.g. cache `key`/`version`) can be merged into the result.
+pub fn blob_jwt_claims(kind: &str, op: &str, job: &str, jti: &str) -> serde_json::Value {
+    serde_json::json!({
+        "sub": "preloop-blob",
+        "kind": kind,
+        "op": op,
+        "job": job,
+        "jti": jti,
+    })
+}
+
+/// The owner string to mint for a blob URL: the job's backend id when a job
+/// identity mints it, [`BLOB_SYSTEM_OWNER`] for the engine/control plane.
+pub fn blob_owner_for_job(job: Option<impl ToString>) -> String {
+    job.map(|j| j.to_string())
+        .unwrap_or_else(|| BLOB_SYSTEM_OWNER.to_owned())
 }
 
 /// Parse and validate a raw `/twirp-blob/{kind}/{token}` request path.
@@ -198,6 +285,18 @@ pub async fn blob_put(
         warn!(kind, "rejected blob PUT with malformed jti");
         return StatusCode::BAD_REQUEST;
     };
+    // Operation binding (round-3 finding 3): this endpoint only serves
+    // uploads. A download (`read`) URL presented here is rejected even
+    // though the middleware gate enforces the same rule first.
+    if blob_token_op(&claims) != Some(BLOB_OP_WRITE)
+        || blob_token_job(&claims).is_none_or(str::is_empty)
+    {
+        warn!(
+            kind,
+            "rejected blob PUT with wrong operation or empty owner"
+        );
+        return StatusCode::FORBIDDEN;
+    }
     // If a bearer is present and verifies as a job identity, require
     // the job to be live. Bearerless PUTs (Azure SDK compat) cannot be
     // attributed; their liveness is enforced at URL-mint time.
@@ -486,6 +585,18 @@ pub async fn blob_get(
         warn!(kind, "rejected blob GET with invalid kind/token");
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // Operation binding (round-3 finding 3): this endpoint only serves
+    // downloads. An upload (`write`) URL presented here is rejected even
+    // though the middleware gate enforces the same rule first.
+    if blob_token_op(&claims) != Some(BLOB_OP_READ)
+        || blob_token_job(&claims).is_none_or(str::is_empty)
+    {
+        warn!(
+            kind,
+            "rejected blob GET with wrong operation or empty owner"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     if kind == "cache" {
         // Download tokens carry (key, version) in their claims — resolution
