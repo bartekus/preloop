@@ -686,6 +686,15 @@ Releases before v0.27.0 predate the changelog.
   Legs of one matrix share that `job_order`, so among themselves they fall
   back to `job_id`.
 
+- **Fresh pull-request merge resolution**: Webhook-delivered `pull_request` and
+  `pull_request_review` runs accept GitHub's live test merge only when its first
+  parent matches the base SHA observed in the same API response and its second
+  parent matches the webhook payload head. Otherwise GitHub is polled within
+  the existing budget, then the engine builds a merge of the target branch's
+  current tip fetched at fallback time and the pinned payload head. Runs never
+  fall back to the bare pull-request head. The base is not guaranteed to remain
+  latest at job execution; base advancement does not automatically rerun jobs.
+  Conflicted pull requests do not start `pull_request` runs.
 - **A new store no longer replays three days of webhook history**: the
   delivery watchdog treated every delivery in GitHub's history as a phantom
   ack when the store had no watchdog cursor, and asked GitHub to redeliver
