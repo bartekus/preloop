@@ -12,11 +12,3 @@ rules:
   unpinned-images:
     ignore:
       - release.yml
-  # decilabel.yml labels issues and fork pull requests, which needs the
-  # pull_request_target trigger (a plain pull_request run gets a read-only
-  # token on forks). It has no checkout step, so it never executes PR code, and
-  # the action is pinned to a commit SHA. It still passes TYPESAFE_API_KEY to
-  # that third-party action, so keep it in dry-run mode until that is reviewed.
-  dangerous-triggers:
-    ignore:
-      - decilabel.yml
