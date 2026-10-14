@@ -616,6 +616,12 @@ Releases before v0.27.0 predate the changelog.
   A present unknown tier also fails closed; a missing tier remains the
   trusted-native case.
 
+- Job runtime tokens remain valid for the effective job timeout plus pause allowance and slack, capped at GitHub's five-day self-hosted maximum.
+
+- The server applies the same timeout cap to the runner message, token lifetime, and reaper deadline.
+
+- Settled attempts cannot use job tokens to write Results, cache/artifact, snapshot, timeline/log, or live-log data, or mint OIDC credentials. Retained-data reads and completion reporting remain available; retries use fresh attempt credentials.
+
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
   control bridge), which a container's network namespace resolves to the
