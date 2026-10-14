@@ -248,6 +248,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-24.04"
+    # Every publish job below needs this one, so a required reviewer on the
+    # `release` environment holds the whole release (GitHub Release, npm,
+    # Homebrew) until someone approves the run after checking CI is green.
+    environment: release
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     permissions:
