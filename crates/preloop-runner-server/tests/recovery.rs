@@ -2541,7 +2541,7 @@ async fn live_log_websocket_rejects_a_settled_jobs_credential() {
     });
     futures::SinkExt::send(
         &mut ws,
-        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string().into()),
     )
     .await
     .unwrap();
