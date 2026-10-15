@@ -1536,6 +1536,12 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     cmd.arg("engine");
     cmd.env("PRELOOP_SYSTEM_TOKEN", token);
     cmd.env("PRELOOP_HOME", &preloop_dir);
+    // Lets the engine record in serve.lock that a preloop command started it,
+    // so a second `preloop serve` names the right way to stop it.
+    cmd.env(
+        preloop_runner_server::bootstrap::ENGINE_ORIGIN_ENV,
+        preloop_runner_server::bootstrap::EngineOrigin::Background.as_str(),
+    );
     if std::env::var_os("RUST_LOG").is_none() {
         cmd.env("RUST_LOG", "info,preloop=debug");
     }

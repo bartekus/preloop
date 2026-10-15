@@ -620,6 +620,25 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
 | `failed to publish workspace snapshot repository` with `EXDEV` | The state directory spans more than one filesystem (a bind mount inside it) — put `$PRELOOP_HOME` on a single device |
 
+#### Another engine is already running
+
+Only one engine serves a state directory. A second `preloop serve` on the same
+`$PRELOOP_HOME` exits at once and names the engine holding `state/serve.lock`,
+with its pid and the way to stop it:
+
+- **Started by a preloop command** (the autostart of `preloop status` and other
+  client commands): `kill <pid>` stops it, and then `preloop serve` can run in
+  this terminal.
+- **A systemd service**: stop both units. Stopping only `preloop.service` is not
+  enough, because `preloop.socket` starts it again on the next connection:
+  `sudo systemctl stop preloop.socket preloop.service`. Per-user installs use the
+  same commands with `systemctl --user` and no `sudo`.
+- **Running in another terminal**: stop it there with Ctrl-C, or `kill <pid>`.
+
+When the message says the holder left no usable record, the holder is an older
+build or the record is damaged. Find the process holding the lock: on Linux,
+`lslocks | grep serve.lock`; on macOS, `lsof <state dir>/serve.lock`.
+
 ---
 
 ## 8. GitHub admin controls (codified policy)

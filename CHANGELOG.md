@@ -29,6 +29,14 @@ Releases before v0.27.0 predate the changelog.
   and headless setups stored secrets inline in `config.toml`. Setup also loads
   the config before creating the App, so a config error cannot strand the key.
 
+- **`preloop serve` names the engine holding `serve.lock` and how to stop it.**
+  A second engine on the same state directory now reports the holder's pid,
+  when it started, how it was started (a preloop command's autostart, a systemd
+  service, or another terminal), and the command that stops it. For systemd that
+  is `sudo systemctl stop preloop.socket preloop.service`, since the socket unit
+  would otherwise start the service again. A holder that left no readable record
+  gets the `lslocks` / `lsof` hint instead.
+
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
   Results job runtime token, bind that token to the requested plan/job, and
