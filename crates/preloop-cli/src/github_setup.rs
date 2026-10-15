@@ -502,27 +502,30 @@ async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
     // its one-time private key must have somewhere to land once it exists.
     let preflight = load_config()?;
     CredentialWriter::for_home(&preloop_home(), preflight.credential_store.as_deref())?;
-    let registration = crate::app_manifest::register(
+    let (registration, path) = crate::app_manifest::register_with_persist(
         &args.app_name,
         args.org.as_deref(),
         args.port,
         args.public_url.as_deref(),
         !args.no_browser,
+        |credentials| {
+            let app_id = credentials.id.to_string();
+            save_app_credentials(
+                &app_id,
+                &credentials.pem,
+                credentials.webhook_secret.clone(),
+            )
+            .with_context(|| {
+                format!(
+                    "GitHub created App {app_id}, but its credentials could not be saved; \
+                     regenerate a private key under the App's settings to recover one"
+                )
+            })
+        },
     )
     .await?;
     let credentials = &registration.credentials;
     let app_id = credentials.id.to_string();
-    let path = save_app_credentials(
-        &app_id,
-        &credentials.pem,
-        credentials.webhook_secret.clone(),
-    )
-    .with_context(|| {
-        format!(
-            "GitHub created App {app_id}, but its credentials could not be saved; \
-                 regenerate a private key under the App's settings to recover one"
-        )
-    })?;
     println!("Created App {app_id} and wrote {}", path.display());
     if credentials.webhook_secret.is_some() {
         println!("Webhook secret stored — signed deliveries will verify.");
