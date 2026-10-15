@@ -387,7 +387,7 @@ pub(crate) fn api_token() -> Option<String> {
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-            preloop_runner_server::credential_store::load_engine_token_from_env(&preloop_home())
+            preloop_runner_server::credential_store::load_engine_token(&preloop_home())
                 .ok()
                 .flatten()
         })
@@ -401,7 +401,7 @@ pub(crate) fn api_token() -> Option<String> {
             if home == cwd_default {
                 return None;
             }
-            preloop_runner_server::credential_store::load_engine_token_from_env(&cwd_default)
+            preloop_runner_server::credential_store::load_engine_token(&cwd_default)
                 .ok()
                 .flatten()
         })
@@ -1523,7 +1523,7 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
         );
     }
 
-    let store = preloop_runner_server::credential_store::store_from_env(&preloop_dir);
+    let store = preloop_runner_server::credential_store::engine_store(&preloop_dir)?;
     let token = prepare_engine_token(
         &preloop_dir,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
@@ -1629,7 +1629,7 @@ fn prepare_engine_token(
     )
 }
 
-/// Move any inline GitHub credential in `config` into the OS credential
+/// Move any inline GitHub credential in `config` into the selected credential
 /// store, returning whether anything moved.
 ///
 /// Only the `legacy_*` fields are inspected, and those are populated purely
@@ -1817,7 +1817,10 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
     let mut file_config = preloop_runner_server::config::load_config()?;
-    let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
+    let store = preloop_runner_server::credential_store::selected_store(
+        &preloop_home(),
+        file_config.credential_store.as_deref(),
+    )?;
     // Read before migrating: migration moves the inline values out of
     // `config.github`, and the freshly stored ones are not re-resolved here.
     let from_file = github_auth::StoredAuth {
@@ -1828,9 +1831,7 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     };
     if migrate_legacy_github_credentials(&mut file_config, store.as_ref())? {
         preloop_runner_server::config::write_config(&file_config)?;
-        eprintln!(
-            "[preloop] migrated legacy GitHub credentials to the operating-system credential store"
-        );
+        eprintln!("[preloop] migrated legacy GitHub credentials to the credential store");
     }
     auth.fill_gaps(from_file);
 
@@ -1862,7 +1863,7 @@ async fn cmd_engine(
 
     // Keep AppState's resolver on the same engine home as this CLI.
     unsafe { std::env::set_var("PRELOOP_HOME", &home) };
-    let store = preloop_runner_server::credential_store::store_from_env(&home);
+    let store = preloop_runner_server::credential_store::engine_store(&home)?;
     let token = prepare_engine_token(
         &home,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),

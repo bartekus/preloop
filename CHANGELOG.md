@@ -8,7 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Changed
+
+- **The file credential store is the default.** The engine token, GitHub App
+  private key, PAT, and webhook secrets are written to `0600` files under
+  `$PRELOOP_HOME/credentials` instead of the OS keychain. Select the keychain
+  with `credential_store = "os"` in `config.toml` or `PRELOOP_CREDENTIAL_STORE=os`.
+  The environment variable overrides the config key, and an unknown value in
+  either is an error that names the valid choices. Credentials an earlier build
+  kept in the keychain are copied into the file store the first time they are
+  read; the keychain entry is left in place.
+
 ### Fixed
+
+- **A GitHub App's private key survives an OS keychain failure.** With
+  `credential_store = "os"`, an unavailable keychain or a refused write now
+  stores the credential in the file store, prints a warning naming the
+  directory, and records `credential_store = "file"` in `config.toml`. Before,
+  `preloop setup github` aborted after GitHub had issued the one-time App key,
+  and headless setups stored secrets inline in `config.toml`. Setup also loads
+  the config before creating the App, so a config error cannot strand the key.
 
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
