@@ -997,11 +997,16 @@ pub fn selected_store(
     })
 }
 
-/// [`selected_store`] for the engine whose config is the active config file
-/// (`config_path()`). Callers that already hold a parsed config pass its
-/// `credential_store` to [`selected_store`] directly.
+/// [`selected_store`] for the engine whose config is active. An explicit
+/// `PRELOOP_CONFIG` wins; otherwise the config is next to `state_dir`, so a
+/// custom `PRELOOP_HOME` does not accidentally read `$HOME/.preloop/config.toml`.
+/// Callers that already hold a parsed config pass its `credential_store` to
+/// [`selected_store`] directly.
 pub fn engine_store(state_dir: &Path) -> Result<Arc<dyn CredentialStore>> {
-    let configured = crate::config::credential_store_setting(&crate::config::config_path())?;
+    let config_path = std::env::var_os(crate::config::CONFIG_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("config.toml"));
+    let configured = crate::config::credential_store_setting(&config_path)?;
     selected_store(state_dir, configured.as_deref())
 }
 

@@ -28,6 +28,9 @@ Releases before v0.27.0 predate the changelog.
   `preloop setup github` aborted after GitHub had issued the one-time App key,
   and headless setups stored secrets inline in `config.toml`. Setup also loads
   the config before creating the App, so a config error cannot strand the key.
+  The manifest flow also persists converted credentials before waiting for the
+  optional installation redirect, so an install timeout or Ctrl-C cannot lose
+  the one-time PEM.
 
 - **`preloop serve` names the engine holding `serve.lock` and how to stop it.**
   A second engine on the same state directory now reports the holder's pid,
