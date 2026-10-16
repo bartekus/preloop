@@ -6053,7 +6053,15 @@ mod tests {
         // newer head and offers no merge this payload could use.
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let polls_for_stub = polls.clone();
+        let head_for_stub = head.clone();
         let (api, requests) = start_github_stub(move |_method, path, _body| {
+            if path == format!("/repos/owner/repo/commits/{head_for_stub}") {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({"commit": {"message": "regular change"}}),
+                );
+            }
             if path == "/repos/owner/repo/pulls/42" {
                 polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return (
@@ -6115,12 +6123,16 @@ mod tests {
             polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
             "a head the API never offers a merge for is polled through the budget, not decided on first sight"
         );
-        assert!(
-            !requests
-                .lock()
-                .iter()
-                .any(|(_, path, _)| path.contains("/commits/")),
-            "the API offers no merge of this head to verify"
+        let commit_paths: Vec<String> = requests
+            .lock()
+            .iter()
+            .filter(|(_, path, _)| path.contains("/commits/"))
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            commit_paths,
+            vec![format!("/repos/owner/repo/commits/{head}")],
+            "only the head commit is fetched for [skip ci] evaluation"
         );
     }
 
