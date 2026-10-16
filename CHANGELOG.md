@@ -80,6 +80,11 @@ Releases before v0.27.0 predate the changelog.
   `contains(github.event.pull_request.labels.*.name, 'x')` always evaluated
   false and label-gated workflows never saw their labels.
 
+- **Partial merged job logs no longer hide step logs**: a failed temporary
+  log-file flush no longer produces an apparently complete but truncated
+  merged upload, and the logs endpoint falls back to the larger per-step
+  representation when one exists. This preserves mutation and other
+  heavy-step output after guest temporary-storage pressure.
 
 ## [0.34.4] - 2026-10-13
 
