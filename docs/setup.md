@@ -12,9 +12,10 @@ standalone runner release artifacts target Linux and macOS, not native Windows.
 Inside WSL2, everything works like Linux:
 
 ```sh
-# Homebrew and npm install the same binaries (macOS and Linux/WSL2):
+# Homebrew, npm and mise install the same binaries (macOS and Linux/WSL2):
 brew install preloopdev/tap/preloop
 npm install -g @preloop-dev/cli
+mise use -g github:preloopdev/preloop
 
 # Or fetch the installer at a release tag, read it, then run it. It downloads
 # the release binaries and verifies the sha256 of each one.

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
+  the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
+  release digest and GitHub artifact attestation. Pin a release with
+  `mise use -g github:preloopdev/preloop@<version>`. See the
+  [Quick start](README.md#quick-start).
+
 ### Changed
 
 - **The file credential store is the default.** The engine token, GitHub App
