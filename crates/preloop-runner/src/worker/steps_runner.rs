@@ -35,6 +35,13 @@ pub struct Step {
     pub raw: serde_json::Value,
     /// Background steps run without DAP step-pauses, matching the official runner.
     pub is_background: bool,
+    /// For a generated post hook: the context names of the steps whose
+    /// execution registers it — the action's main step, and its generated
+    /// `Pre` step when the action declares `pre:`. The official runner
+    /// registers a post job step from `ActionRunner.RunAsync` for the Pre and
+    /// the Main stage, so the hook runs only once one of those steps entered
+    /// its action handler. Empty for every other step.
+    pub post_of: Vec<String>,
 }
 
 /// What kind of step this is.
@@ -77,6 +84,7 @@ struct BackgroundStepStart {
     queue: Arc<Mutex<ServerQueue>>,
     step_number: u32,
     display_name: String,
+    hooks: super::execution_context::HookRegistrations,
 }
 
 impl BackgroundStepCoordinator {
@@ -92,16 +100,7 @@ impl BackgroundStepCoordinator {
         let mut bg_job = job.clone();
         self.tasks.push(tokio::spawn(async move {
             let _permit = permit.acquire_owned().await.expect("background semaphore");
-            run_background_step(
-                start.step,
-                &mut bg_job,
-                &start.workspace,
-                start.cancel_rx,
-                start.queue,
-                start.step_number,
-                start.display_name,
-            )
-            .await
+            run_background_step(&mut bg_job, start).await
         }));
     }
 
@@ -186,6 +185,10 @@ pub async fn run_steps(
     let mut init_failed = false;
     let mut cancelled = false;
     let mut background = BackgroundStepCoordinator::new(10);
+    // Action steps that entered their handler, i.e. whose post hooks are
+    // registered. A generated post hook runs only if its action is in this set;
+    // the official runner registers post hooks while the action runs.
+    let hooks = super::execution_context::HookRegistrations::default();
     let now = crate::worker::helpers::iso_now();
 
     // Queue initial "Set up job" step as completed (number 1, official convention)
@@ -454,14 +457,23 @@ pub async fn run_steps(
         }
 
         // Evaluate the step condition. Official runner treats expression
-        // evaluation errors as step failures, not skips.
-        match should_run_step(step, job) {
+        // evaluation errors as step failures, not skips. A post hook whose
+        // action never registered it is skipped without evaluating its condition.
+        let orphaned_post_hook = post_hook_orphaned(step, &hooks);
+        let decision = if orphaned_post_hook {
+            Ok(false)
+        } else {
+            should_run_step(step, job)
+        };
+        match decision {
             Ok(true) => {}
             Ok(false) => {
-                info!(
-                    "Skipping step '{}' (condition not met)",
-                    resolved_display_name
-                );
+                let reason = if orphaned_post_hook {
+                    "its action step did not run"
+                } else {
+                    "condition not met"
+                };
+                info!("Skipping step '{}' ({reason})", resolved_display_name);
                 job.steps.insert(
                     step.context_name.clone(),
                     StepResult {
@@ -542,6 +554,7 @@ pub async fn run_steps(
                     queue: queue.clone(),
                     step_number,
                     display_name: resolved_display_name,
+                    hooks: hooks.clone(),
                 },
             );
             continue;
@@ -573,6 +586,9 @@ pub async fn run_steps(
             step.context_name.clone(),
             resolved_display_name.clone(),
         );
+        // An action step registers its post hook from its own handler, so the
+        // registration is visible to the hook step scheduled after it.
+        step_ctx.hooks = hooks.clone();
         // The official runner fails the step when a step-env expression
         // cannot be evaluated (AssertString throws; StepsRunner marks the
         // step failed). Never silently keep a literal `${{ }}` in the
@@ -1375,6 +1391,11 @@ pub async fn run_steps(
             // re-run. Restoring only the target snapshot leaves saveState and
             // annotations from later steps visible during their second pass.
             clear_replayed_step_state(step_ctx.job, &job_step_summaries, target, idx);
+            // A replayed step registers its post hook again only if it runs again,
+            // so its earlier registration is stale for the range about to re-run.
+            for replayed in &steps[target..=idx] {
+                hooks.unregister(&replayed.context_name);
+            }
             // Restore the snapshot captured before the *target* step, not
             // the current step. Without this, the target step's prior
             // GITHUB_ENV/GITHUB_PATH/state writes remain and are doubled.
@@ -1548,6 +1569,15 @@ fn clear_replayed_step_state(
     }
 }
 
+/// Whether `step` is a post hook that none of its action steps registered.
+fn post_hook_orphaned(step: &Step, hooks: &super::execution_context::HookRegistrations) -> bool {
+    !step.post_of.is_empty()
+        && !step
+            .post_of
+            .iter()
+            .any(|registration| hooks.is_registered(registration))
+}
+
 fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {
     use super::step_conditions::{contains_status_check_function, effective_condition};
 
@@ -1678,16 +1708,22 @@ async fn execute_step(
 }
 
 async fn run_background_step(
-    step: Step,
     job: &mut JobContext,
-    workspace: &str,
-    cancel_rx: watch::Receiver<bool>,
-    queue: Arc<Mutex<ServerQueue>>,
-    step_number: u32,
-    display_name: String,
+    start: BackgroundStepStart,
 ) -> BackgroundStepResult {
+    let BackgroundStepStart {
+        step,
+        workspace,
+        cancel_rx,
+        queue,
+        step_number,
+        display_name,
+        hooks,
+    } = start;
+    let workspace = workspace.as_str();
     let started_at = crate::worker::helpers::iso_now();
     let mut ctx = StepContext::new(job, step.context_name.clone(), display_name.clone());
+    ctx.hooks = hooks;
     {
         let expr_ctx = ctx.job.build_expression_context();
         for (key, value) in &step.env {

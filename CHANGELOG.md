@@ -172,6 +172,16 @@ Releases before v0.27.0 predate the changelog.
   representation when one exists. This preserves mutation and other
   heavy-step output after guest temporary-storage pressure.
 
+- **Post hooks of skipped actions no longer run**: a workflow step that did
+  not run, because its `if:` was false or an earlier step failed, no longer
+  runs its action's `post` hook. The official runner registers a post hook
+  while the action's handler runs — for the action's `Pre` step as well as its
+  main step — but the engine ran every post hook under its `always()` default,
+  so cleanup hooks of skipped steps ran for minutes and their failures were
+  recorded beside the real first failure. A post hook whose action never
+  reached its handler is now recorded as `skipped`; hooks of actions that ran,
+  and hooks whose action's `pre:` step ran, are unchanged.
+
 ## [0.34.4] - 2026-10-13
 
 ### Fixed
