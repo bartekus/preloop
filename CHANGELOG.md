@@ -16,6 +16,10 @@ Releases before v0.27.0 predate the changelog.
   `mise use -g github:preloopdev/preloop@<version>`. See the
   [Quick start](README.md#quick-start).
 
+- **Dev tools pinned in `mise.toml`.** `mise install` provides zig, cargo-zigbuild,
+  ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
+  cargo-zigbuild match `release-runner.yml`.
+
 ### Changed
 
 - **The file credential store is the default.** The engine token, GitHub App
