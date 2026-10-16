@@ -1350,7 +1350,6 @@ pub(crate) fn config_path_for_home() -> std::path::PathBuf {
 mod tests {
     use super::*;
     use preloop_runner_server::credential_store::CREDENTIAL_STORE_ENV;
-    static SETUP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn checklist_union_of_workflow_permissions() {
         let dir = tempfile::tempdir().unwrap();
@@ -1469,9 +1468,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn app_key_survives_an_os_store_write_failure() {
-        let _env_guard = SETUP_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         use preloop_runner_server::credential_store::{CREDENTIAL_STORE_ENV, FileCredentialStore};
 
         let home = tempfile::tempdir().unwrap();
@@ -1526,17 +1523,15 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn setup_round_trips_app_and_pat_beside_external_config() {
-        let _env_guard = SETUP_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         let config_root = tempfile::tempdir().unwrap();
         let config_path = config_root.path().join("config.toml");
         let previous_config = std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV);
         let previous_home = std::env::var_os("PRELOOP_HOME");
         let previous_store = std::env::var_os(CREDENTIAL_STORE_ENV);
-        // SAFETY: this test serializes process-global env access with
-        // SETUP_ENV_LOCK and restores each value below.
+        // SAFETY: TEST_ENV_LOCK serializes this process-global env access
+        // across tests; each value is restored below.
         unsafe {
             std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, &config_path);
             std::env::set_var("PRELOOP_HOME", home.path());

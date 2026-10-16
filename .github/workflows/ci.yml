@@ -107,6 +107,12 @@ jobs:
       CARGO_BUILD_JOBS: "4"
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "6"
+      # Test tempdirs must land in `runner.temp`, not the system temp dir:
+      # `runner.temp` is disk-backed and cleared between jobs, while the
+      # guest's system temp is small and a shard's parallel tests fill it.
+      # A full temp surfaces as SQLite "disk I/O error" in a random fixture
+      # mid-shard, which is indistinguishable from a real failure in the log.
+      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -241,6 +247,8 @@ jobs:
           else
             echo "no shard log captured at $log"
           fi
+          echo "--- guest disk (temp full? look for a small/100% tmpfs) ---"
+          df -h 2>/dev/null | head -8 || true
           echo "--- guest kernel (OOM?) ---"
           sudo dmesg 2>/dev/null | tail -15 || echo "(no dmesg)"
           echo "--- guest memory ---"

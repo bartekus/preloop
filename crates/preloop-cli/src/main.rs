@@ -634,6 +634,16 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
 #[cfg(test)]
 pub(crate) static SMOLVM_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serializes every test that reads or writes process-global environment
+/// variables (`PRELOOP_HOME`, `PRELOOP_CONFIG`, `PRELOOP_CREDENTIAL_STORE`,
+/// `PRELOOP_TOKEN`, `HOME`, …). Process env is per-process state, so parallel
+/// test threads would otherwise race each other's `set_var`/`remove_var`
+/// pairs and observe each other's transient values across modules. Sync
+/// tests take it with [`tokio::sync::Mutex::blocking_lock`]; async tests with
+/// `lock().await`.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A fake `smolvm` on PATH that records the sandbox environment it was given
 /// and answers the debug-session byte-count probe. Serialized with
 /// [`SMOLVM_PATH_LOCK`]: `PATH` is process-global and the debug-session and
@@ -5791,12 +5801,8 @@ mod tests {
         // reason is the server error, inside the backoff window.
     }
 
-    /// Serializes tests that mutate process-global env vars read by
-    /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
-    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_CPUS`,
-    /// `PRELOOP_RUNNER_STORAGE_GB`): parallel test threads would otherwise
-    /// race each other's set_var/remove_var pairs.
-    static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Env-var serialization for these tests lives in the crate-wide
+    // [`crate::TEST_ENV_LOCK`].
 
     mod github_credential_migration {
         use super::super::migrate_legacy_github_credentials;
@@ -6099,7 +6105,7 @@ mod tests {
 
     #[test]
     fn runner_cpus_honors_positive_values_and_rejects_invalid_values() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("1", 1),
             (" 8 ", 8),
@@ -6121,7 +6127,7 @@ mod tests {
 
     #[test]
     fn runner_storage_gib_ignores_invalid_or_zero_values() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("80", 80),
             (" 96 ", 96),
@@ -6213,7 +6219,7 @@ mod tests {
     /// `PRELOOP_RUNNER_BASE_IMAGE` still overrides it.
     #[test]
     fn the_pool_reads_the_golden_init_recorded() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let mut config = preloop_runner_server::config::ConfigFile::default();
@@ -6281,7 +6287,7 @@ mod tests {
     /// it forever and idle runners would be replaced forever.
     #[test]
     fn only_the_official_golden_keeps_environment_replacement() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         // The config resolves a Linux guest runner bundle; fabricate one so
         // the construction reaches the base-image decision.
@@ -6379,7 +6385,7 @@ mod tests {
 
     #[test]
     fn packed_artifact_cache_key_tracks_base_image_digest() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -7010,6 +7016,7 @@ mod tests {
     #[tokio::test]
     async fn shell_spawn_carries_the_sandbox_environment() {
         let _guard = crate::SMOLVM_PATH_LOCK.lock().await;
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
         let (directory, executable) = crate::fake_smolvm_on_path();
         let previous_path = std::env::var_os("PATH");
         let previous_home = std::env::var_os("PRELOOP_HOME");
@@ -7643,8 +7650,7 @@ mod tests {
     /// the probe must still arrive without an `Authorization` header.
     #[tokio::test]
     async fn health_probe_sends_no_authorization_header() {
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _env_guard = ENV_LOCK.lock().await;
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
         let saw_authorization = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_authorization_clone = std::sync::Arc::clone(&saw_authorization);
         let app = axum::Router::new().route(

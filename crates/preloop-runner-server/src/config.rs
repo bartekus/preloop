@@ -1597,8 +1597,21 @@ fn resolve_config_sealing_key_with_store(
                         store.name(),
                         key_path.display()
                     );
-                    std::fs::remove_file(&key_path)
-                        .with_context(|| format!("retiring {}", key_path.display()))?;
+                    // Retire the legacy file only once the store proves it can
+                    // hold the key. A value that was only read through — a
+                    // migration whose copy failed — must leave the file in
+                    // place as the last way to unseal the secrets.
+                    if store_confirms(store, &reference, &secret) {
+                        std::fs::remove_file(&key_path)
+                            .with_context(|| format!("retiring {}", key_path.display()))?;
+                    } else {
+                        tracing::warn!(
+                            store = store.name(),
+                            path = %key_path.display(),
+                            "could not verify a durable copy of the config-secrets key; \
+                             keeping the legacy key file"
+                        );
+                    }
                 }
                 return Ok(key);
             }
@@ -1648,6 +1661,32 @@ fn resolve_config_sealing_key_with_store(
     let key = generate_sealing_key();
     write_sealing_key_file(&key_path, &key)?;
     Ok(key)
+}
+
+/// Whether `store` verifiably holds `value` under `reference`: the write is
+/// accepted and a fresh read returns the same bytes. Checked before retiring a
+/// legacy `secrets.key`, so a credential that was only read through (a
+/// migration whose copy failed) never causes the file to be deleted.
+fn store_confirms(
+    store: &dyn CredentialStore,
+    reference: &CredentialRef,
+    value: &SecretString,
+) -> bool {
+    match store
+        .set(reference, value)
+        .and_then(|()| store.get_fresh(reference))
+    {
+        Ok(Some(stored)) => stored.expose() == value.expose(),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(
+                store = store.name(),
+                %error,
+                "credential store could not confirm a durable copy"
+            );
+            false
+        }
+    }
 }
 
 /// Credential-store reference for the config-secrets key, scoped by the
@@ -2870,5 +2909,75 @@ REPO_OVERLAY = "repo-from-credential"
             key
         );
         assert!(!dir.path().join(SECRETS_KEY_FILE).exists());
+    }
+
+    /// A store that reads a value but cannot keep one — the shape a failed
+    /// OS-to-file migration copy leaves behind.
+    struct ReadOnlyStore {
+        value: String,
+    }
+
+    impl CredentialStore for ReadOnlyStore {
+        fn get(&self, _reference: &CredentialRef) -> anyhow::Result<Option<SecretString>> {
+            Ok(Some(SecretString::new(self.value.clone())))
+        }
+
+        fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> anyhow::Result<()> {
+            anyhow::bail!("credentials directory is not writable")
+        }
+
+        fn delete(&self, _reference: &CredentialRef) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "read-only store"
+        }
+    }
+
+    /// A durable copy retires the legacy `secrets.key`: the store writes the
+    /// key and reads it back before the file goes away.
+    #[test]
+    fn secrets_key_file_is_retired_once_the_store_confirms_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x5a; 32];
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &key).unwrap();
+        let legacy = MemoryCredentialStore::default();
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        legacy
+            .set(&reference, &SecretString::new(hex::encode(key)))
+            .unwrap();
+        let store = FileCredentialStore::new(dir.path().join("credentials"))
+            .migrating_from(std::sync::Arc::new(legacy));
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store).unwrap(),
+            key
+        );
+        assert!(
+            !key_path.exists(),
+            "a confirmed durable copy may retire the legacy file"
+        );
+    }
+
+    /// A store that cannot keep the copy must not retire `secrets.key`: the
+    /// file is then the only durable way to unseal the config secrets.
+    #[test]
+    fn secrets_key_file_survives_a_store_that_cannot_keep_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x5a; 32];
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &key).unwrap();
+        let store = ReadOnlyStore {
+            value: hex::encode(key),
+        };
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store).unwrap(),
+            key
+        );
+        assert!(
+            key_path.exists(),
+            "an unconfirmed copy must leave the legacy key file in place"
+        );
     }
 }

@@ -457,9 +457,11 @@ file store instead, prints a warning naming the directory, and sets
 `credential_store = "file"` in the config. An explicit
 `PRELOOP_CREDENTIAL_STORE=os` still wins over that config key, but the selected
 OS-primary store reads the sibling file store when the OS store is unavailable,
-the read fails, or the entry is absent. A successful OS value is authoritative;
-the file value is used only as fallback. This keeps setup's file fallback
-readable without requiring the environment override to be removed.
+the read fails, or the entry is absent. A successful OS value is authoritative,
+except for a reference whose write had to fall back: that reference is marked,
+and its file copy is read even while a stale or corrupted OS entry stays
+readable. This keeps setup's file fallback readable without requiring the
+environment override to be removed.
 
 Fields:
 
