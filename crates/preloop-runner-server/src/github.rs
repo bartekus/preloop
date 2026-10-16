@@ -3127,6 +3127,105 @@ async fn freshen_pull_request_events(
     ))
 }
 
+/// Whether a pull-request delivery's head commit carries a `[skip ci]` label.
+///
+/// The pull-request webhook payload carries only `head.sha`, never the commit
+/// message, so the head commit must be fetched here — this gate lives in the
+/// async dispatcher, not the pure `project()` adapters (which cannot make
+/// network calls).
+///
+/// Fork PRs are never eligible: a fork's commit message is attacker-controlled,
+/// so untrusted code must not be able to opt itself out of scrutiny. Every
+/// failure to read the commit (auth, network, missing data) fails open and
+/// runs CI; skipping is never inferred from an error.
+async fn pr_head_commit_skips_ci(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    payload: &Value,
+    api_base: &str,
+) -> bool {
+    let pr_head = payload.get("pull_request").and_then(|pr| pr.get("head"));
+
+    // Fork PRs always run. `head.repo.fork` missing fails closed to fork.
+    let is_fork = pr_head
+        .and_then(|head| head.get("repo"))
+        .and_then(|repo| repo.get("fork"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if is_fork {
+        return false;
+    }
+
+    let Some(head_sha) = pr_head
+        .and_then(|head| head.get("sha"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+
+    let (token, bucket) = match crate::github_app::select_app_for_repo(shared, repo).await {
+        Some(app) => {
+            let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+            match crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await
+            {
+                Ok(token) => {
+                    let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                        Ok(installation) if installation != 0 => {
+                            crate::github_breaker::GithubCredentialBucket::Installation(
+                                installation,
+                            )
+                        }
+                        _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                    };
+                    (Some(token), bucket)
+                }
+                Err(error) => {
+                    warn!(?error, "failed to mint token for [skip ci] check; running CI");
+                    return false;
+                }
+            }
+        }
+        None => (
+            std::env::var("PRELOOP_GITHUB_TOKEN").ok(),
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        ),
+    };
+    let Some(token) = token else {
+        return false;
+    };
+
+    let response = match crate::github_breaker::send_observed(
+        &shared.state.github_breakers,
+        bucket,
+        crate::shared_http::CLIENT
+            .clone()
+            .get(format!("{api_base}/repos/{repo}/commits/{head_sha}"))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(?error, "failed to fetch PR head commit for [skip ci] check; running CI");
+            return false;
+        }
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(commit) = response.json::<Value>().await else {
+        return false;
+    };
+
+    commit
+        .get("commit")
+        .and_then(|c| c.get("message"))
+        .and_then(Value::as_str)
+        .is_some_and(crate::events::has_skip_label)
+}
+
 const WEBHOOK_ACK_BUDGET: Duration = Duration::from_secs(8);
 const WEBHOOK_ENQUEUE_ATTEMPTS: usize = 2;
 const WEBHOOK_LEASE_DURATION_SECS: u64 = 60;
@@ -4559,6 +4658,19 @@ async fn process_delivery_payload_with_lease(
             );
         }
     };
+
+    // [skip ci] on an internal PR's head commit suppresses the whole delivery
+    // (both the pull_request_target and pull_request fan-out). Fork PRs are
+    // never eligible — untrusted code cannot opt itself out of scrutiny. This
+    // runs before the changed-files lookup so a skipped PR burns no API call.
+    if matches!(delivery.event.as_str(), "pull_request" | "pull_request_target") {
+        let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
+            .unwrap_or_else(|_| "https://api.github.com".to_owned());
+        if pr_head_commit_skips_ci(shared, &repo_full_name, &payload_val, &api_base).await {
+            info!("[skip ci] on internal pull-request head commit — suppressing delivery");
+            return WebhookOutcome::Success;
+        }
+    }
 
     let (changed_paths, changed_paths_known) = if matches!(
         delivery.event.as_str(),
