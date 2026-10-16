@@ -4167,8 +4167,8 @@ pub fn redirect_primary_checkout(
 /// already-redirected steps are untouched.
 ///
 /// Rewritten ids are appended to `preloop_snapshot_token_steps` — the list
-/// the broker re-mints at claim — because the pinned credential is a
-/// ~50-minute JWT and a queued job outlives it; an expired token turns the
+/// the broker re-mints at claim — because the pinned credential is minted at
+/// submission and a queued job can outlive it; an expired token turns the
 /// relay into a 401 the step can never recover from.
 pub fn reroute_forge_checkouts(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
@@ -4376,7 +4376,7 @@ pub async fn snapshot_git_http(
     // The Bearer challenge tells git the failure is an authentication
     // rejection, so it reports it instead of prompting.
     let storage_repository = match storage_repository {
-        Ok(repository) => repository,
+        Ok(snapshot) => snapshot_storage_repository(&snapshot).to_owned(),
         Err(error) if error.status() == StatusCode::UNAUTHORIZED => {
             return Ok(snapshot_unauthorized_response(error.message()));
         }
@@ -4632,11 +4632,17 @@ fn snapshot_unauthorized_response(message: &str) -> Response<Body> {
         .expect("static 401 response is valid")
 }
 
+/// The run's checkout snapshot, authorized for this token.
+///
+/// Callers get the whole snapshot rather than only its storage repository so
+/// the archive endpoint can bind what it serves to the run's own commit; a
+/// repository-scoped cache's object store holds every cached run's commits
+/// (see [`build_snapshot_archive`]).
 async fn authorize_snapshot_token(
     state: &AppState,
     token: &str,
     run_id: RunId,
-) -> Result<String, ApiError> {
+) -> Result<WorkspaceSnapshot, ApiError> {
     let identity = match crate::auth::results_identity(state, token) {
         Ok(crate::auth::ResultsIdentity::Job(identity)) => identity,
         Ok(crate::auth::ResultsIdentity::System) => {
@@ -4671,6 +4677,19 @@ async fn authorize_snapshot_token(
             "snapshot Git token does not belong to this run",
         ));
     }
+    // The credential is spent with its attempt. This token is exported to
+    // workflow code as `ACTIONS_RUNTIME_TOKEN` and pinned into checkout steps,
+    // and the snapshot is otherwise reachable only by the jobs that hold one —
+    // so a completed (or purged) job's token must not keep fetching the run's
+    // snapshot for the rest of its lifetime. Liveness follows the request
+    // record, exactly like the Results writes (`auth::job_is_live`): an
+    // attempt stays live through a debug session, whose retry replays the
+    // checkout with a freshly minted token from `debug_sessions::poll_verdict`.
+    if !crate::auth::job_is_live(state, identity.job_id).await? {
+        return Err(ApiError::forbidden(
+            "snapshot Git token belongs to a completed job",
+        ));
+    }
     let run = state
         .backend
         .run_record(run_id)
@@ -4680,11 +4699,20 @@ async fn authorize_snapshot_token(
         .workspace_snapshot
         .as_ref()
         .ok_or_else(|| ApiError::not_found("checkout snapshot not found"))?;
-    Ok(snapshot
-        .storage_repository
-        .clone()
-        .unwrap_or_else(|| snapshot.repository.clone()))
+    Ok(snapshot.clone())
 }
+
+/// The bare repository backing a snapshot, relative to the state directory.
+///
+/// Older local snapshots carry no `storage_repository`; theirs is derived
+/// from the snapshot's `repository` (`snapshots/{run-id}`).
+fn snapshot_storage_repository(snapshot: &WorkspaceSnapshot) -> &str {
+    snapshot
+        .storage_repository
+        .as_deref()
+        .unwrap_or(&snapshot.repository)
+}
+
 fn snapshot_authorization_token(value: &str) -> Option<String> {
     let (scheme, credentials) = value.split_once(' ')?;
     if scheme.eq_ignore_ascii_case("bearer") {
@@ -4874,6 +4902,231 @@ pub async fn forge_git_http(
         format!("{upstream}?{query}")
     };
     forge_relay_forward(request, &upstream).await
+}
+
+/// REST archive endpoint for checkouts that cannot run Git.
+///
+/// `actions/checkout` derives `{github-server-url}/api/v3` as its API base
+/// when the engine is the run's GHES-shaped server, and without a `git`
+/// binary in the image it downloads the repository through
+/// `GET /repos/{owner}/{repo}/tarball/{ref}` instead of fetching over Git.
+/// Host images have `git`, so only container jobs on minimal images take
+/// this path — and until now the engine answered it with
+/// "not available on this endpoint" (the socket surface refused `/api/v3/*`
+/// and no tarball route existed), which made every `container:` job whose
+/// first step was a redirected `actions/checkout` fail even after the
+/// container could reach the engine.
+///
+/// Two upstreams, mirroring the Git relay's split:
+/// - `snapshots/{run-id}` archives the run's immutable local-workspace
+///   snapshot (`git archive` of the same bare repository the snapshot Git
+///   endpoint serves), authenticated with the pinned job runtime token.
+/// - any other repository is an anonymous forge fetch, relayed to the
+///   forge's own API host with the caller's credential stripped
+///   ([`authorize_forge_relay`] pins the job runtime token; private
+///   repositories keep failing closed on the upstream 404). The forge
+///   answers with a redirect to its archive host, which the engine's relay
+///   client follows and streams back, so the job never needs egress to the
+///   archive host itself.
+pub async fn forge_api_repo_tarball(
+    State(shared): State<Arc<SharedState>>,
+    Path((owner, repo, git_ref)): Path<(String, String, String)>,
+    request: Request,
+) -> Result<Response<Body>, ApiError> {
+    if !valid_repo_segment(&owner) || !valid_repo_segment(&repo) || !valid_archive_ref(&git_ref) {
+        return Err(ApiError::bad_request("invalid archive path"));
+    }
+    if owner == "snapshots" {
+        // The request body is not `Sync`: keep only the credential, and let the
+        // request go before awaiting, or the handler future is not `Send`.
+        let token = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(snapshot_authorization_token);
+        drop(request);
+        return snapshot_repo_tarball(&shared, &repo, &git_ref, token).await;
+    }
+    if let Err(response) = authorize_forge_relay(&shared.state, &request) {
+        return Ok(*response);
+    }
+    // The API base is the forge's own api host (`api.github.com` for the
+    // github.com default), never the server URL — the same rule the Git
+    // relay and the repository lookup follow.
+    let api_base = shared
+        .state
+        .github_urls
+        .api_url
+        .trim_end_matches('/')
+        .to_owned();
+    let upstream = format!("{api_base}/repos/{owner}/{repo}/tarball/{git_ref}");
+    forge_relay_forward(request, &upstream).await
+}
+
+/// `git archive` of a run's local-workspace snapshot, shaped like the forge's
+/// own tarball so `actions/checkout`'s extractor sees a single top-level
+/// `{owner}-{repo}-{sha}/` directory.
+async fn snapshot_repo_tarball(
+    shared: &Arc<SharedState>,
+    run_id_raw: &str,
+    git_ref: &str,
+    token: Option<String>,
+) -> Result<Response<Body>, ApiError> {
+    let run_id = snapshot_route_run_id(run_id_raw)?;
+    let token =
+        token.ok_or_else(|| ApiError::unauthorized("snapshot archive authentication required"))?;
+    let snapshot = match authorize_snapshot_token(&shared.state, &token, run_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.status() == StatusCode::UNAUTHORIZED => {
+            return Ok(snapshot_unauthorized_response(error.message()));
+        }
+        Err(error) => return Err(error),
+    };
+    let repository = shared
+        .state
+        .state_dir
+        .join(snapshot_storage_repository(&snapshot));
+    if !repository.is_dir() {
+        return Err(ApiError::not_found("checkout snapshot not found"));
+    }
+    let archive = build_snapshot_archive(&repository, run_id_raw, git_ref, &snapshot).await?;
+    Ok(archive)
+}
+
+/// Build the snapshot archive response: a gzipped `git archive` written to a
+/// private temp file and streamed back.
+///
+/// Written to disk rather than held in memory: a snapshot can be a whole
+/// repository tree, and the response is streamed to the client anyway.
+///
+/// `git_ref` must resolve to one of the run's own snapshot commits. A
+/// repository-scoped checkout cache is shared by every run of the repository:
+/// its object store holds all cached commits, and the Git endpoint hides
+/// every run ref (`uploadpack.hideRefs refs/preloop/runs`) so a job fetches
+/// only its own commit. The archive endpoint is a second door into the same
+/// store and serves the same set — without the check, any commit in the
+/// cache (another run's tree) could be archived by naming its SHA.
+async fn build_snapshot_archive(
+    repository: &FsPath,
+    run_id_raw: &str,
+    git_ref: &str,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Response<Body>, ApiError> {
+    let sha = resolve_archive_commit(repository, git_ref).await?;
+    if !archive_commit_belongs_to_run(snapshot, &sha) {
+        // The same answer as an unresolvable ref: a request must not learn
+        // whether the commit exists in the shared cache.
+        return Err(ApiError::not_found("snapshot archive ref not found"));
+    }
+    let prefix = archive_prefix("snapshots", run_id_raw, &sha);
+    // Archive the resolved SHA, not the caller's spelling: what was checked
+    // is what gets archived.
+    let archive_path = write_snapshot_archive(repository, &sha, &prefix).await?;
+    let file = tokio::fs::File::open(&archive_path)
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to open snapshot archive: {error}")))?;
+    // The handle keeps the data; the directory entry goes away now so a
+    // client that never finishes reading leaves nothing behind.
+    let _ = tokio::fs::remove_file(&archive_path).await;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to stat snapshot archive: {error}")))?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-gzip")
+        .header(header::CONTENT_LENGTH, metadata.len())
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .unwrap())
+}
+
+/// Run `git archive` for a snapshot into a private file and return its path.
+async fn write_snapshot_archive(
+    repository: &FsPath,
+    git_ref: &str,
+    prefix: &str,
+) -> Result<PathBuf, ApiError> {
+    let archive_path = repository
+        .parent()
+        .map(|parent| parent.join(format!("archive-{}.tar.gz", uuid::Uuid::new_v4())))
+        .ok_or_else(|| ApiError::internal("snapshot repository has no parent directory"))?;
+    let args = snapshot_archive_args(git_ref, prefix);
+    let output = tokio::process::Command::new("git")
+        .current_dir(repository)
+        .args(args.iter().map(String::as_str))
+        .arg("-o")
+        .arg(&archive_path)
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to run git archive: {error}")))?;
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::not_found(format!(
+            "snapshot archive ref not found: {}",
+            stderr.trim().lines().last().unwrap_or("")
+        )));
+    }
+    Ok(archive_path)
+}
+
+/// `git archive` arguments for a snapshot tarball: gzip, GitHub's single
+/// top-level directory, then the requested tree-ish.
+fn snapshot_archive_args(git_ref: &str, prefix: &str) -> Vec<String> {
+    vec![
+        "archive".to_owned(),
+        "--format=tar.gz".to_owned(),
+        format!("--prefix={prefix}"),
+        git_ref.to_owned(),
+    ]
+}
+
+/// The forge's archive directory name: `{owner}-{repo}-{sha}`.
+fn archive_prefix(owner: &str, repo: &str, sha: &str) -> String {
+    format!("{owner}-{repo}-{sha}/")
+}
+
+/// Whether a resolved archive commit is one of the run's own snapshot
+/// commits: the snapshot store's commit (for remote checkouts the fetched
+/// commit, for local workspaces the synthetic one) or the real workspace
+/// commit the snapshot is based on, when it carries one.
+fn archive_commit_belongs_to_run(snapshot: &WorkspaceSnapshot, sha: &str) -> bool {
+    sha == snapshot.commit_sha || snapshot.head_sha.as_deref() == Some(sha)
+}
+
+/// Resolve the archive's commit so the prefix carries a sha, and so an
+/// unprovable ref never reaches `git archive` as an argument.
+async fn resolve_archive_commit(repository: &FsPath, git_ref: &str) -> Result<String, ApiError> {
+    let output = tokio::process::Command::new("git")
+        .current_dir(repository)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{git_ref}^{{commit}}"),
+        ])
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to run git rev-parse: {error}")))?;
+    if !output.status.success() {
+        return Err(ApiError::not_found("snapshot archive ref not found"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Archive refs arrive in a URL path segment: allow sha(1)/sha256(256) hex and
+/// ordinary ref names, never anything that could read as a `git` option or a
+/// traversal.
+fn valid_archive_ref(git_ref: &str) -> bool {
+    !git_ref.is_empty()
+        && git_ref.len() <= 1024
+        && !git_ref.starts_with('-')
+        && git_ref.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'+' | b'-')
+        })
+        && !git_ref
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
 }
 
 /// Minimal `api/v3/repos/{owner}/{repo}` passthrough for checkout's
@@ -6095,7 +6348,7 @@ mod remote_checkout_cache_tests {
         let canonical = canonical_slug.to_owned();
         let router = axum::Router::new()
             .route(
-                "/repositories/:id",
+                "/repositories/{id}",
                 get(
                     |Path(id): Path<u64>,
                      Extension(repo_id): Extension<RepoId>,
@@ -6132,7 +6385,7 @@ mod remote_checkout_cache_tests {
                 ),
             )
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |Extension(authed): Extension<AuthedDownloads>,
                      Extension(blob): Extension<Vec<u8>>| async move {
@@ -6202,7 +6455,7 @@ mod remote_checkout_cache_tests {
                 ),
             )
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |headers: axum::http::HeaderMap,
                      Extension(authed): Extension<AuthedDownloads>,
@@ -6459,7 +6712,7 @@ mod remote_checkout_cache_tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router = axum::Router::new()
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |headers: HeaderMap,
                      Extension(authed): Extension<Arc<AtomicUsize>>,
@@ -7027,38 +7280,26 @@ mod snapshot_staging_tests {
         }
     }
 
-    /// The bench that found this: the engine's `TMPDIR` on tmpfs, the state
-    /// directory on another device. Staging in the process temp directory made
-    /// the publish fail with `EXDEV`, the immutable snapshot was never created,
-    /// and the run fell back to a checkout of a commit no forge has.
+    /// The bench that found this: staging in the process temp directory made
+    /// the publish fail with `EXDEV` on a host whose `TMPDIR` is a tmpfs, the
+    /// immutable snapshot was never created, and the run fell back to a
+    /// checkout of a commit no forge has. Staging lives under the state
+    /// directory now. This test leaves `TMPDIR` alone: changing the process
+    /// environment raced with other tests that create their own temporary
+    /// directories, which then vanished when this one was torn down. It checks
+    /// the real temp directory for legacy staging trees instead.
     #[tokio::test]
-    async fn snapshot_publishes_when_the_process_temp_dir_is_another_filesystem() {
+    async fn snapshot_publishes_without_staging_in_the_process_temp_dir() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("ws");
         let state_dir = temp.path().join("state");
         init_workspace(&workspace);
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        let other = OtherFilesystem::create(&state_dir, temp.path());
-        let tmpdir_guard = other
-            .as_ref()
-            .map(|other| tempfile::tempdir_in(&other.path).unwrap());
-        let tmpdir = match &tmpdir_guard {
-            Some(tmpdir) => tmpdir.path().to_path_buf(),
-            // No second filesystem to point `TMPDIR` at: the publish below
-            // still runs, but only a host with a spare device can make the
-            // rename cross-device. The recovery itself is covered by
-            // `cross_filesystem_staging_still_publishes_atomically`.
-            None => temp.path().join("tmp"),
-        };
-        std::fs::create_dir_all(&tmpdir).unwrap();
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _tmpdir = crate::state::TestEnvVar::set("TMPDIR", &tmpdir);
-
         let run_id = RunId::new();
         let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None, None, None)
             .await
-            .expect("the snapshot must publish whatever TMPDIR points at");
+            .expect("the snapshot must publish");
 
         let repository = state_dir.join(&snapshot.repository);
         assert!(
@@ -7070,11 +7311,14 @@ mod snapshot_staging_tests {
             Vec::<String>::new(),
             "publishing leaves no staging tree behind"
         );
-        let staged_in_temp_dir: Vec<String> = std::fs::read_dir(&tmpdir)
+        let run_name = run_id.to_string();
+        let staged_in_temp_dir: Vec<String> = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("preloop-workspace-snapshot"))
+            .filter(|name| {
+                name.starts_with("preloop-workspace-snapshot") && name.contains(&run_name)
+            })
             .collect();
         assert!(
             staged_in_temp_dir.is_empty(),
@@ -7367,6 +7611,256 @@ mod object_cache_tests {
 }
 
 #[cfg(test)]
+mod archive_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_archive_refs_are_url_safe() {
+        assert!(valid_archive_ref(
+            "de2d615edebdc27145960f78962b1b789ea07d33"
+        ));
+        assert!(valid_archive_ref("refs/heads/main"));
+        assert!(valid_archive_ref("v1.2.3-rc.1"));
+        assert!(!valid_archive_ref(""));
+        assert!(!valid_archive_ref("--output=/tmp/x"));
+        assert!(!valid_archive_ref("-x"));
+        assert!(!valid_archive_ref("refs/../etc/passwd"));
+        assert!(!valid_archive_ref("refs//main"));
+        assert!(!valid_archive_ref("refs/heads/main "));
+    }
+
+    #[test]
+    fn archive_arguments_and_prefix_match_the_forge_shape() {
+        assert_eq!(
+            archive_prefix(
+                "snapshots",
+                "7b116f3a-6973-4e4e-bcd1-213de9518ad1",
+                "abc123"
+            ),
+            "snapshots-7b116f3a-6973-4e4e-bcd1-213de9518ad1-abc123/"
+        );
+        assert_eq!(
+            snapshot_archive_args("abc123", "snapshots-run-abc123/"),
+            vec![
+                "archive".to_string(),
+                "--format=tar.gz".to_string(),
+                "--prefix=snapshots-run-abc123/".to_string(),
+                "abc123".to_string(),
+            ]
+        );
+    }
+
+    /// `actions/checkout`'s no-git path extracts GitHub's archive shape: one
+    /// top-level `{owner}-{repo}-{sha}/` directory. Build the real archive
+    /// from a real repository and check the shape the action will see.
+    #[tokio::test]
+    async fn snapshot_archive_has_the_forge_top_level_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("snapshot.git");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str], cwd: &FsPath| {
+            std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet", "."], &work).status.success());
+        std::fs::write(work.join("tracked.txt"), "archive me\n").unwrap();
+        assert!(git(&["add", "-A"], &work).status.success());
+        assert!(
+            git(&["commit", "--quiet", "-m", "seed"], &work)
+                .status
+                .success()
+        );
+        let sha = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(&work)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let sha = sha.trim().to_owned();
+        assert!(
+            git(
+                &["clone", "--quiet", "--bare", ".", repo.to_str().unwrap()],
+                &work
+            )
+            .status
+            .success()
+        );
+
+        let prefix = archive_prefix("snapshots", "run-1", &sha);
+        let path = write_snapshot_archive(&repo, &sha, &prefix).await.unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[..2], b"\x1f\x8b", "archive must be gzipped");
+        // `tar` sees one top-level directory holding the tree, which is the
+        // directory `actions/checkout` moves the contents out of. The raw
+        // first block is git's `pax_global_header` (commit id metadata), as in
+        // the forge's own tarballs; `tar` does not list it.
+        let listing = std::process::Command::new("tar")
+            .args(["-tzf", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        let entries: Vec<&str> = listing.lines().collect();
+        assert_eq!(
+            entries.first().copied(),
+            Some(prefix.as_str()),
+            "first listed entry must be the top-level dir: {listing}"
+        );
+        assert!(
+            entries.iter().all(|entry| entry.starts_with(&prefix)),
+            "every entry must live under {prefix}: {listing}"
+        );
+        assert!(
+            entries.contains(&format!("{prefix}tracked.txt").as_str()),
+            "the tree must be inside the prefixed directory: {listing}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A repository-scoped cache is shared by every run of the repository:
+    /// its object store holds all cached commits, and the Git endpoint hides
+    /// every run ref so a job fetches only its own commit. The archive
+    /// endpoint must serve the same set — any other cached commit, however it
+    /// is spelled, is refused exactly like a missing ref.
+    #[tokio::test]
+    async fn snapshot_archive_serves_only_the_runs_own_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let repo = dir.path().join("cache.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str], cwd: &FsPath| {
+            std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let head = |cwd: &FsPath| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        assert!(git(&["init", "--quiet", "."], &work).status.success());
+        std::fs::write(work.join("a.txt"), "the run's tree\n").unwrap();
+        assert!(git(&["add", "-A"], &work).status.success());
+        assert!(
+            git(&["commit", "--quiet", "-m", "run"], &work)
+                .status
+                .success()
+        );
+        let run_commit = head(&work);
+        std::fs::write(work.join("b.txt"), "another run's tree\n").unwrap();
+        assert!(git(&["add", "-A"], &work).status.success());
+        assert!(
+            git(&["commit", "--quiet", "-m", "other"], &work)
+                .status
+                .success()
+        );
+        let other_commit = head(&work);
+        assert!(
+            git(
+                &["clone", "--quiet", "--bare", ".", repo.to_str().unwrap()],
+                &work
+            )
+            .status
+            .success()
+        );
+        // The shared cache's layout: every cached run's commit is a run ref.
+        assert!(
+            git(
+                &[
+                    "--git-dir",
+                    repo.to_str().unwrap(),
+                    "update-ref",
+                    "refs/preloop/runs/other",
+                    other_commit.as_str(),
+                ],
+                dir.path()
+            )
+            .status
+            .success()
+        );
+
+        let snapshot = WorkspaceSnapshot {
+            commit_sha: run_commit.clone(),
+            head_sha: Some(run_commit.clone()),
+            ..Default::default()
+        };
+
+        let response = build_snapshot_archive(&repo, "run-1", &run_commit, &snapshot)
+            .await
+            .expect("the run's own commit archives");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = build_snapshot_archive(&repo, "run-1", &run_commit[..10], &snapshot)
+            .await
+            .expect("a short spelling of the run's commit archives");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for spelling in [other_commit.as_str(), "refs/preloop/runs/other"] {
+            let error = build_snapshot_archive(&repo, "run-1", spelling, &snapshot)
+                .await
+                .expect_err("another run's cached commit must not archive");
+            assert_eq!(error.status(), StatusCode::NOT_FOUND, "{spelling}");
+        }
+    }
+
+    /// The forge answers an archive request with a redirect to its archive
+    /// host (`codeload.github.com`); the relay's client follows it and streams
+    /// the archive, so the job needs egress only to the engine.
+    #[tokio::test]
+    async fn forge_relay_follows_the_archive_redirect() {
+        use axum::routing::get;
+
+        let archive_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let archive_base = format!("http://{}", archive_listener.local_addr().unwrap());
+        let archive =
+            axum::Router::new().route("/codeload/tarball", get(|| async { "archive-bytes" }));
+        tokio::spawn(async move { axum::serve(archive_listener, archive).await.unwrap() });
+
+        let forge_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let forge_base = format!("http://{}", forge_listener.local_addr().unwrap());
+        let location = format!("{archive_base}/codeload/tarball");
+        let forge = axum::Router::new().route(
+            "/repos/owner/repo/tarball/main",
+            get(move || {
+                let location = location.clone();
+                async move { (StatusCode::FOUND, [(header::LOCATION, location)]) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(forge_listener, forge).await.unwrap() });
+
+        let request = Request::builder()
+            .uri("/api/v3/repos/owner/repo/tarball/main")
+            .body(Body::empty())
+            .unwrap();
+        let upstream = format!("{forge_base}/repos/owner/repo/tarball/main");
+        let response = forge_relay_forward(request, &upstream).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"archive-bytes");
+    }
+}
+
+#[cfg(test)]
 mod lfs_accounting_tests {
     use super::*;
     use crate::github_breaker::GithubCredentialBucket;
@@ -7427,7 +7921,7 @@ mod lfs_accounting_tests {
                         axum::routing::get(move || async move { blob_response(blob) }),
                     )
                     .route(
-                        "/*path",
+                        "/{*path}",
                         axum::routing::post(move || async move { batch_response(&batch_body) }),
                     );
                 servers.push(tokio::spawn(async move {
@@ -7456,7 +7950,7 @@ mod lfs_accounting_tests {
                 let batch_base = format!("http://{}", batch_listener.local_addr().unwrap());
                 servers.push(tokio::spawn(async move {
                     let app = axum::Router::new().route(
-                        "/*path",
+                        "/{*path}",
                         axum::routing::post(move || async move { batch_response(&batch_body) }),
                     );
                     axum::serve(batch_listener, app).await.unwrap()

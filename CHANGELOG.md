@@ -8,6 +8,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Changed
+
+- **The file credential store is the default.** The engine token, GitHub App
+  private key, PAT, and webhook secrets are written to `0600` files under
+  `$PRELOOP_HOME/credentials` instead of the OS keychain. GitHub credentials
+  follow the config file, so a `PRELOOP_CONFIG` outside `$PRELOOP_HOME` gets a
+  `credentials` directory beside it. Select the keychain with
+  `credential_store = "os"` in `config.toml` or `PRELOOP_CREDENTIAL_STORE=os`.
+  The environment variable overrides the config key, and an unknown value in
+  either is an error that names the valid choices. Credentials an earlier build
+  kept in the keychain are copied into the file store the first time they are
+  read; the keychain entry is left in place.
+
+### Fixed
+
+- **A GitHub App's private key survives an OS keychain failure.** With
+  `credential_store = "os"`, an unavailable keychain or a refused write now
+  stores the credential in the file store, prints a warning naming the
+  directory, and records `credential_store = "file"` in `config.toml`. Before,
+  `preloop setup github` aborted after GitHub had issued the one-time App key,
+  and headless setups stored secrets inline in `config.toml`. Setup also loads
+  the config before creating the App, so a config error cannot strand the key.
+  The manifest flow also persists converted credentials before waiting for the
+  optional installation redirect, so an install timeout or Ctrl-C cannot lose
+  the one-time PEM.
+
+- **`preloop serve` explains a `serve.lock` collision.** A second engine on the same
+  state directory reports the recorded holder's pid, start time, and how it was
+  started (a preloop command's autostart, a systemd service, or another terminal).
+  On Linux, when `/proc/locks` proves that pid holds the lock, it also prints how to
+  stop it; for systemd that is `sudo systemctl stop preloop.socket preloop.service`,
+  since the socket unit would otherwise start the service again. Otherwise the pid is
+  shown as unverified, with a command to find the holder, and no stop command is
+  suggested.
+
+- **Action credential minting is liveness- and identity-bound** (#468):
+  ActionDownloadInfo and runnerresolve accept only the system credential or a
+  Results job runtime token, bind that token to the requested plan/job, and
+  re-check job liveness after action-reference resolution before signing
+  bearerless download tickets.
+
+- **Large replay step logs are retained** (#599): signed
+  `/replay/results/*` uploads now accept bodies up to 64 MiB instead of
+  inheriting Axum's 2 MiB default, so long failing steps remain available for
+  diagnosis while oversized requests are rejected.
+
+- **Log appends and legacy cache chunks above 2 MiB are accepted** (#610):
+  log append and console routes accept bodies up to 16 MiB, while legacy
+  cache chunks stream to disk up to the existing 512 MiB upload budget instead
+  of inheriting Axum's 2 MiB default. Oversized requests still get a
+  deterministic 413 without buffering the whole cache chunk in RAM.
+
+- **Runner-side `github.event` arrays decode correctly** (#571): the
+  runner's typed-context decoder used a legacy `{"t":1,"d":…}` tag map while
+  the wire codec serializes arrays as `{"t":1,"a":[…]}`. Nested arrays inside
+  `github.event` (labels, commits, head-commit fields) arrived as `null`, so
+  step env/condition expressions such as
+  `contains(github.event.pull_request.labels.*.name, 'x')` always evaluated
+  false and label-gated workflows never saw their labels.
+
+
+## [0.34.4] - 2026-10-13
+
+### Fixed
+
+- **Server integration tests build against tokio-tungstenite 0.30**: the
+  `recovery` suite still sent `String` WebSocket frames, which 0.30 rejects
+  (`Message::Text` takes `Utf8Bytes`). The `test-support` suites compile and
+  pass again; there is no runtime change from 0.34.3.
+
+## [0.34.3] - 2026-10-13
+
 
 ### Added
 
@@ -27,8 +99,73 @@ Releases before v0.27.0 predate the changelog.
   testing a different tree. `--no-merge` restores testing the branch alone,
   and `push` events are unchanged (they test the commit itself). The server
   also validates and serves prebuilt merges for other submission paths.
+- **Hosted dirty submits**: `preloop run --push` on a dirty working tree now
+  creates a real commit C in a private index (the branch, index and working
+  tree never move; a tracked file that an ignore rule now matches stays in
+  C), uploads it to the engine as a git bundle and tests exactly C — or, for
+  `--event pull_request`, the merge of C with the freshly fetched base tip.
+  After success C is published, its checks attach to C, and `--create-pr`
+  opens the pull request. The bundle carries only C and, for a pull request,
+  the base tip (never every local ref), streams to disk under a 512 MiB cap,
+  is single-use, and is deleted as soon as the submission is accepted or
+  refused; unsubmitted uploads are swept after an hour. Webhook echoes of the
+  publish are deduplicated against the published head: the branch `push` is
+  skipped once any run published that commit, while the `pull_request` that
+  opening or updating its PR emits is skipped only when a `pull_request` run
+  that tested the base merged in published it, so a branch-only publish still
+  lets the PR's merge test run. `pull_request_target`, manual dispatches and
+  other later events at the same head still run. Auto-PR requires webhook
+  delivery provenance, so a native
+  submission cannot trigger it. The local branch moves only after a
+  successful push, on confirmation, when the working tree still matches the
+  submitted tree by content.
+
+### Changed
+
+- **Dependencies**: the weekly batched updates for the Rust toolchain (#569),
+  non-breaking crates (#570) and breaking crates (#572).
 
 ### Fixed
+
+- **Diagnostic staging directories of expired upload tokens are reaped again**: the pending-upload sweep dropped each expired token from the map before the reaper collected its `blobs/diag/<jti>` directory, so the staged bytes stayed on disk until the age-based backstop, which is disabled when `diag_staging_max_age_seconds` is 0. The reaper now collects those directories before the sweep runs.
+
+- **Reusable workflows called as `uses: $/...` resolve** (#581): the runner
+  client, the `preloop-runner` resolver, and the server's remote-workflow
+  resolver treated `$/` as a remote `owner/repo/path@ref` reference and
+  rejected it as unsupported. `$/` and `./` now name a file in the submitting
+  repository: the client resolves them from the workspace, the server fetches
+  them at the submitted commit, and a call inside a remote reusable workflow
+  resolves in that workflow's repository at its pinned commit. The path must
+  be under `.github/workflows/`, with segments of letters, digits, `-`, `_` and
+  `.` only: a `..` segment, an empty or absolute path, or any other character
+  is refused before a request is sent.
+
+- **Breaker refusals are typed and the webhook queue gate sees live probes**:
+  action downloads answer `503` only for a real breaker refusal, and the queue
+  stops claiming while a half-open probe is in flight. A failed delivery is
+  parked without spending an attempt only when GitHub is down or its own
+  credential bucket is throttled, not whenever any bucket is.
+
+- **Pull-request runs read their workflows from the merge they check out**: a
+  webhook `pull_request` run on a merge preloop built itself took its workflow
+  files from the pull request head, so a workflow the base branch had changed
+  (and the head had not) ran its older copy, while GitHub's own `pull_request`
+  run executes the merge's copy. The files now come from that merge commit in
+  the engine's mirror; only a failed mirror read falls back to the head's copies,
+  with a warning. Check runs still report on the pull request head.
+
+- **A webhook worker is no longer parked for the whole merge poll under load**:
+  a pull-request delivery that waited for GitHub's test merge held its worker for
+  up to the 30-second budget, and every superseded head polled to the full
+  budget, so a burst of pushes (fork pull requests included) could occupy all
+  `PRELOOP_WEBHOOK_WORKERS` and stall every other webhook. At most a quarter of
+  the workers (and at least one) may probe GitHub's merge state at once, and at
+  most that many may wait between probes. A probe waits up to two seconds for a
+  permit; a delivery whose GitHub merge is already available still uses it once
+  it gets one, and otherwise builds the engine's merge, as the budget-expiry
+  fallback does. A delivery that finds no wait slot builds it at once. Each
+  permit and slot is released when its probe or wait ends, including on failure
+  or cancellation.
 
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
@@ -258,6 +395,27 @@ Releases before v0.27.0 predate the changelog.
   `job_requests_timeline_cascade` trigger prunes the shared timeline with the
   last request.
 
+
+### Fixed
+
+- GitHub rerun/cancel endpoints now validate that a provided run UUID
+  belongs to the specified repository, preventing cross-repository
+  access via token reuse. A request with a foreign UUID returns 404.
+- `POST .../actions/runs/{id}/cancel` returns 202 only when the request
+  actually cancelled a live run; an already-completed run answers 409,
+  matching github.com's "Cannot cancel a workflow run that is completed."
+- A `check_suite.rerequested` delivery now re-runs every terminal run whose
+  check runs reported on the suite's head SHA (matched on the reported
+  coordinate — `status_check_sha` for pull_request runs — not the checkout
+  `head_sha`), instead of restarting only the newest run at that SHA. A
+  suite naming an unregistered App id is ignored.
+- Rerun endpoints reject malformed JSON bodies and non-boolean
+  `enable_debug_logging`/`enable_debugger` with a GitHub-shaped 422
+  (`message` + `documentation_url`) instead of silently defaulting.
+- Rerun and rerequest webhook handlers now pass the webhook sender
+  (`sender.login`) as `triggering_actor` to preserve the user who
+  initiated the rerun, while the original submission's actor is
+  retained for authorization.
 ### Changed
 
 - **Postgres completions no longer load the run graph**: `settle_job` and
@@ -372,16 +530,21 @@ Releases before v0.27.0 predate the changelog.
   every other origin requires HTTPS. Point a remote emulator or GHES at an
   `https://` URL (with `PRELOOP_GITHUB_CA_FILE` for a private CA) to keep it
   authenticated.
+- **Webhook auto-PR requires delivery provenance**: native submissions cannot
+  trigger it by setting a trust-tier field.
+
+### Changed
+- **The container-engine bootstrap is now maintained as a shell file** at
+  `scripts/docker-start.sh` and syntax-checked before it is sent to guests.
 
 ### Fixed
-- **A restart no longer fails the queued backlog as starved**: the starvation
-  sweep measured every queued job from its ready-enqueue instant, so jobs
-  queued for more than an hour before an engine restart failed with
-  `none appeared within 3600s` seconds after boot — before the restarted
-  pool had registered a single runner (221 jobs on one deploy). Both the
-  3600s ceiling and the 120s grace now start at ready-enqueue or engine boot,
-  whichever is later, so a restart gives the backlog the same window a newly
-  queued job gets.
+- **Failed container-engine starts now include daemon diagnostics** by
+  forwarding the tail of `/var/log/dockerd.log` after both retries fail.
+
+- **Root/sudo guest-script wrapping now handles trailing whitespace**, so
+  file-backed scripts remain valid when inlined.
+
+
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment
@@ -575,6 +738,12 @@ Releases before v0.27.0 predate the changelog.
   A present unknown tier also fails closed; a missing tier remains the
   trusted-native case.
 
+- Job runtime tokens remain valid for the effective job timeout plus pause allowance and slack, capped at GitHub's five-day self-hosted maximum.
+
+- The server applies the same timeout cap to the runner message, token lifetime, and reaper deadline.
+
+- Settled attempts cannot use job tokens to write Results, cache/artifact, snapshot, timeline/log, or live-log data, or mint OIDC credentials. Retained-data reads and completion reporting remain available; retries use fresh attempt credentials.
+
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
   control bridge), which a container's network namespace resolves to the
@@ -686,6 +855,15 @@ Releases before v0.27.0 predate the changelog.
   Legs of one matrix share that `job_order`, so among themselves they fall
   back to `job_id`.
 
+- **Fresh pull-request merge resolution**: Webhook-delivered `pull_request` and
+  `pull_request_review` runs accept GitHub's live test merge only when its first
+  parent matches the base SHA observed in the same API response and its second
+  parent matches the webhook payload head. Otherwise GitHub is polled within
+  the existing budget, then the engine builds a merge of the target branch's
+  current tip fetched at fallback time and the pinned payload head. Runs never
+  fall back to the bare pull-request head. The base is not guaranteed to remain
+  latest at job execution; base advancement does not automatically rerun jobs.
+  Conflicted pull requests do not start `pull_request` runs.
 - **A new store no longer replays three days of webhook history**: the
   delivery watchdog treated every delivery in GitHub's history as a phantom
   ack when the store had no watchdog cursor, and asked GitHub to redeliver
@@ -721,6 +899,19 @@ Releases before v0.27.0 predate the changelog.
   Postgres store, so the next run died on the store's key-fingerprint
   guard. The node key now survives the wipe, restored private (`0600`)
   rather than carrying a saved file's permissions.
+
+- **Container jobs without Git can check out**: `actions/checkout` on a
+  minimal image takes its no-git path, which resolves
+  `{github-server-url}/api/v3` and downloads
+  `GET /repos/{owner}/{repo}/tarball/{ref}`. The engine answered that with a
+  404, so every `container:` job whose first step was a redirected checkout
+  failed. The endpoint now serves the run's own snapshot as a `git archive`
+  shaped like the forge's tarball (one `{owner}-{repo}-{sha}/` top-level
+  directory) and relays other repositories to the forge anonymously, with the
+  guest control socket carrying these two read-only repository shapes. The
+  snapshot archive serves only the requesting run's own commit: a
+  repository-scoped cache holds every cached run's commits, and naming
+  another run's SHA must not archive its tree.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
@@ -779,6 +970,10 @@ Releases before v0.27.0 predate the changelog.
   golden's sparse disks exceed. Preloop now passes a 512 GiB ceiling to SmolVM
   unless the operator sets one.
 
+- **Debug-session guest commands avoid unrelated login profiles**: commands
+  entered at the attach prompt, plus the sync/export/probe helpers, use a
+  non-login `sh -c` while inheriting the provider-selected image environment
+  and PATH and preserving the job workspace.
 - **Scheduled golden refreshes no longer launch an impossible hosted bake**:
   the apt-index freshness workflow now opens one idempotent draft PR asking for
   a manual host-side rebuild. Webhook `workflow_dispatch` boolean inputs are
@@ -930,6 +1125,12 @@ Releases before v0.27.0 predate the changelog.
   dependents see the carried-forward `needs` context. A run the archiver
   already moved to history can only be re-run in full, which starts a new
   run (previous behavior).
+- GitHub-compatible re-run/cancel endpoints for tooling and `gh run rerun`:
+  `POST /repos/{owner}/{repo}/actions/runs/{id}/rerun`,
+  `…/rerun-failed-jobs`, `…/actions/jobs/{job_id}/rerun`, and
+  `…/actions/runs/{id}/cancel`, authorized with the dispatch credential
+  chain (`actions: write`) and mirroring github.com's 201/202/403/404/409
+  statuses.
 - `PRELOOP_RERUN_WINDOW_DAYS` (default 30, `0` disables) keeps completed runs
   that have a failed/cancelled/timed-out job in the live control tables so
   they stay re-runnable in place; everything else still archives within a
