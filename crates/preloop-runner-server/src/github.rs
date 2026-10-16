@@ -7380,7 +7380,9 @@ mod tests {
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
-        let shared = poll_only_shared(&temp, Duration::from_secs(1)).await;
+        // Leave wall time for the stub request when nextest is CPU-contended;
+        // the 20ms poll interval still exercises the retry budget.
+        let shared = poll_only_shared(&temp, Duration::from_secs(5)).await;
         let slots = shared.state.fresh_merge_poll_slots.clone();
         let total = slots.available_permits();
         assert!(
