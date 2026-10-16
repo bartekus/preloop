@@ -3180,7 +3180,10 @@ async fn pr_head_commit_skips_ci(
                     (Some(token), bucket)
                 }
                 Err(error) => {
-                    warn!(?error, "failed to mint token for [skip ci] check; running CI");
+                    warn!(
+                        ?error,
+                        "failed to mint token for [skip ci] check; running CI"
+                    );
                     return false;
                 }
             }
@@ -3208,7 +3211,10 @@ async fn pr_head_commit_skips_ci(
     {
         Ok(response) => response,
         Err(error) => {
-            warn!(?error, "failed to fetch PR head commit for [skip ci] check; running CI");
+            warn!(
+                ?error,
+                "failed to fetch PR head commit for [skip ci] check; running CI"
+            );
             return false;
         }
     };
@@ -4663,7 +4669,10 @@ async fn process_delivery_payload_with_lease(
     // (both the pull_request_target and pull_request fan-out). Fork PRs are
     // never eligible — untrusted code cannot opt itself out of scrutiny. This
     // runs before the changed-files lookup so a skipped PR burns no API call.
-    if matches!(delivery.event.as_str(), "pull_request" | "pull_request_target") {
+    if matches!(
+        delivery.event.as_str(),
+        "pull_request" | "pull_request_target"
+    ) {
         let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_owned());
         if pr_head_commit_skips_ci(shared, &repo_full_name, &payload_val, &api_base).await {
