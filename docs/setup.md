@@ -435,10 +435,14 @@ not hold plaintext at rest, two options:
 Everything lives in `~/.preloop/config.toml` (mode 0600; `PRELOOP_CONFIG`
 overrides the path, `PRELOOP_HOME` the default directory). GitHub App keys,
 PATs, and webhook secrets are held in the engine's credential store: private
-`0600` files under `$PRELOOP_HOME/credentials` by default. Set
-`credential_store = "os"` to hold them in the operating-system credential store
-instead (Keychain on macOS, Credential Manager on Windows, Secret Service on
-Linux). The config file keeps only a `*_ref` name pointing at each one.
+`0600` files in `<config-parent>/credentials` by default
+(`$PRELOOP_HOME/credentials` when the config is the default
+`$PRELOOP_HOME/config.toml`). If `PRELOOP_CONFIG` points elsewhere, the
+credential directory follows it — for example,
+`PRELOOP_CONFIG=/srv/preloop/config.toml` uses `/srv/preloop/credentials`.
+Set `credential_store = "os"` to hold them in the operating-system credential
+store instead (Keychain on macOS, Credential Manager on Windows, Secret Service
+on Linux). The config file keeps only a `*_ref` name pointing at each one.
 Credentials still stored inline are migrated on the next `preloop serve`, which
 rewrites the config to reference them instead. A missing or empty file is fine
 (everything defaults); a malformed one fails startup, so a typo is caught before
@@ -447,16 +451,15 @@ a mint or a job hits it. `preloop setup github` writes the `[github]` section;
 section and runs `setup` for the credentials.
 
 With `credential_store = "os"`, a keychain that is unavailable (a headless Linux
-box without a Secret Service daemon, or an SSH session that cannot unlock it) or
-that refuses a write does not lose the credential. Preloop stores it in the file
-store instead, prints a warning naming the directory, and sets
-`credential_store = "file"` in the config so later starts read the same place.
-When the selected store is unreachable at startup, the engine logs a warning and
-falls back to any inline values plus the `PRELOOP_GITHUB_*` environment
-variables, which always take precedence. Nothing is migrated then, so the config
-is left exactly as written. Secrets an earlier build kept in the keychain are
-copied into the file store the first time they are read; the keychain entry is
-left in place.
+box without a Secret Service daemon, or an SSH session that cannot unlock it)
+or that refuses a write does not lose the credential. Preloop stores it in the
+file store instead, prints a warning naming the directory, and sets
+`credential_store = "file"` in the config. An explicit
+`PRELOOP_CREDENTIAL_STORE=os` still wins over that config key, but the selected
+OS-primary store reads the sibling file store when the OS store is unavailable,
+the read fails, or the entry is absent. A successful OS value is authoritative;
+the file value is used only as fallback. This keeps setup's file fallback
+readable without requiring the environment override to be removed.
 
 Fields:
 

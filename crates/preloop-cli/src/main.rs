@@ -1823,8 +1823,9 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
     let mut file_config = preloop_runner_server::config::load_config()?;
-    let store = preloop_runner_server::credential_store::selected_store(
-        &preloop_home(),
+    let config_path = preloop_runner_server::config::config_path();
+    let store = preloop_runner_server::credential_store::selected_store_for_config(
+        &config_path,
         file_config.credential_store.as_deref(),
     )?;
     // Read before migrating: migration moves the inline values out of

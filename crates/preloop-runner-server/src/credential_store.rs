@@ -920,6 +920,136 @@ impl<S: CredentialStore> CredentialStore for CachedCredentialStore<S> {
 /// Environment variable that overrides the configured credential store.
 pub const CREDENTIAL_STORE_ENV: &str = "PRELOOP_CREDENTIAL_STORE";
 
+/// A primary credential store with a private file fallback.
+///
+/// The primary remains authoritative whenever it returns a value. A missing
+/// entry, an unavailable store, or an individual read failure falls through
+/// to the file store so a setup write that had to fall back remains readable
+/// even while `PRELOOP_CREDENTIAL_STORE=os` is still exported.
+#[derive(Clone)]
+pub struct FallbackCredentialStore {
+    primary: Arc<dyn CredentialStore>,
+    fallback: FileCredentialStore,
+    primary_available: Arc<parking_lot::Mutex<Option<bool>>>,
+}
+
+impl FallbackCredentialStore {
+    /// Wrap `primary`, using `fallback` for misses and primary-store errors.
+    pub fn new(primary: Arc<dyn CredentialStore>, fallback: FileCredentialStore) -> Self {
+        Self {
+            primary,
+            fallback,
+            primary_available: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    fn primary_is_available(&self) -> bool {
+        let mut available = self.primary_available.lock();
+        if let Some(available) = *available {
+            return available;
+        }
+        let result = self.primary.available().is_ok();
+        *available = Some(result);
+        result
+    }
+
+    fn primary_failed(&self) {
+        *self.primary_available.lock() = Some(false);
+    }
+}
+
+impl CredentialStore for FallbackCredentialStore {
+    fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+        if self.primary_is_available() {
+            match self.primary.get(reference) {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(error) => {
+                    self.primary_failed();
+                    tracing::debug!(
+                        store = self.primary.name(),
+                        reference = reference.as_str(),
+                        %error,
+                        "primary credential read failed; trying private file fallback"
+                    );
+                }
+            }
+        }
+        self.fallback.get(reference)
+    }
+
+    fn get_fresh(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+        if self.primary_is_available() {
+            match self.primary.get_fresh(reference) {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(error) => {
+                    self.primary_failed();
+                    tracing::debug!(
+                        store = self.primary.name(),
+                        reference = reference.as_str(),
+                        %error,
+                        "primary credential readback failed; trying private file fallback"
+                    );
+                }
+            }
+        }
+        self.fallback.get(reference)
+    }
+
+    fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+        if self.primary_is_available() {
+            match self.primary.set(reference, value) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.primary_failed();
+                    return self.fallback.set(reference, value).with_context(|| {
+                        format!(
+                            "store the credential in the file fallback after {} failed: \
+                                 {error:#}",
+                            self.primary.name()
+                        )
+                    });
+                }
+            }
+        }
+        self.fallback.set(reference, value)
+    }
+
+    fn delete(&self, reference: &CredentialRef) -> Result<()> {
+        let primary_error = if self.primary_is_available() {
+            match self.primary.delete(reference) {
+                Ok(()) => None,
+                Err(error) => {
+                    self.primary_failed();
+                    Some(error)
+                }
+            }
+        } else {
+            None
+        };
+        let fallback_result = self.fallback.delete(reference);
+        match primary_error {
+            Some(error) => {
+                fallback_result?;
+                Err(error).context("delete credential from primary store")
+            }
+            None => fallback_result,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.primary.name()
+    }
+
+    fn available(&self) -> Result<()> {
+        // The file backend is part of this composite store, so an unavailable
+        // primary is not an unavailable selected store.
+        let _ = self.primary_is_available();
+        self.fallback.available()
+    }
+}
+
 /// A credential backend, as chosen by [`selected_kind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialStoreKind {
@@ -977,18 +1107,48 @@ fn kind_from(env: Option<&str>, configured: Option<&str>) -> Result<CredentialSt
 ///
 /// The file store reads through to the OS store on a miss, so a credential an
 /// earlier build wrote to the keychain stays reachable: a value found there is
-/// copied into the file store, and the OS entry is never deleted.
+/// copied into the file store, and the OS entry is never deleted. When `os` is
+/// selected, the OS store is primary and this function still keeps the private
+/// file store as a read/write fallback.
 pub fn selected_store(
     state_dir: &Path,
     configured: Option<&str>,
 ) -> Result<Arc<dyn CredentialStore>> {
+    selected_store_at(FileCredentialStore::default_dir(state_dir), configured)
+}
+
+/// Return the private credential directory associated with a config file.
+///
+/// Credentials live beside the config, not beside an unrelated
+/// `PRELOOP_HOME`: `<config-parent>/credentials`. A relative config filename
+/// with no parent uses `./credentials`.
+pub fn credential_store_dir(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    FileCredentialStore::default_dir(parent)
+}
+
+/// [`selected_store`] using the credential directory beside `config_path`.
+pub fn selected_store_for_config(
+    config_path: &Path,
+    configured: Option<&str>,
+) -> Result<Arc<dyn CredentialStore>> {
+    selected_store_at(credential_store_dir(config_path), configured)
+}
+
+fn selected_store_at(
+    credentials_dir: PathBuf,
+    configured: Option<&str>,
+) -> Result<Arc<dyn CredentialStore>> {
+    let file = FileCredentialStore::new(credentials_dir);
     Ok(match selected_kind(configured)? {
         // Not cached: a cache would only hide changes made by other processes.
-        CredentialStoreKind::File => Arc::new(
-            FileCredentialStore::new(FileCredentialStore::default_dir(state_dir))
-                .migrating_from(os_credential_store()),
-        ),
-        CredentialStoreKind::Os => os_credential_store(),
+        CredentialStoreKind::File => Arc::new(file.migrating_from(os_credential_store())),
+        CredentialStoreKind::Os => {
+            Arc::new(FallbackCredentialStore::new(os_credential_store(), file))
+        }
         // Shared across calls: a long-lived process (or a test that loads a
         // config it just wrote) resolves and writes credentials through
         // separate calls, and a fresh store per call would forget every
@@ -1040,7 +1200,24 @@ impl CredentialWriter {
     /// The writer for the engine whose state lives in `state_dir`, under the
     /// backend [`selected_kind`] picks.
     pub fn for_home(state_dir: &Path, configured: Option<&str>) -> Result<Self> {
-        let file = FileCredentialStore::new(FileCredentialStore::default_dir(state_dir));
+        Self::from_file_store(
+            FileCredentialStore::new(FileCredentialStore::default_dir(state_dir)),
+            configured,
+        )
+    }
+
+    /// The writer for credentials associated with `config_path`.
+    ///
+    /// The private file fallback is always the `credentials` sibling of the
+    /// config file, matching [`selected_store_for_config`].
+    pub fn for_config(config_path: &Path, configured: Option<&str>) -> Result<Self> {
+        Self::from_file_store(
+            FileCredentialStore::new(credential_store_dir(config_path)),
+            configured,
+        )
+    }
+
+    fn from_file_store(file: FileCredentialStore, configured: Option<&str>) -> Result<Self> {
         Ok(match selected_kind(configured)? {
             CredentialStoreKind::Os => Self {
                 store: os_credential_store(),
@@ -1918,6 +2095,74 @@ mod tests {
         fn name(&self) -> &'static str {
             "refusing credential store"
         }
+    }
+
+    #[test]
+    fn os_primary_reads_and_writes_through_file_fallbacks() {
+        let reference = CredentialRef::new("github-pat-fallback").unwrap();
+        let mut read_error = LegacyOsStore::reachable();
+        read_error.fail_reads = true;
+        let cases: [(&str, Arc<dyn CredentialStore>); 3] = [
+            ("unavailable", Arc::new(UnavailableCredentialStore)),
+            ("read error", Arc::new(read_error)),
+            ("write error", Arc::new(RefusingCredentialStore)),
+        ];
+
+        for (case, primary) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let fallback = FileCredentialStore::new(dir.path().join("credentials"));
+            fallback
+                .set(&reference, &SecretString::new("file-value"))
+                .unwrap();
+            let store = FallbackCredentialStore::new(primary, fallback.clone());
+            assert_eq!(
+                store
+                    .get(&reference)
+                    .unwrap()
+                    .as_ref()
+                    .map(|value| value.expose()),
+                Some("file-value"),
+                "{case}: file fallback was not readable"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = FileCredentialStore::new(dir.path().join("credentials"));
+        let store =
+            FallbackCredentialStore::new(Arc::new(RefusingCredentialStore), fallback.clone());
+        store
+            .set(&reference, &SecretString::new("written-through"))
+            .unwrap();
+        assert_eq!(
+            fallback
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|value| value.expose()),
+            Some("written-through"),
+            "a primary write failure must persist to the file fallback"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = FileCredentialStore::new(dir.path().join("credentials"));
+        fallback
+            .set(&reference, &SecretString::new("file-value"))
+            .unwrap();
+        let primary = LegacyOsStore::reachable();
+        primary
+            .inner
+            .set(&reference, &SecretString::new("os-value"))
+            .unwrap();
+        let store = FallbackCredentialStore::new(Arc::new(primary), fallback);
+        assert_eq!(
+            store
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|value| value.expose()),
+            Some("os-value"),
+            "a successful OS value must remain authoritative over the file fallback"
+        );
     }
 
     #[test]

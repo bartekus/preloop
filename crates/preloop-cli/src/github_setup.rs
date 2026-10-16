@@ -8,7 +8,9 @@
 use crate::preloop_home;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use preloop_runner_server::config::{ConfigFile, load_config, store_memory, write_config};
+use preloop_runner_server::config::{
+    ConfigFile, config_path, load_config, store_memory, write_config,
+};
 use preloop_runner_server::credential_store::{
     CredentialRef, CredentialWriter, SecretString, Written, github_reference,
     github_reference_with_host,
@@ -259,8 +261,8 @@ pub(crate) async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()
             let mut config = load_config()?;
             let target_app_id = args.app_id.clone().or_else(|| config.github.app_id.clone());
             if let Some(app_id) = target_app_id {
-                let mut writer = CredentialWriter::for_home(
-                    &preloop_home(),
+                let mut writer = CredentialWriter::for_config(
+                    &config_path(),
                     config.credential_store.as_deref(),
                 )?;
                 let reference = github_reference_with_host(
@@ -393,7 +395,7 @@ fn save_app_credentials(
 ) -> anyhow::Result<PathBuf> {
     let mut config = load_config()?;
     let mut writer =
-        CredentialWriter::for_home(&preloop_home(), config.credential_store.as_deref())?;
+        CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
     record_app_credentials(&mut config, &mut writer, app_id, pem, webhook_secret)?;
     write_config(&config)
 }
@@ -501,7 +503,7 @@ async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
     // Settle the config and the store selection before GitHub creates the App:
     // its one-time private key must have somewhere to land once it exists.
     let preflight = load_config()?;
-    CredentialWriter::for_home(&preloop_home(), preflight.credential_store.as_deref())?;
+    CredentialWriter::for_config(&config_path(), preflight.credential_store.as_deref())?;
     let (registration, path) = crate::app_manifest::register_with_persist(
         &args.app_name,
         args.org.as_deref(),
@@ -572,7 +574,7 @@ async fn enable_webhooks(
         .await?;
     let mut config = load_config()?;
     let mut writer =
-        CredentialWriter::for_home(&preloop_home(), config.credential_store.as_deref())?;
+        CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
     let webhook_ref =
         github_reference_with_host("webhook", config.github.server_url.as_deref(), Some(app_id))?;
     persist_secret(&mut writer, &mut config, &webhook_ref, &secret)?;
@@ -687,7 +689,7 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
 
     let mut config = load_config()?;
     let mut writer =
-        CredentialWriter::for_home(&preloop_home(), config.credential_store.as_deref())?;
+        CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
     let pat_ref = github_reference_with_host("pat", config.github.server_url.as_deref(), None)?;
     persist_secret(&mut writer, &mut config, &pat_ref, &token)?;
     config.github.legacy_pat = None;
@@ -1347,7 +1349,8 @@ pub(crate) fn config_path_for_home() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use preloop_runner_server::credential_store::CREDENTIAL_STORE_ENV;
+    static SETUP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn checklist_union_of_workflow_permissions() {
         let dir = tempfile::tempdir().unwrap();
@@ -1466,6 +1469,9 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn app_key_survives_an_os_store_write_failure() {
+        let _env_guard = SETUP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use preloop_runner_server::credential_store::{CREDENTIAL_STORE_ENV, FileCredentialStore};
 
         let home = tempfile::tempdir().unwrap();
@@ -1513,5 +1519,80 @@ mod tests {
         assert_eq!(loaded.github.app_pem(), Some(pem));
         assert_eq!(loaded.github.webhook_secret(), Some("hook-secret"));
         assert_eq!(loaded.credential_store.as_deref(), Some("file"));
+    }
+    /// The real setup writers and a subsequent normal config load agree on
+    /// the credential directory when an explicit config path is outside the
+    /// CLI home. The file backend keeps this test off the host keychain.
+    #[test]
+    #[allow(unsafe_code)]
+    fn setup_round_trips_app_and_pat_beside_external_config() {
+        let _env_guard = SETUP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("config.toml");
+        let previous_config = std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV);
+        let previous_home = std::env::var_os("PRELOOP_HOME");
+        let previous_store = std::env::var_os(CREDENTIAL_STORE_ENV);
+        // SAFETY: this test serializes process-global env access with
+        // SETUP_ENV_LOCK and restores each value below.
+        unsafe {
+            std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, &config_path);
+            std::env::set_var("PRELOOP_HOME", home.path());
+            std::env::set_var(CREDENTIAL_STORE_ENV, "file");
+        }
+
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nEXTERNAL-PEM\n-----END RSA PRIVATE KEY-----\n";
+        let pem_path = home.path().join("app.pem");
+        std::fs::write(&pem_path, pem).unwrap();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                save_app_credentials("9876", pem, None)?;
+                setup_pat(&GithubSetupArgs {
+                    via: Some(Via::Pat),
+                    app_id: None,
+                    pem_file: None,
+                    add: false,
+                    org: None,
+                    port: 0,
+                    public_url: None,
+                    app_name: "preloop-test".to_owned(),
+                    no_browser: true,
+                    webhook_secret: None,
+                    token: Some("github_pat_external".to_owned()),
+                    repos: Vec::new(),
+                    workspace: None,
+                })
+                .await?;
+                preloop_runner_server::config::load_config_from(&config_path)
+            });
+
+        // SAFETY: restores the values captured before the test.
+        unsafe {
+            match previous_config {
+                Some(value) => {
+                    std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, value)
+                }
+                None => std::env::remove_var(preloop_runner_server::config::CONFIG_PATH_ENV),
+            }
+            match previous_home {
+                Some(value) => std::env::set_var("PRELOOP_HOME", value),
+                None => std::env::remove_var("PRELOOP_HOME"),
+            }
+            match previous_store {
+                Some(value) => std::env::set_var(CREDENTIAL_STORE_ENV, value),
+                None => std::env::remove_var(CREDENTIAL_STORE_ENV),
+            }
+        }
+
+        let loaded = result.unwrap();
+        assert_eq!(loaded.github.app_pem(), Some(pem));
+        assert_eq!(loaded.github.pat(), Some("github_pat_external"));
+        assert!(config_root.path().join("credentials").is_dir());
+        assert!(!home.path().join("credentials").exists());
     }
 }

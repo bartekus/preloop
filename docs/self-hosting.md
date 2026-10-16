@@ -623,21 +623,28 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 #### Another engine is already running
 
 Only one engine serves a state directory. A second `preloop serve` on the same
-`$PRELOOP_HOME` exits at once and names the engine holding `state/serve.lock`,
-with its pid and the way to stop it:
+`$PRELOOP_HOME` exits at once. When the operating system can prove that the PID
+recorded in `$PRELOOP_HOME/serve.lock` owns that exact lock, the error names
+the engine and the way to stop it:
 
 - **Started by a preloop command** (the autostart of `preloop status` and other
   client commands): `kill <pid>` stops it, and then `preloop serve` can run in
   this terminal.
 - **A systemd service**: stop both units. Stopping only `preloop.service` is not
   enough, because `preloop.socket` starts it again on the next connection:
-  `sudo systemctl stop preloop.socket preloop.service`. Per-user installs use the
-  same commands with `systemctl --user` and no `sudo`.
+  `sudo systemctl stop preloop.socket preloop.service`. Per-user installs use
+  the same commands with `systemctl --user` and no `sudo`.
 - **Running in another terminal**: stop it there with Ctrl-C, or `kill <pid>`.
 
-When the message says the holder left no usable record, the holder is an older
-build or the record is damaged. Find the process holding the lock: on Linux,
-`lslocks | grep serve.lock`; on macOS, `lsof <state dir>/serve.lock`.
+The PID in `serve.lock` is advisory and is never enough by itself to justify a
+`kill`: a stale record can name a live, unrelated process after PID reuse.
+PID remediation appears only when Linux proves the owner: Preloop checks the
+exact lock-file inode and owner in `/proc/locks`. macOS cannot prove the owner,
+because `lsof` does not report `flock` locks. There, a recorded PID that is
+still running is shown as unverified, with `ps -p <pid> -o lstart=,command=` to
+check it. To find the holder by hand, use `lslocks | grep serve.lock` on Linux
+or `ps -axo pid=,lstart=,command= | grep '[p]reloop serve'` on macOS. Re-run
+`preloop serve` after stopping the process.
 
 ---
 

@@ -867,9 +867,11 @@ pub struct ConfigFile {
     #[serde(default)]
     pub secrets_store: Option<String>,
     /// Credential backend for the engine token and the GitHub App, PAT, and
-    /// webhook secrets: `file` (the default: `0600` files under
-    /// `<PRELOOP_HOME>/credentials`) or `os` (the native keychain or
-    /// secret-service). `PRELOOP_CREDENTIAL_STORE` overrides this key.
+    /// webhook secrets. For config-backed GitHub credentials, `file` (the
+    /// default) stores `0600` files under the config file's parent
+    /// `credentials` directory; the engine token remains scoped to its engine
+    /// home. `os` uses the native keychain or secret-service.
+    /// `PRELOOP_CREDENTIAL_STORE` overrides this key.
     #[serde(default)]
     pub credential_store: Option<String>,
     /// Maximum jobs one run may expand to (after matrix expansion), a
@@ -1850,12 +1852,10 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         .with_context(|| format!("validating config {}", path.display()))?;
     validate_execution_protection(&config)
         .with_context(|| format!("validating config {}", path.display()))?;
-    let cred_base = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let store =
-        crate::credential_store::selected_store(&cred_base, config.credential_store.as_deref())?;
+    let store = crate::credential_store::selected_store_for_config(
+        path,
+        config.credential_store.as_deref(),
+    )?;
     resolve_credential_references(&mut config, store.as_ref())?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
@@ -1977,8 +1977,10 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         // Same store selection as `load_config_from`; sealing with a different
         // backend than unsealing makes the file unreadable.
-        let store =
-            crate::credential_store::selected_store(dir, sealed.credential_store.as_deref())?;
+        let store = crate::credential_store::selected_store_for_config(
+            path,
+            sealed.credential_store.as_deref(),
+        )?;
         seal_config_secrets(&mut sealed, dir, store.as_ref())
             .with_context(|| format!("sealing secrets in config {}", path.display()))?;
     }
@@ -2216,7 +2218,8 @@ mod tests {
     }
 
     use crate::credential_store::{
-        MemoryCredentialStore, UnavailableCredentialStore, github_reference,
+        CREDENTIAL_STORE_ENV, CredentialWriter, FileCredentialStore, MemoryCredentialStore,
+        UnavailableCredentialStore, credential_store_dir, github_reference,
     };
 
     fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {
@@ -2774,6 +2777,77 @@ REPO_OVERLAY = "repo-from-credential"
         let loaded = load_config_from(&path).unwrap();
         assert_eq!(loaded.github.app_pem(), Some(pem));
         assert_eq!(loaded.credential_store, None);
+    }
+    /// A setup fallback remains readable when the explicit environment
+    /// override still selects the OS-primary store on the next load.
+    #[tokio::test]
+    async fn os_env_reads_pem_and_pat_from_the_file_fallback() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::set(CREDENTIAL_STORE_ENV, "os");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let credentials = FileCredentialStore::new(credential_store_dir(&config_path));
+        let pem_ref = github_reference("app-pem", Some("777")).unwrap();
+        let pat_ref = github_reference("pat", None).unwrap();
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nFALLBACK-PEM\n-----END RSA PRIVATE KEY-----\n";
+        credentials.set(&pem_ref, &SecretString::new(pem)).unwrap();
+        credentials
+            .set(&pat_ref, &SecretString::new("fallback-pat"))
+            .unwrap();
+
+        let config = ConfigFile {
+            credential_store: Some("file".to_owned()),
+            github: GitHubConfig {
+                app_id: Some("777".to_owned()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                pat_ref: Some(pat_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..ConfigFile::default()
+        };
+        write_config_to(&config_path, &config).unwrap();
+
+        let loaded = load_config_from(&config_path).unwrap();
+        assert_eq!(loaded.github.app_pem(), Some(pem));
+        assert_eq!(loaded.github.pat(), Some("fallback-pat"));
+    }
+
+    /// Writers and readers use the config's parent when `PRELOOP_CONFIG` is
+    /// outside `PRELOOP_HOME`, for both App PEMs and PATs.
+    #[tokio::test]
+    async fn explicit_config_path_uses_its_sibling_credentials_directory() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _store_env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
+        let home = tempfile::tempdir().unwrap();
+        let _home_env = crate::state::TestEnvVar::set("PRELOOP_HOME", home.path());
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("config.toml");
+        let mut writer = CredentialWriter::for_config(&config_path, None).unwrap();
+        let pem_ref = github_reference("app-pem", Some("888")).unwrap();
+        let pat_ref = github_reference("pat", None).unwrap();
+        writer
+            .write(&pem_ref, &SecretString::new("external-pem"))
+            .unwrap();
+        writer
+            .write(&pat_ref, &SecretString::new("external-pat"))
+            .unwrap();
+
+        let config = ConfigFile {
+            github: GitHubConfig {
+                app_id: Some("888".to_owned()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                pat_ref: Some(pat_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..ConfigFile::default()
+        };
+        write_config_to(&config_path, &config).unwrap();
+        assert!(credential_store_dir(&config_path).exists());
+        assert!(!home.path().join("credentials").exists());
+
+        let loaded = load_config_from(&config_path).unwrap();
+        assert_eq!(loaded.github.app_pem(), Some("external-pem"));
+        assert_eq!(loaded.github.pat(), Some("external-pat"));
     }
 
     /// Sealed secrets survive the move to the file store: a key an earlier

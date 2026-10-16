@@ -12,8 +12,10 @@ Releases before v0.27.0 predate the changelog.
 
 - **The file credential store is the default.** The engine token, GitHub App
   private key, PAT, and webhook secrets are written to `0600` files under
-  `$PRELOOP_HOME/credentials` instead of the OS keychain. Select the keychain
-  with `credential_store = "os"` in `config.toml` or `PRELOOP_CREDENTIAL_STORE=os`.
+  `$PRELOOP_HOME/credentials` instead of the OS keychain. GitHub credentials
+  follow the config file, so a `PRELOOP_CONFIG` outside `$PRELOOP_HOME` gets a
+  `credentials` directory beside it. Select the keychain with
+  `credential_store = "os"` in `config.toml` or `PRELOOP_CREDENTIAL_STORE=os`.
   The environment variable overrides the config key, and an unknown value in
   either is an error that names the valid choices. Credentials an earlier build
   kept in the keychain are copied into the file store the first time they are
@@ -32,13 +34,14 @@ Releases before v0.27.0 predate the changelog.
   optional installation redirect, so an install timeout or Ctrl-C cannot lose
   the one-time PEM.
 
-- **`preloop serve` names the engine holding `serve.lock` and how to stop it.**
-  A second engine on the same state directory now reports the holder's pid,
-  when it started, how it was started (a preloop command's autostart, a systemd
-  service, or another terminal), and the command that stops it. For systemd that
-  is `sudo systemctl stop preloop.socket preloop.service`, since the socket unit
-  would otherwise start the service again. A holder that left no readable record
-  gets the `lslocks` / `lsof` hint instead.
+- **`preloop serve` explains a `serve.lock` collision.** A second engine on the same
+  state directory reports the recorded holder's pid, start time, and how it was
+  started (a preloop command's autostart, a systemd service, or another terminal).
+  On Linux, when `/proc/locks` proves that pid holds the lock, it also prints how to
+  stop it; for systemd that is `sudo systemctl stop preloop.socket preloop.service`,
+  since the socket unit would otherwise start the service again. Otherwise the pid is
+  shown as unverified, with a command to find the holder, and no stop command is
+  suggested.
 
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
