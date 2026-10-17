@@ -31,6 +31,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::credential_store::CredentialRef;
+use crate::github_breaker::{
+    GithubBreakerRegistry, GithubConsumption, GithubCredentialBucket, GithubSubsystem,
+};
 use crate::shared_http::CLIENT;
 /// Private-key environment variables, highest precedence first. The flag marks
 /// a variable that holds a path to a PEM file rather than the PEM itself.
@@ -262,6 +265,15 @@ pub struct GitHubAppCredentials {
     /// GitHub scopes to someone else's repositories. The verified owner is
     /// cached so the check costs one API call per (app, installation) pair.
     verified_installation_owners: Arc<parking_lot::Mutex<HashMap<(String, u64), String>>>,
+    /// Breaker registry this App's JWT calls report through, under the
+    /// `App(app_id)` bucket. Attached by [`GitHubApps::with_github_accounting`]
+    /// when an `AppState` adopts the registry. `None` for credentials built
+    /// outside an `AppState` (the CLI's setup and doctor paths): their calls
+    /// are sent plainly.
+    github_breakers: Option<Arc<crate::github_breaker::GithubBreakerRegistry>>,
+    /// Consumption accounting for this App's JWT calls, attached together with
+    /// `github_breakers`.
+    github_consumption: Option<Arc<crate::github_breaker::GithubConsumption>>,
 }
 
 /// Registry of every configured GitHub App.
@@ -322,6 +334,20 @@ impl GitHubApps {
             signers.push((legacy.to_owned(), WebhookSigner::Legacy));
         }
         signers
+    }
+
+    /// Route every registered App's JWT calls through `breakers` and
+    /// `consumption`, giving each App its own `App(app_id)` budget.
+    pub fn with_github_accounting(
+        mut self,
+        breakers: &Arc<crate::github_breaker::GithubBreakerRegistry>,
+        consumption: &Arc<crate::github_breaker::GithubConsumption>,
+    ) -> Self {
+        for app in &mut self.apps {
+            app.github_breakers = Some(Arc::clone(breakers));
+            app.github_consumption = Some(Arc::clone(consumption));
+        }
+        self
     }
 }
 
@@ -416,6 +442,8 @@ impl GitHubAppCredentials {
             webhook_secret: None,
             installation_id: None,
             verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            github_breakers: None,
+            github_consumption: None,
         }
     }
 }
@@ -426,7 +454,21 @@ impl GitHubAppCredentials {
     ///
     /// Authenticates with the App JWT, the only credential `/app` accepts.
     pub async fn read_app_subscription(&self) -> anyhow::Result<AppSubscription> {
-        read_app_subscription_at(&api_base(), &self.app_id, &self.private_key).await
+        read_app_subscription_at_with_breaker(
+            &api_base(),
+            &self.app_id,
+            &self.private_key,
+            self.github_accounting(),
+        )
+        .await
+    }
+
+    /// Breaker and consumption handles for this App's JWT calls, present when
+    /// the credentials were registered with an `AppState`.
+    fn github_accounting(&self) -> Option<(&GithubBreakerRegistry, &GithubConsumption)> {
+        self.github_breakers
+            .as_deref()
+            .zip(self.github_consumption.as_deref())
     }
 }
 
@@ -512,6 +554,8 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 webhook_secret: crate::config::webhook_secret_from_env_or_config(file_config),
                 installation_id: installation_id_override()?,
                 verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                github_breakers: None,
+                github_consumption: None,
             });
         }
         (None, None) => {}
@@ -593,6 +637,8 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
             webhook_secret,
             installation_id: app.installation_id,
             verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            github_breakers: None,
+            github_consumption: None,
         });
     }
     if apps.is_empty() {
@@ -766,13 +812,18 @@ pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str)
         Err(_) => return false,
     };
     let url = format!("{api_base}/repos/{owner}/{repo}/installation");
-    let response = match CLIENT
+    let request = CLIENT
         .get(&url)
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
+        .header("Accept", "application/vnd.github+json");
+    let response = match send_app_jwt(
+        app.github_accounting(),
+        &app.app_id,
+        GithubSubsystem::AppAuth,
+        request,
+    )
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -906,8 +957,15 @@ async fn mint_for_repository(
     let (owner, repo) = split_repository(repository)?;
     let app_jwt = sign_app_jwt(&creds.app_id, &creds.private_key)?;
     let installation_id = installation_id_for(api_base, creds, &app_jwt, owner).await?;
-    let attempt =
-        mint_installation_token(api_base, &app_jwt, installation_id, repo, permissions).await;
+    let attempt = mint_installation_token(
+        api_base,
+        creds,
+        &app_jwt,
+        installation_id,
+        repo,
+        permissions,
+    )
+    .await;
     // GitHub rejects the *whole* request when one scope is ungranted, so a
     // default set that happens to name a scope this installation lacks would
     // otherwise cost the job its GitHub authority entirely — the job then
@@ -920,7 +978,7 @@ async fn mint_for_repository(
     });
     let mut narrowed = None;
     let (token, expires_at) = if unprocessable {
-        let granted = installation_grants(api_base, &app_jwt, installation_id).await?;
+        let granted = installation_grants(api_base, creds, &app_jwt, installation_id).await?;
         let missing = ungranted_scopes(permissions, &granted);
         let clamped = clamp_to_grants(permissions, &granted);
         if declared {
@@ -944,7 +1002,8 @@ async fn mint_for_repository(
             );
         }
         let minted =
-            mint_installation_token(api_base, &app_jwt, installation_id, repo, &clamped).await?;
+            mint_installation_token(api_base, creds, &app_jwt, installation_id, repo, &clamped)
+                .await?;
         narrowed = Some(clamped);
         minted
     } else {
@@ -980,18 +1039,24 @@ async fn mint_for_repository(
 /// Permission scopes this installation currently holds, keyed snake_case.
 async fn installation_grants(
     api_base: &str,
+    creds: &GitHubAppCredentials,
     app_jwt: &str,
     installation_id: u64,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let url = format!("{api_base}/app/installations/{installation_id}");
-    let response = CLIENT
+    let request = CLIENT
         .get(&url)
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+        .header("Accept", "application/vnd.github+json");
+    let response = send_app_jwt(
+        creds.github_accounting(),
+        &creds.app_id,
+        GithubSubsystem::AppAuth,
+        request,
+    )
+    .await
+    .with_context(|| format!("GET {url}"))?;
     let status = response.status();
     let payload = response
         .text()
@@ -1064,18 +1129,28 @@ pub fn sign_app_jwt(app_id: &str, key: &rsa::RsaPrivateKey) -> anyhow::Result<St
 }
 
 /// Resolve the id of this App's installation on `owner`'s account.
-pub async fn find_installation(api_base: &str, app_jwt: &str, owner: &str) -> anyhow::Result<u64> {
+pub async fn find_installation(
+    api_base: &str,
+    creds: &GitHubAppCredentials,
+    app_jwt: &str,
+    owner: &str,
+) -> anyhow::Result<u64> {
     for page in 1..=MAX_INSTALLATION_PAGES {
         let url =
             format!("{api_base}/app/installations?per_page={INSTALLATIONS_PER_PAGE}&page={page}");
-        let response = CLIENT
+        let request = CLIENT
             .get(&url)
             .header("User-Agent", "preloop")
             .header("Authorization", format!("Bearer {app_jwt}"))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
+            .header("Accept", "application/vnd.github+json");
+        let response = send_app_jwt(
+            creds.github_accounting(),
+            &creds.app_id,
+            GithubSubsystem::AppAuth,
+            request,
+        )
+        .await
+        .with_context(|| format!("GET {url}"))?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -1113,6 +1188,7 @@ pub async fn find_installation(api_base: &str, app_jwt: &str, owner: &str) -> an
 /// already fixes the owner.
 pub async fn mint_installation_token(
     api_base: &str,
+    creds: &GitHubAppCredentials,
     app_jwt: &str,
     installation_id: u64,
     repository: &str,
@@ -1127,15 +1203,20 @@ pub async fn mint_installation_token(
         "repositories": [repository],
         "permissions": installation_permissions(permissions),
     });
-    let response = CLIENT
+    let request = CLIENT
         .post(&url)
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
         .header("Accept", "application/vnd.github+json")
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
+        .json(&body);
+    let response = send_app_jwt(
+        creds.github_accounting(),
+        &creds.app_id,
+        GithubSubsystem::AppAuth,
+        request,
+    )
+    .await
+    .with_context(|| format!("POST {url}"))?;
     let status = response.status();
     // The success body carries the token, so it is parsed but never logged.
     let payload = response
@@ -1188,7 +1269,7 @@ async fn installation_id_for(
             return Ok(*installation_id);
         }
     }
-    let installation_id = find_installation(api_base, app_jwt, owner).await?;
+    let installation_id = find_installation(api_base, creds, app_jwt, owner).await?;
     creds
         .installation_cache
         .write()
@@ -1227,14 +1308,19 @@ async fn verify_override_installation_owner(
         );
     }
     let url = format!("{api_base}/app/installations/{installation_id}");
-    let response = CLIENT
+    let request = CLIENT
         .get(&url)
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+        .header("Accept", "application/vnd.github+json");
+    let response = send_app_jwt(
+        creds.github_accounting(),
+        &creds.app_id,
+        GithubSubsystem::AppAuth,
+        request,
+    )
+    .await
+    .with_context(|| format!("GET {url}"))?;
     let status = response.status();
     let payload = response
         .text()
@@ -1519,7 +1605,7 @@ async fn set_app_webhook_config_at(
 ) -> anyhow::Result<()> {
     let creds = credentials_for(app_id, pem)?;
     let app_jwt = sign_app_jwt(&creds.app_id, &creds.private_key)?;
-    let response = crate::shared_http::CLIENT
+    let request = crate::shared_http::CLIENT
         .patch(format!("{api_base}/app/hook/config"))
         .bearer_auth(&app_jwt)
         .header("Accept", "application/vnd.github+json")
@@ -1529,10 +1615,15 @@ async fn set_app_webhook_config_at(
             "content_type": "json",
             "secret": secret,
             "insecure_ssl": "0",
-        }))
-        .send()
-        .await
-        .context("calling GitHub to update the App webhook configuration")?;
+        }));
+    let response = send_app_jwt(
+        creds.github_accounting(),
+        &creds.app_id,
+        GithubSubsystem::Webhooks,
+        request,
+    )
+    .await
+    .context("calling GitHub to update the App webhook configuration")?;
     let status = response.status();
     if status.is_success() {
         // GitHub cannot change an App's event subscription through the API
@@ -1733,17 +1824,48 @@ impl AppSubscription {
     }
 }
 
+/// Send a request that authenticates as a GitHub App (an App JWT).
+///
+/// With accounting handles, the call goes through the App's `App(app_id)`
+/// breaker bucket and is accounted under `subsystem`. Without them it is a
+/// plain send: the CLI's setup and doctor credentials are built outside an
+/// `AppState`, so there is no registry to report to.
+async fn send_app_jwt(
+    accounting: Option<(&GithubBreakerRegistry, &GithubConsumption)>,
+    app_id: &str,
+    subsystem: GithubSubsystem,
+    request: reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    match accounting {
+        Some((registry, consumption)) => {
+            let response = crate::github_breaker::send_observed_labeled(
+                registry,
+                GithubCredentialBucket::for_app(app_id),
+                consumption,
+                subsystem,
+                request,
+            )
+            .await?;
+            // The labeled sender accounts the exchange but not its bytes;
+            // charge the advertised size before a caller consumes the body.
+            consumption.record_advertised_bytes(subsystem, &response);
+            Ok(response)
+        }
+        None => Ok(request.send().await?),
+    }
+}
+
 /// Read a GitHub App endpoint as JSON.
 ///
-/// The optional breaker registry is used by periodic health checks; startup
-/// reads pass `None` because the registry is not initialized at that point.
-/// App-JWT calls carry the App bucket: the App's own rate-limit identity.
+/// The accounting handles come from the running `AppState`; callers without one
+/// (the CLI) pass `None`. App-JWT calls carry the App bucket: the App's own
+/// rate-limit identity.
 async fn read_app_json_at(
     api_base: &str,
     path: &str,
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
-    breaker: Option<&crate::github_breaker::GithubBreakerRegistry>,
+    accounting: Option<(&GithubBreakerRegistry, &GithubConsumption)>,
 ) -> anyhow::Result<serde_json::Value> {
     let app_jwt = sign_app_jwt(app_id, private_key)?;
     let request = CLIENT
@@ -1751,20 +1873,9 @@ async fn read_app_json_at(
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
         .header("Accept", "application/vnd.github+json");
-    let response = match breaker {
-        Some(registry) => {
-            crate::github_breaker::send_observed(
-                registry,
-                crate::github_breaker::GithubCredentialBucket::App,
-                request,
-            )
-            .await?
-        }
-        None => request
-            .send()
-            .await
-            .with_context(|| format!("GET {api_base}{path}"))?,
-    };
+    let response = send_app_jwt(accounting, app_id, GithubSubsystem::Webhooks, request)
+        .await
+        .with_context(|| format!("GET {api_base}{path}"))?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -1794,9 +1905,9 @@ pub async fn read_app_subscription_at_with_breaker(
     api_base: &str,
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
-    breaker: Option<&crate::github_breaker::GithubBreakerRegistry>,
+    accounting: Option<(&GithubBreakerRegistry, &GithubConsumption)>,
 ) -> anyhow::Result<AppSubscription> {
-    let payload = read_app_json_at(api_base, "/app", app_id, private_key, breaker).await?;
+    let payload = read_app_json_at(api_base, "/app", app_id, private_key, accounting).await?;
     let events = payload
         .get("events")
         .and_then(serde_json::Value::as_array)
@@ -1855,10 +1966,16 @@ pub async fn read_app_hook_config_at_with_breaker(
     api_base: &str,
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
-    breaker: Option<&crate::github_breaker::GithubBreakerRegistry>,
+    accounting: Option<(&GithubBreakerRegistry, &GithubConsumption)>,
 ) -> anyhow::Result<AppHookConfig> {
-    let payload =
-        read_app_json_at(api_base, "/app/hook/config", app_id, private_key, breaker).await?;
+    let payload = read_app_json_at(
+        api_base,
+        "/app/hook/config",
+        app_id,
+        private_key,
+        accounting,
+    )
+    .await?;
     let field = |name: &str| {
         payload
             .get(name)
@@ -1902,6 +2019,8 @@ fn credentials_for(app_id: &str, pem: &str) -> anyhow::Result<GitHubAppCredentia
         webhook_secret: None,
         installation_id: None,
         verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        github_breakers: None,
+        github_consumption: None,
     })
 }
 
@@ -2194,6 +2313,57 @@ mod tests {
         assert!(parse_private_key("not a pem at all").is_err());
     }
 
+    /// An App JWT response is charged its advertised `content-length` to the
+    /// subsystem that sent it: the labeled sender accounts the exchange but
+    /// not its bytes, so without the funnel doing it the `app-auth` counters
+    /// stay at zero no matter how much traffic flows.
+    #[tokio::test]
+    async fn app_jwt_responses_are_charged_their_advertised_bytes() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let payload = json!({ "events": ["push"], "permissions": { "contents": "read" } });
+        let body = payload.clone();
+        let stub = Router::new().route(
+            "/app",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        let registry = crate::github_breaker::GithubBreakerRegistry::default();
+        let consumption = crate::github_breaker::GithubConsumption::default();
+        let request = CLIENT.get(format!("{api_base}/app"));
+        send_app_jwt(
+            Some((&registry, &consumption)),
+            "424",
+            GithubSubsystem::AppAuth,
+            request,
+        )
+        .await
+        .expect("send an App JWT request");
+
+        let advertised = serde_json::to_vec(&payload)
+            .expect("serialize the stub body")
+            .len() as u64;
+        let usage = consumption
+            .snapshot()
+            .into_iter()
+            .find(|usage| usage.subsystem == GithubSubsystem::AppAuth.as_str())
+            .expect("app-auth usage row");
+        assert_eq!(usage.requests, 1);
+        assert_eq!(
+            usage.bytes, advertised,
+            "the response's advertised content-length must be charged to app-auth"
+        );
+    }
+
     /// Records what the stub GitHub API was asked for.
     #[derive(Default)]
     struct StubCalls {
@@ -2289,6 +2459,8 @@ mod tests {
             webhook_secret: None,
             installation_id: None,
             verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            github_breakers: None,
+            github_consumption: None,
         };
         let permissions = BTreeMap::from([
             ("contents".to_owned(), "read".to_owned()),

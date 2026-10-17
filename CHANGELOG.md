@@ -35,6 +35,17 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **The GitHub App JWT breaker is partitioned by App id**: one App's rate
+  limit or outage no longer skips the webhook-health and delivery-watchdog
+  checks of the other Apps, and installation lookup, token minting, and App
+  reads now go through the breaker and the `app-auth` consumption counters.
+  A pass that skips an App behind its breaker no longer counts as a successful
+  watchdog poll, so `webhook_watchdog_stale` still fires while any App's
+  deliveries go unwatched; a held-back App stays visible in the health snapshot
+  as explicitly unchecked and keeps its own check time instead of inheriting
+  the pass's, and App JWT responses charge their advertised bytes to the
+  consumption counters.
+
 - **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
   RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
   extraction) flagged by `cargo audit`.
