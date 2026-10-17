@@ -4100,8 +4100,11 @@ pub(crate) mod suite {
         // row the count missed can surface after the prune; rows never
         // vanish except by pruning. Hence `>=`: prune removed no more than it
         // reported.
+        // The count and the prune are separate snapshots on one cluster, so a
+        // row the count could not see (above the cluster-wide `xmin`) may be
+        // removed by the prune: `pruned` can legitimately exceed `before`.
         assert!(
-            outbox_len(backend).await >= before - pruned as usize,
+            outbox_len(backend).await >= before.saturating_sub(pruned as usize),
             "prune removes no more rows than it counted"
         );
 
