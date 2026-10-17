@@ -76,16 +76,17 @@ structurally identical to a fresh run.
   does not apply migration SQL. Opening SQLite can create the database file
   (and parent directory) and normalize its permissions, so it is not a
   strictly read-only filesystem probe.
-- `preloop serve` **never** migrates: an uninitialized, older, newer or
-  divergent database refuses with `preloop store migrate` in the message. A
-  legacy store (`PRAGMA user_version` 11 / `schema_migrations`, or the
-  Postgres `public` legacy tables) refuses with
-  `preloop store import-legacy --source <old> --target <new>`.
-- Some local setup/start paths initialize a missing SQLite store through the
-  embedded migration set. Do not rely on every service-install or foreground
-  mode to do this: `preloop serve` does not migrate. Provision and upgrade
-  stores explicitly with `preloop store migrate`; existing stores are not
-  upgraded implicitly.
+- `preloop serve` initializes a **brand-new** local SQLite store (absent or
+  empty) through the embedded migration set, and otherwise **never** migrates:
+  an older, newer or divergent database refuses with `preloop store migrate`
+  in the message. A legacy store (`PRAGMA user_version` 11 /
+  `schema_migrations`, or the Postgres `public` legacy tables) refuses with
+  `preloop store import-legacy --source <old> --target <new>`. A Postgres
+  store is never initialized here.
+- Other local setup paths initialize a missing SQLite store the same way:
+  `preloop init` run in the foreground, and `preloop server install` (as the
+  service account). Provision and upgrade stores explicitly with
+  `preloop store migrate`; existing stores are not upgraded implicitly.
 
 ## CI
 

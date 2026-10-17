@@ -775,8 +775,9 @@ enum Command {
     /// pending migrations, report migration state — and the one-time import
     /// of a legacy v11 `preloop.db`.
     ///
-    /// `preloop serve` never migrates: a missing, older or newer control
-    /// schema refuses at boot and names `preloop store migrate` as the fix.
+    /// `preloop serve` initializes only a brand-new local store and otherwise
+    /// never migrates: an older, newer or divergent control schema refuses at
+    /// boot and names `preloop store migrate` as the fix.
     /// SQLite migrations take a consistent backup before changing anything
     /// (refinery has no down; restore the backup to roll back).
     Store(store::StoreArgs),
@@ -814,8 +815,8 @@ enum Command {
     /// tunnel or reverse proxy at `--listen` to receive events from GitHub.
     Serve(ServeArgs),
 
-    /// Former name for `serve`. Retained because `ensure_engine_running`
-    /// spawns it by name, and to keep existing supervisor units working.
+    /// Former name for `serve`. Retained so existing supervisor units and
+    /// scripts that still invoke it keep working.
     #[command(hide = true)]
     Engine,
 
@@ -1155,10 +1156,10 @@ async fn main() -> anyhow::Result<()> {
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
         _ => {
-            // Bootstrap the engine for client commands, but bind the outcome
-            // instead of `?` so the telemetry flush below still runs when
-            // engine startup fails.
-            match ensure_engine_running().await {
+            // Client commands require an engine that is already running
+            // (#658): none of them starts one. Bind the outcome instead of
+            // `?` so the telemetry flush below still runs when it is missing.
+            match require_running_engine().await {
                 Ok(()) => match cli.command {
                     Command::Run(args) => cmd_run(args).await,
                     Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
@@ -1500,127 +1501,69 @@ async fn probe_engine_health(client: &reqwest::Client, url: &str) -> bool {
         .is_ok()
 }
 
-/// The last lines the engine wrote to `engine.log` at or after `offset`, which
-/// hold its own exit error. Empty when the log cannot be read.
-fn engine_log_tail(path: &std::path::Path, offset: u64) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL_LINES: usize = 20;
-    let mut bytes = Vec::new();
-    let read = std::fs::File::open(path).and_then(|mut file| {
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_to_end(&mut bytes)
-    });
-    if read.is_err() {
-        return String::new();
+/// The whole client-side engine-access policy, and it has exactly two
+/// outcomes: an engine that answers lets the command proceed, anything else
+/// refuses. No client command may start an engine (#658 — a `preloop run`
+/// from the pre-push hook used to boot a control plane and a smolVM on the
+/// developer's machine); `preloop serve` is the only entry point that starts
+/// one.
+///
+/// Pure on purpose: the start path is gone, so this is the policy's entire
+/// surface and tests cover it without touching the process table.
+fn engine_access(reachable: bool, url: &str) -> anyhow::Result<()> {
+    if reachable {
+        return Ok(());
     }
-    let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let tail = &lines[lines.len().saturating_sub(TAIL_LINES)..];
-    if tail.is_empty() {
-        return String::new();
-    }
-    format!("\n{}\n(full log: {})", tail.join("\n"), path.display())
+    Err(no_engine_error(url))
 }
 
-async fn ensure_engine_running() -> anyhow::Result<()> {
-    if std::env::var("PRELOOP_URL").is_ok() {
-        return Ok(());
-    }
+/// What a client command says, and exits non-zero with, when nothing answers
+/// the liveness probe: what was probed, and both ways to start an engine.
+///
+/// The message carries [`ENGINE_UNREACHABLE_MARKER`] through
+/// [`engine_unreachable_context`]. That is a compatibility contract, not
+/// decoration: the pre-push hook fails open only on that marker, so dropping
+/// it would turn a missing engine into "CI failed" and block pushes with a
+/// verdict about a run that never happened.
+fn no_engine_error(url: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no engine is running at {url} — start one with `preloop serve` (foreground) \
+         or `preloop server install` (supervised service)"
+    )
+    .context(engine_unreachable_context())
+}
 
+/// Probe the endpoint this CLI would use — `PRELOOP_URL` when set, else the
+/// local default — and refuse when nothing answers.
+///
+/// `PRELOOP_URL` still means "talk to that engine": it is probed like any
+/// other endpoint, never assumed live, and never replaced by a locally
+/// started one.
+async fn require_running_engine() -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
+    // Anonymous liveness probe — see `probe_engine_health`.
+    let reachable = probe_engine_health(&client, &url).await;
+    engine_access(reachable, &url)
+}
 
-    // The liveness probe is anonymous — see `probe_engine_health`.
-    if probe_engine_health(&client, &url).await {
-        return Ok(());
-    }
-
-    eprintln!("[preloop] Starting local background engine...");
-
-    let preloop_dir = preloop_home();
-    let state_dir = preloop_dir.join("state");
-    let pid_path = preloop_dir.join("preloop.pid");
-
+/// First-run preparation for the one command that starts an engine: create
+/// the home and, when the local control database is brand-new (absent or
+/// empty), initialize it through the embedded migrations, so a fresh
+/// `PRELOOP_HOME` serves with no extra step.
+///
+/// An existing database is never touched: `preloop serve` does not migrate,
+/// and an older, newer or divergent schema still fails the boot with
+/// `preloop store migrate` in the message. `PRELOOP_STORE_URL` redirects the
+/// store — a Postgres URL is the operator's to provision.
+fn prepare_local_engine_home(home: &std::path::Path) -> anyhow::Result<()> {
+    let state_dir = home.join("state");
     std::fs::create_dir_all(&state_dir)?;
-    set_private_directory_permissions(&preloop_dir)?;
-
-    // Brand-new local installs: initialize the control database here so
-    // first use stays zero-config. Anything that already exists is left
-    // untouched — the engine refuses a missing/older/newer schema and
-    // `preloop store migrate` is the explicit upgrade path (never implicit).
+    set_private_directory_permissions(home)?;
     if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)? {
-        eprintln!(
-            "[preloop] initialized the local control database ({}), migrations applied",
-            state_dir.join("preloop.db").display()
-        );
+        eprintln!("[preloop] initialized the brand-new control database");
     }
-
-    let store = preloop_runner_server::credential_store::engine_store(&preloop_dir)?;
-    let token = prepare_engine_token(
-        &preloop_dir,
-        std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
-        store.as_ref(),
-    )?;
-
-    let engine_bin = std::env::current_exe().context("resolve preloop executable")?;
-
-    let mut cmd = std::process::Command::new(&engine_bin);
-    cmd.arg("engine");
-    cmd.env("PRELOOP_SYSTEM_TOKEN", token);
-    cmd.env("PRELOOP_HOME", &preloop_dir);
-    // Lets the engine record in serve.lock that a preloop command started it,
-    // so a second `preloop serve` names the right way to stop it.
-    cmd.env(
-        preloop_runner_server::bootstrap::ENGINE_ORIGIN_ENV,
-        preloop_runner_server::bootstrap::EngineOrigin::Background.as_str(),
-    );
-    if std::env::var_os("RUST_LOG").is_none() {
-        cmd.env("RUST_LOG", "info,preloop=debug");
-    }
-
-    let engine_log = preloop_dir.join("engine.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&engine_log)?;
-    // Where this start's output begins, so a failed start quotes only its own error.
-    let log_offset = log_file.metadata()?.len();
-
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(log_file.try_clone()?);
-    cmd.stderr(log_file);
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn engine at {}", engine_bin.display()))?;
-
-    let _ = std::fs::write(&pid_path, child.id().to_string());
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(30) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!(
-                "engine exited before becoming ready: {status}{}",
-                engine_log_tail(&engine_log, log_offset)
-            );
-        }
-        if client
-            .get(format!("{url}/healthz"))
-            .timeout(Duration::from_millis(300))
-            .send()
-            .await
-            .is_ok()
-        {
-            eprintln!("[preloop] Engine ready.");
-            return Ok(());
-        }
-    }
-
-    anyhow::bail!("engine auto-boot timed out after 30 seconds");
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1953,6 +1896,12 @@ async fn cmd_engine(
     }
     let runner_url = std::env::var("PRELOOP_RUNNER_URL").unwrap();
     let control_origin = mounted_control_origin(&runner_url);
+
+    // `preloop serve` is the only command that starts an engine (#658), so
+    // it owns the zero-config first run: create the home and initialize a
+    // brand-new control database. The removed client-command auto-start used
+    // to perform this step.
+    prepare_local_engine_home(&home)?;
 
     // Resolve GitHub credentials before `AppState::new` reads the environment.
     // Both `github_app::load_from_env` and the webhook-secret lookup happen
@@ -7718,23 +7667,61 @@ mod tests {
         );
     }
 
+    /// The policy is probe-only (#658): an engine that answers is used, and a
+    /// silent endpoint refuses. There is no third outcome — no client command
+    /// starts an engine.
     #[test]
-    fn engine_log_tail_quotes_only_this_starts_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("engine.log");
-        let previous = "previous run\nold error\n";
-        std::fs::write(&log, previous).unwrap();
-        let offset = u64::try_from(previous.len()).unwrap();
-        std::fs::write(
-            &log,
-            format!("{previous}starting engine\nError: unlock the login keychain\n"),
-        )
-        .unwrap();
+    fn a_reachable_engine_lets_the_command_proceed() {
+        assert!(engine_access(true, "http://127.0.0.1:9090").is_ok());
+    }
 
-        let tail = engine_log_tail(&log, offset);
-        assert!(tail.contains("Error: unlock the login keychain"), "{tail}");
-        assert!(!tail.contains("old error"), "{tail}");
-        assert!(tail.contains(&log.display().to_string()), "{tail}");
-        assert_eq!(engine_log_tail(&dir.path().join("missing.log"), 0), "");
+    /// The refusal names the probed endpoint and both ways to start an engine,
+    /// and it carries the pre-push hook's fail-open marker. That marker is a
+    /// compatibility contract: without it the hook reads the non-zero exit as
+    /// "CI failed" and blocks the push over a run that never happened.
+    #[test]
+    fn an_unreachable_engine_refuses_with_the_marker_and_the_fix() {
+        let url = "http://127.0.0.1:19099";
+        let error = engine_access(false, url).unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains(url), "{rendered}");
+        assert!(rendered.contains("no engine is running"), "{rendered}");
+        assert!(rendered.contains("preloop serve"), "{rendered}");
+        assert!(rendered.contains("preloop server install"), "{rendered}");
+        assert!(rendered.contains(ENGINE_UNREACHABLE_MARKER), "{rendered}");
+    }
+
+    /// `preloop serve` is the only command that starts an engine, so the
+    /// zero-config first run — the brand-new control database — must be part
+    /// of its path (`cmd_engine` calls this). A second preparation is a no-op:
+    /// an existing store is never rebuilt, and upgrading is `preloop store
+    /// migrate`.
+    #[test]
+    fn serve_prepares_a_fresh_home_and_leaves_an_existing_store_alone() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous_store = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
+        unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        prepare_local_engine_home(home).unwrap();
+        let db = home.join("state").join("preloop.db");
+        assert!(db.is_file(), "a fresh home must get a control database");
+        let created = std::fs::metadata(&db).unwrap();
+
+        prepare_local_engine_home(home).unwrap();
+        let untouched = std::fs::metadata(&db).unwrap();
+        assert_eq!(
+            (created.len(), created.modified().unwrap()),
+            (untouched.len(), untouched.modified().unwrap()),
+            "an existing store must not be rewritten"
+        );
+
+        match previous_store {
+            Some(previous) => unsafe {
+                std::env::set_var(preloop_runner_server::store::STORE_URL_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
+        }
     }
 }

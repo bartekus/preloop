@@ -648,9 +648,10 @@ Only one engine serves a state directory. A second `preloop serve` on the same
 recorded in `$PRELOOP_HOME/serve.lock` owns that exact lock, the error names
 the engine and the way to stop it:
 
-- **Started by a preloop command** (the autostart of `preloop status` and other
-  client commands): `kill <pid>` stops it, and then `preloop serve` can run in
-  this terminal.
+- **Started in the background** by a launcher that set
+  `PRELOOP_ENGINE_ORIGIN=background` (no preloop command starts an engine on
+  its own — issue #658): `kill <pid>` stops it, and then `preloop serve` can
+  run in this terminal.
 - **A systemd service**: stop both units. Stopping only `preloop.service` is not
   enough, because `preloop.socket` starts it again on the next connection:
   `sudo systemctl stop preloop.socket preloop.service`. Per-user installs use

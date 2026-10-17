@@ -32,14 +32,19 @@ Usage: preloop <COMMAND>
 | `update` | Poll GitHub Releases and atomically self-update |
 | `serve` | Run the control plane + microVM runner pool in the foreground |
 
-`preloop run` auto-starts the engine when no server is reachable
-(`ensure_engine_running`); `serve` is the explicit foreground server.
+**Only `preloop serve` starts an engine** (`engine` is its former name). Every
+other command requires one that is already running: it probes `PRELOOP_URL`
+(default `http://127.0.0.1:9090`) and, when nothing answers, exits non-zero
+naming the probed endpoint and how to start one — `preloop serve` for the
+foreground, `preloop server install` for a supervised service. `preloop run`
+is included: it submits work to an engine, it does not boot one (issue #658).
 
 ---
 
 ## `preloop run [OPTIONS]`
 
-Submit a workflow and stream its events until terminal.
+Submit a workflow and stream its events until terminal. Requires a running
+engine (`preloop serve`); it does not start one.
 
 | Flag | Description |
 |---|---|
@@ -444,9 +449,11 @@ bootstrap the engine.
 
 ### `preloop store migrate [OPTIONS]`
 
-Initialize or upgrade the schema. `preloop serve` never applies migrations;
-run this command explicitly. SQLite migrations take a pre-migration backup by
-default when the database exists and has pending migrations.
+Initialize or upgrade the schema. `preloop serve` initializes only a brand-new
+local store and otherwise never applies migrations; run this command
+explicitly to upgrade an existing store. SQLite migrations take a
+pre-migration backup by default when the database exists and has pending
+migrations.
 
 | Flag | Description |
 |---|---|
@@ -494,6 +501,10 @@ Poll GitHub Releases and atomically install the matching binary.
 
 Run the control plane and microVM runner pool in the foreground — the
 self-hosting entry point (webhook + Checks endpoints, microVM provisioning).
+**The only command that starts an engine**: every other command requires one
+that is already running, and exits non-zero when it finds none (issue #658).
+On a fresh `PRELOOP_HOME` it initializes the brand-new control database; an
+existing store is never migrated here (`preloop store migrate`).
 
 | Flag | Description |
 |---|---|

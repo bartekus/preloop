@@ -3,9 +3,9 @@
 //! Schema administration (`migrate`/`status`) lives in
 //! `preloop_runner_server::store_admin` (that crate owns the database drivers
 //! and the embedded migrations); this module owns only the CLI surface and
-//! its output. `preloop serve` never migrates: a missing/older/newer control
-//! schema refuses at boot and names `preloop store migrate` as the explicit
-//! recovery.
+//! its output. `preloop serve` initializes only a brand-new local store and
+//! otherwise never migrates: an older/newer/divergent control schema refuses
+//! at boot and names `preloop store migrate` as the explicit recovery.
 //!
 //! `import-legacy` is the one-time, explicit move from a released v11
 //! `preloop.db` (the durable-state store the control backend replaced) to a

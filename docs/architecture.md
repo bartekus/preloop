@@ -72,11 +72,12 @@ diverge between nodes. Scheduling decisions that need Rust evaluation live in
 
 Backends are selected by `--store` / `PRELOOP_STORE_URL` (`sqlite://<path>`, a
 bare path, or `postgres://…`), defaulting to SQLite at `<state_dir>/preloop.db`.
-The control schema uses embedded, forward-only refinery migrations. Fresh local
-SQLite stores are initialized by supported setup paths; existing stores are
-upgraded explicitly with `preloop store migrate`. `preloop serve` verifies the
-migration ledger and refuses an uninitialized or incompatible schema rather
-than migrating it. `schema_meta` is not the version authority; see
+The control schema uses embedded, forward-only refinery migrations. A fresh
+local SQLite store is initialized by the supported setup paths (`preloop serve`
+on a fresh `$PRELOOP_HOME`, `preloop init`, `preloop server install`); existing
+stores are upgraded explicitly with `preloop store migrate`. `preloop serve`
+otherwise refuses an older, newer or incompatible schema rather than migrating
+it. `schema_meta` is not the version authority; see
 [Control database migrations](control-migrations.md).
 
 The Postgres backend supports several engine nodes sharing one database for

@@ -180,9 +180,10 @@ pub async fn status(target: StoreTarget) -> anyhow::Result<StoreStatus> {
 }
 
 /// First-run preparation for a local install: initialize ONLY a brand-new
-/// (absent or empty) SQLite control database so `preloop run` stays
-/// zero-config. An existing database — any state other than empty — is left
-/// untouched: upgrading is `preloop store migrate`, never implicit.
+/// (absent or empty) SQLite control database, so a fresh `PRELOOP_HOME`
+/// serves with no extra step. An existing database — any state other than
+/// empty — is left untouched: upgrading is `preloop store migrate`, never
+/// implicit.
 ///
 /// Returns whether the database was created. A Postgres store is never
 /// initialized here (the operator runs `store migrate`). Synchronous on
