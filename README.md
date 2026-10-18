@@ -1,4 +1,16 @@
-# preloop
+<p align="center">
+  <a href="https://preloop.dev"><img src="docs/images/preloop-logo-wide.jpg" width="320" alt="preloop"></a>
+</p>
+
+<p align="center">
+  <b>5× faster drop-in GitHub Actions, rebuilt for agents.</b>
+</p>
+
+<p align="center">
+  <img alt="Status: beta" src="https://img.shields.io/badge/status-beta-orange">
+  <a href="https://github.com/preloopdev/preloop/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/preloopdev/preloop?sort=semver&amp;label=release"></a>
+  <a href="https://www.npmjs.com/package/@preloop-dev/cli"><img alt="npm version" src="https://img.shields.io/npm/v/@preloop-dev/cli?label=npm&amp;logo=npm&amp;logoColor=white"></a>
+</p>
 
 ![Watch the preloop demo: a failed step, a fix in another pane, and a re-run, all local, no push required](docs/demo/demo.gif)
 
