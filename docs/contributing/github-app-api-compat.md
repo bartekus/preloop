@@ -62,7 +62,7 @@ extends that to the *dispatch* contract.
 | Run submission | `src/runs.rs::submit_run_inner` (~123, takes `WorkflowSubmission`) | The scheduler already does "synthesize payload → submit_run_inner" (`src/scheduler.rs` ~745) — the template for dispatch |
 | Workflow fetch | `src/remote_workflows.rs`, `src/github.rs` (~634 contents API, ~715 commit fetch, ~746 PR files) | Fetches `.github/workflows` for a ref; used by the webhook path |
 | Default branch | `src/scheduler.rs` (~388, `GET /repos/{repository}`) | Reusable for ref resolution |
-| App JWT/mint | `src/github_app.rs` | Single App (`PRELOOP_GITHUB_APP_ID` + PEM), installation discovery, per-job token minting with `repositories`+`permissions`, `set_app_webhook_config` (~915, PATCH `/app/hook/config`), manifest defaults include `push`, `pull_request`, and `check_run` |
+| App JWT/mint | `src/github_app.rs` | Single App (`PRELOOP_GITHUB_APP_ID` + PEM), installation discovery, per-job token minting with `repositories`+`permissions`, `set_app_webhook_config` (~915, PATCH `/app/hook/config`), manifest defaults include `push`, `pull_request`, `check_run`, and `workflow_job` |
 | Router | `src/routes.rs` | `protected_apis` block; no `/repos/...` routes |
 | Auth deny rules | `src/auth.rs` (~357-381) | `/api/v3/` denied; `/api/v1/` protected except `/api/v1/actions/`; `/repos/...` currently unclassified |
 | Config | `src/config.rs` `Github` struct | Single `webhook_secret`, `pat`, App env vars |
@@ -161,16 +161,19 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
 
 ### Event subscription
 - Manifest `default_events` is configurable and defaults to the minimal CI set:
-  `push`, `pull_request`. Operators who need additional events must add them
+  `push`, `pull_request`, `check_run`, `workflow_job`. Operators who need
+  additional events must add them
   manually in the App settings UI because GitHub's API cannot change event
   subscriptions after App creation. The trigger events Apps may need include
-  `pull_request_review`, `workflow_dispatch`, `workflow_run`,
+  `pull_request_review`, `workflow_dispatch`, `workflow_run`, `workflow_job`,
   `repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`,
   `create`, `delete`, `release`, plus the Tier B/C events the adapters already
   handle. `pull_request_target` is not among them: preloop synthesizes it from
   the `pull_request` webhook, and GitHub delivers no such event. `check_run`
   and `check_suite` need no explicit subscription when the App holds
   `checks: write` — GitHub auto-subscribes those and omits them from `events`.
+  `workflow_job` requires `actions: read` — without the permission GitHub does
+  not even render its checkbox.
 - **Caveat**: GitHub's `PATCH /app/hook/config` cannot change an App's event
   subscription (only url/content_type/secret). Event subscriptions are set at App
   creation (manifest) or in the App settings UI. So:
@@ -361,9 +364,10 @@ Milestone status and open-question decisions, updated as the work lands.
   `read_app_events_at` parses a stubbed `/app` and
   fails closed on refusal; missing-trigger computation is canonical.
 
-- Manifest defaults include `push`, `pull_request`, and `check_run`. Additional
-  events can be selected with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS`; after
-  creation, operators can add subscriptions manually in GitHub's App settings.
+- Manifest defaults include `push`, `pull_request`, `check_run`, and
+  `workflow_job`. Additional events can be selected with
+  `PRELOOP_GITHUB_APP_DEFAULT_EVENTS`; after creation, operators can add
+  subscriptions manually in GitHub's App settings.
 
 ### Dispatch shim (done)
 

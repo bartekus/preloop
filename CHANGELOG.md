@@ -156,6 +156,20 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **GitHub Apps created by the manifest flow now subscribe to
+  `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
+  signal joins the creation-time `default_events`, and `actions: read` joins
+  the manifest's `default_permissions` because GitHub does not render the
+  `workflow_job` checkbox without it (the permission is requested only when the
+  event list actually carries `workflow_job`). The startup subscription
+  read-back now reports a missing `workflow_job` with the permission-gating
+  remediation. GitHub cannot change an App's event subscriptions through its
+  API after creation, so **Apps created before this change need a manual
+  edit**: App settings → Permissions & events → grant Actions: read
+  (installation must accept) → Subscribe to events → tick `workflow_job`.
+  Apps created without `--public-url` were shipped with no webhook and no
+  `default_events` at all, so enabling webhooks on one of those needs the same
+  manual step for every event.
 - **Converted App credentials are `SecretString` end to end.** The private key
   and webhook secret GitHub returns are deserialized into `SecretString`, so
   formatting or logging either one redacts it; the plaintext is exposed only
