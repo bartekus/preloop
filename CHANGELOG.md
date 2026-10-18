@@ -28,7 +28,8 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
-- **Only `preloop serve` starts an engine.** Every command that talks to an
+- **`preloop serve` (and `preloop init --mode foreground`) is the only way an
+  engine starts.** Every command that talks to an
   engine — `run` and `rerun` included, plus `status`, `logs`, `cancel`,
   `shell`, `debug`, `dap`, `push` and `webhooks` — requires one that is
   already running: it probes the endpoint it would use (`PRELOOP_URL`, else
@@ -36,8 +37,8 @@ Releases before v0.27.0 predate the changelog.
   endpoint and how to start one (`preloop serve` in the foreground, `preloop
   server install` for a supervised service) instead of booting a background
   engine. Local and administrative commands (`plan`, `store`, `setup`,
-  `doctor`, `secret`, `init`, `server`, `update`, `version`, `build-golden`,
-  `golden-path`) never contact one. A set `PRELOOP_URL` no
+  `doctor`, `secret`, `update`, `version`, `build-golden`, `golden-path`, and
+  `init` outside `--mode foreground`) never contact one. A set `PRELOOP_URL` no
   longer implies a live engine, and no command falls back to a local one. The
   refusal keeps the `PRELOOP_UNREACHABLE` marker the pre-push hook fails open
   on, so a missing engine stays a soft gate. A `PRELOOP_URL` that crosses a

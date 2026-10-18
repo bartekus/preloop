@@ -32,17 +32,18 @@ Usage: preloop <COMMAND>
 | `update` | Poll GitHub Releases and atomically self-update |
 | `serve` | Run the control plane + microVM runner pool in the foreground |
 
-**Only `preloop serve` starts an engine** (`engine` is its former name). Every
-command that talks to an engine — `run`, `rerun`, `status`, `logs`, `cancel`,
-`shell`, `debug`, `dap`, `push`, `webhooks` — requires one that is already
-running: it probes `PRELOOP_URL` (default `http://127.0.0.1:9090`) and, when
-nothing answers, exits non-zero naming the probed endpoint and how to start one
-— `preloop serve` for the foreground, `preloop server install` for a supervised
-service. `preloop run` is included: it submits work to an engine, it does not
-boot one (issue #658). Local and administrative commands (`plan`, `store`,
-`setup`, `doctor`, `secret`, `init`, `server`, `update`, `version`,
-`build-golden`, `golden-path`) neither probe nor start an engine, so
-`preloop store migrate` still prepares a database with no engine running.
+**Only `preloop serve` and `preloop init --mode foreground` start an engine**
+(`engine` is `serve`'s former name). Every command that talks to an engine —
+`run`, `rerun`, `status`, `logs`, `cancel`, `shell`, `debug`, `dap`, `push`,
+`webhooks` — requires one that is already running: it probes `PRELOOP_URL`
+(default `http://127.0.0.1:9090`) and, when nothing answers, exits non-zero
+naming the probed endpoint and how to start one — `preloop serve` for the
+foreground, `preloop server install` for a supervised service. `preloop run`
+is included: it submits work to an engine, it does not boot one (issue #658).
+Local and administrative commands (`plan`, `store`, `setup`, `doctor`,
+`secret`, `update`, `version`, `build-golden`, `golden-path`, and `init`
+outside `--mode foreground`) neither probe nor start an engine, so `preloop
+store migrate` still prepares a database with no engine running.
 A loopback endpoint is probed with a tight budget (500 ms) so a silent local
 engine refuses at once; an endpoint that crosses a network gets 5 s, so a
 healthy but slow remote engine is not reported absent.
@@ -538,9 +539,10 @@ Poll GitHub Releases and atomically install the matching binary.
 
 Run the control plane and microVM runner pool in the foreground — the
 self-hosting entry point (webhook + Checks endpoints, microVM provisioning).
-**The only command that starts an engine**: every command that talks to an
-engine requires one that is already running, and exits non-zero when it finds
-none (issue #658); local and administrative commands never contact one.
+**The only foreground entry point that starts an engine** (`preloop init
+--mode foreground` runs this same mode): every command that talks to an engine
+requires one that is already running and exits non-zero when it finds none
+(issue #658), while local and administrative commands never contact one.
 On a fresh `PRELOOP_HOME` it initializes the brand-new control database — the
 one `--store` / `PRELOOP_STORE_URL` selects, which is also the one the boot
 opens; an existing store is never migrated here (`preloop store migrate`), and
