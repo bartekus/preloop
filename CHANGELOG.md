@@ -10,6 +10,21 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
+  `PRELOOP_PUBLIC_URL`), `preloop setup github --via app` asks the running
+  engine to host the App-creation form. The CLI prints a single-use setup link
+  that expires in ten minutes. The engine serves the form at `/setup/github`,
+  converts GitHub's code at `/setup/github/callback`, and stores the credentials
+  the same way the CLI does, so the browser never needs a route back to a
+  laptop. The routes answer 404 unless a setup is in progress. New endpoints:
+  `POST /api/v1/github/setup-sessions` and
+  `GET /api/v1/github/setup-sessions/{id}`, both with the system token.
+
+- **App setup over SSH.** Without a public URL, an SSH session binds the
+  loopback listener on port 8765 (or `--port`) and prints the `ssh -L` command
+  to run on your laptop, then the address to open. The redirect path is the
+  same as the local flow.
+
 - **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
   the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
   release digest and GitHub artifact attestation. Pin a release with
@@ -65,8 +80,77 @@ Releases before v0.27.0 predate the changelog.
   kept in the keychain are copied into the file store the first time they are
   read; the keychain entry is left in place.
 
+- **`$BROWSER` is honored when the CLI opens a page.** It is tried first, as
+  `xdg-open` reads it, so VS Code and Cursor remote terminals open GitHub's
+  setup page on your laptop and forward its port. The platform opener remains
+  the fallback. Entries are parsed with shell-style quoting, so a helper whose
+  path or arguments contain spaces launches, and no entry is waited on — a
+  foreground browser can no longer hold the page it is waiting for.
+
+- **Engine-hosted App setup runs `--repo` checks.** The engine waits (up to
+  five minutes, shared across the list) for the App to be installed on each
+  requested repository, verifies the new credentials there, and reports one
+  `✓`/`✗` line per repository through the session status; the CLI prints them
+  and exits non-zero when a check failed, exactly like the loopback flow's
+  `doctor`. Up to 16 repositories per setup.
+
 ### Fixed
 
+- **Converted App credentials are `SecretString` end to end.** The private key
+  and webhook secret GitHub returns are deserialized into `SecretString`, so
+  formatting or logging either one redacts it; the plaintext is exposed only
+  where it is written through the credential store. A conversion that GitHub
+  rejects no longer puts the upstream response body into the error the CLI
+  prints.
+
+- **GitHub App installation links follow the configured GitHub host.** The
+  slug-based installation URL is built from the same web root the App was
+  created on, so a GitHub Enterprise Server engine no longer sends the operator
+  to `github.com`.
+
+- **Engine-hosted setup no longer races, clobbers, or duplicates.**
+  - A setup session that is converting, or holding a result its CLI has not
+    read yet, is no longer replaced by a second setup: the CLI that was waiting
+    gets its result instead of a 404 while its App exists on GitHub.
+  - App credential writes take the same whole-file config lock as the secrets
+    and execution-protection APIs, so an overlapping write can no longer erase
+    the other's change.
+  - The engine refuses to create a second App when its own config already has
+    one (the CLI's duplicate check cannot see a remote engine's config) and
+    reports the App id instead; `--add` still creates an additional App.
+  - The engine checks that its config loads and its credential store can hold
+    the key before GitHub creates anything, so a key that could not be stored
+    is reported before the App exists rather than after. A store selected with
+    `PRELOOP_CREDENTIAL_STORE=memory` is refused outright: it holds the key for
+    this process only, while the flow's next step is the restart that would
+    lose it.
+  - A setup is refused when `--public-url` names an origin other than the
+    engine's own `PRELOOP_PUBLIC_URL`, and plain `http` is refused outside
+    loopback: the one-time link and GitHub's redirect carry the App's token and
+    code.
+
+- **Refused setup guesses no longer end a live App setup.** The browser-facing
+  `/setup/github` route is unauthenticated, and five wrong tokens used to fail
+  the session outright — which made an onlooker's guesses a way to cancel a
+  setup that was in progress. A mismatch is now refused and logged without
+  touching the session; the one-time token is still burned the moment it is
+  used, and the request budget still caps how fast anyone can guess.
+
+- **A spent setup budget no longer gates the operator's own request.** The
+  browser-facing setup routes billed every request to one shared window before
+  the token or state was checked, so any unauthenticated caller could spend it
+  guessing and the operator's own setup link — or GitHub's redirect with the
+  App's code — was answered 429 while a setup was open. The token and state
+  checks now run first and only a refusal is charged, so the operator's request
+  is never gated; the form and the callback each have their own window, so
+  neither route's guessing can spend the other's. A burst of invalid requests
+  still reads 404 (or 400 for a forged callback) up to the window's limit and
+  429 after it, and an inactive session still reads 404.
+
+- **`PRELOOP_PUBLIC_URL` alone now updates an existing App's webhook.** The
+  effective public URL is resolved before the already-configured-App branch, so
+  setting it in the environment (without `--public-url`) points the configured
+  App's webhook at that address instead of printing only that it is configured.
 - **A hung OS keychain or trust daemon no longer freezes the engine.** On
   macOS, outbound TLS verified every new connection through
   `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked
