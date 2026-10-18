@@ -3,11 +3,13 @@
 The control schema is created and upgraded by **refinery 0.10** over the
 embedded migration sets in `migrations/{sqlite,postgres}`. `preloop serve`
 checks the applied migration ledger against the versions expected by this build
-and refuses an uninitialized or incompatible schema; it never applies
-migrations. Checksum validation is performed when migrations are applied, not
-as a full historical SQL audit on every server open. There is no
-down/rollback: refinery is forward-only, so rollback is a backup restore or a
-forward corrective migration.
+and refuses an incompatible schema; a serving process never migrates a store
+that already exists. The one thing it creates is a **brand-new** (absent or
+empty) local SQLite store, which it initializes through the embedded migration
+set so a fresh install serves with no extra step. Checksum validation is
+performed when migrations are applied, not as a full historical SQL audit on
+every server open. There is no down/rollback: refinery is forward-only, so
+rollback is a backup restore or a forward corrective migration.
 
 ## Ledger
 

@@ -28,18 +28,25 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
-- **Only `preloop serve` starts an engine.** Every other command — `run` and
-  `rerun` included — requires one that is already running: it probes the
-  endpoint it would use (`PRELOOP_URL`, else the local default) and, when
-  nothing answers, exits non-zero naming that endpoint and how to start one
-  (`preloop serve` in the foreground, `preloop server install` for a supervised
-  service) instead of booting a background engine. A set `PRELOOP_URL` no
+- **Only `preloop serve` starts an engine.** Every command that talks to an
+  engine — `run` and `rerun` included, plus `status`, `logs`, `cancel`,
+  `shell`, `debug`, `dap`, `push` and `webhooks` — requires one that is
+  already running: it probes the endpoint it would use (`PRELOOP_URL`, else
+  the local default) and, when nothing answers, exits non-zero naming that
+  endpoint and how to start one (`preloop serve` in the foreground, `preloop
+  server install` for a supervised service) instead of booting a background
+  engine. Local and administrative commands (`plan`, `store`, `setup`,
+  `doctor`, `secret`, `init`, `server`, `update`, `version`, `build-golden`,
+  `golden-path`) never contact one. A set `PRELOOP_URL` no
   longer implies a live engine, and no command falls back to a local one. The
   refusal keeps the `PRELOOP_UNREACHABLE` marker the pre-push hook fails open
-  on, so a missing engine stays a soft gate. The brand-new control-database
+  on, so a missing engine stays a soft gate. A `PRELOOP_URL` that crosses a
+  network is probed with a longer budget than loopback, so an engine that
+  answers slowly is not reported absent. The brand-new control-database
   initialization that the background start performed moved to `preloop serve`,
-  so a fresh `PRELOOP_HOME` still serves with no extra step; an existing store
-  is still never migrated implicitly. Fixes defect 3 of
+  so a fresh `PRELOOP_HOME` still serves with no extra step — of the store
+  `--store` / `PRELOOP_STORE_URL` selects, which is the one the boot opens; an
+  existing store is still never migrated implicitly. Fixes defect 3 of
   [#658](https://github.com/preloopdev/preloop/issues/658): a `preloop run`
   from the pre-push hook used to start a control plane and a smolVM on the
   developer's machine. The hook's other two defects are tracked separately.

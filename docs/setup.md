@@ -562,14 +562,16 @@ preloop store status
 preloop serve
 ```
 
-Fresh local SQLite stores are prepared by supported `preloop init`/`preloop run`
-paths. The server itself never initializes or upgrades a store; use
-`preloop store migrate` for existing or mismatched schemas. See
+Fresh local SQLite stores are prepared by supported `preloop serve`,
+`preloop init` and `preloop server install` paths. A serving process never
+initializes or upgrades a store that already exists; use `preloop store
+migrate` for existing or mismatched schemas. See
 [Control database migrations](control-migrations.md).
 
 - **`sqlite://<path>`**, a bare path, or nothing = SQLite (default).
   `preloop store migrate` initializes a fresh explicit store or upgrades it;
-  `preloop serve` only verifies the schema and refuses an incompatible version.
+  `preloop serve` initializes a brand-new one (absent or empty) and otherwise
+  only verifies the schema, refusing an older, newer or incompatible version.
 - **`postgres://…`** = the Postgres backend, using the same embedded forward-only
   refinery migrations as SQLite. Run `preloop store migrate --store '<URL>'`
   to initialize or upgrade it; `preloop serve` verifies the migration ledger

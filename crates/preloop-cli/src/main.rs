@@ -36,22 +36,9 @@ pub(crate) fn server_url() -> String {
 }
 
 fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
-    if uses_default_transport {
-        return true;
-    }
-
     // An explicit loopback URL is still a local engine invocation. Do not
     // trust a host path for an arbitrary remote server.
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    uses_default_transport || url_is_loopback(url)
 }
 
 fn mounted_control_origin(public_url: &str) -> Option<String> {
@@ -1264,9 +1251,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Plan(args) => cmd_plan(args).await,
         _ => {
             // Client commands require an engine that is already running
-            // (#658): none of them starts one. Bind the outcome instead of
-            // `?` so the telemetry flush below still runs when it is missing.
-            match require_running_engine().await {
+            // (#658): none of them starts one. The probe targets the endpoint
+            // the command will use — `dap --url` overrides `PRELOOP_URL`, and
+            // probing the default there would refuse a live engine. Bind the
+            // outcome instead of `?` so the telemetry flush below still runs
+            // when it is missing.
+            match require_running_engine(command_engine_url(&cli.command)).await {
                 Ok(()) => match cli.command {
                     Command::Run(args) => cmd_run(args).await,
                     Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
@@ -1600,12 +1590,44 @@ fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
 /// a misconfigured auth layer by succeeding where an anonymous probe would
 /// not. Authenticated readiness is checked against `/readyz` separately.
 async fn probe_engine_health(client: &reqwest::Client, url: &str) -> bool {
+    probe_engine_health_within(client, url, probe_timeout(url)).await
+}
+
+/// [`probe_engine_health`] against an explicit budget, so both endpoint
+/// classes can be covered without a network that is actually slow.
+async fn probe_engine_health_within(client: &reqwest::Client, url: &str, budget: Duration) -> bool {
     client
         .get(format!("{url}/healthz"))
-        .timeout(Duration::from_millis(500))
+        .timeout(budget)
         .send()
         .await
         .is_ok()
+}
+
+/// How long the liveness probe waits for `/healthz` before it calls the
+/// endpoint dead.
+///
+/// The two budgets exist because the endpoints are not alike. A loopback
+/// engine answers in microseconds when it is listening and refuses the
+/// connection instantly when it is not, so a client command probes it
+/// tightly: the pre-push hook runs `preloop run`, and time spent waiting on a
+/// silent local endpoint is time it spends on every push. An explicit
+/// `PRELOOP_URL` may cross a network — a tunnel, a reverse proxy, a VPN —
+/// where a healthy `/healthz` can legitimately take longer than that, so the
+/// remote budget waits out one slow round trip instead of reporting a live
+/// engine as absent. Neither budget is negotiable at runtime: the probe has
+/// to refuse a genuinely dead endpoint in bounded time, and a stalled
+/// endpoint must not hang the command.
+const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The liveness-probe budget for `url` — see [`LOOPBACK_PROBE_TIMEOUT`].
+fn probe_timeout(url: &str) -> Duration {
+    if url_is_loopback(url) {
+        LOOPBACK_PROBE_TIMEOUT
+    } else {
+        REMOTE_PROBE_TIMEOUT
+    }
 }
 
 /// The whole client-side engine-access policy, and it has exactly two
@@ -1646,28 +1668,50 @@ fn no_engine_error(url: &str) -> anyhow::Error {
 /// `PRELOOP_URL` still means "talk to that engine": it is probed like any
 /// other endpoint, never assumed live, and never replaced by a locally
 /// started one.
-async fn require_running_engine() -> anyhow::Result<()> {
+///
+/// `url_override` is the endpoint a command carries itself (`dap --url`). It
+/// is probed instead of the default: the command will talk to that engine, so
+/// probing anywhere else would refuse a live one.
+async fn require_running_engine(url_override: Option<&str>) -> anyhow::Result<()> {
     let client = build_client();
-    let url = server_url();
+    let url = url_override.map(str::to_owned).unwrap_or_else(server_url);
     // Anonymous liveness probe — see `probe_engine_health`.
     let reachable = probe_engine_health(&client, &url).await;
     engine_access(reachable, &url)
 }
 
+/// The endpoint a client command selects for itself, when it has one. `None`
+/// means the command talks to whatever `PRELOOP_URL` (else the local default)
+/// names, which [`server_url`] resolves.
+fn command_engine_url(command: &Command) -> Option<&str> {
+    match command {
+        Command::Dap(args) => args.url.as_deref(),
+        _ => None,
+    }
+}
+
 /// First-run preparation for the one command that starts an engine: create
-/// the home and, when the local control database is brand-new (absent or
-/// empty), initialize it through the embedded migrations, so a fresh
-/// `PRELOOP_HOME` serves with no extra step.
+/// the home and, when the control database is brand-new (absent or empty),
+/// initialize it through the embedded migrations, so a fresh `PRELOOP_HOME`
+/// serves with no extra step.
+///
+/// The database prepared is the one the boot will open: `store_url` is
+/// `preloop serve --store`, and `None` falls back to `PRELOOP_STORE_URL` and
+/// then to the state-dir default — the same precedence the server resolves
+/// (`StoreTarget::resolve`).
 ///
 /// An existing database is never touched: `preloop serve` does not migrate,
 /// and an older, newer or divergent schema still fails the boot with
 /// `preloop store migrate` in the message. `PRELOOP_STORE_URL` redirects the
 /// store — a Postgres URL is the operator's to provision.
-fn prepare_local_engine_home(home: &std::path::Path) -> anyhow::Result<()> {
+fn prepare_local_engine_home(
+    home: &std::path::Path,
+    store_url: Option<&str>,
+) -> anyhow::Result<()> {
     let state_dir = home.join("state");
     std::fs::create_dir_all(&state_dir)?;
     set_private_directory_permissions(home)?;
-    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)? {
+    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir, store_url)? {
         eprintln!("[preloop] initialized the brand-new control database");
     }
     Ok(())
@@ -2021,8 +2065,9 @@ async fn cmd_engine(
     // `preloop serve` is the only command that starts an engine (#658), so
     // it owns the zero-config first run: create the home and initialize a
     // brand-new control database. The removed client-command auto-start used
-    // to perform this step.
-    prepare_local_engine_home(&home)?;
+    // to perform this step. `--store` selects the database, exactly as it
+    // selects the one the server below opens.
+    prepare_local_engine_home(&home, args.store.as_deref())?;
 
     // Resolve GitHub credentials before `AppState::new` reads the environment.
     // Both `github_app::load_from_env` and the webhook-secret lookup happen
@@ -7975,6 +8020,30 @@ mod tests {
         assert!(engine_access(true, "http://127.0.0.1:9090").is_ok());
     }
 
+    /// A command that names its own engine (`dap --url`) is probed there, not
+    /// at the default: the gate must not refuse the engine the command would
+    /// have talked to.
+    #[test]
+    fn a_command_endpoint_override_is_the_probed_endpoint() {
+        let dap = dap_client::DapArgs {
+            run_id: "run-42".to_owned(),
+            url: Some("http://127.0.0.1:19099".to_owned()),
+            token: None,
+        };
+        assert_eq!(
+            command_engine_url(&Command::Dap(dap)),
+            Some("http://127.0.0.1:19099")
+        );
+
+        let no_override = dap_client::DapArgs {
+            run_id: "run-42".to_owned(),
+            url: None,
+            token: None,
+        };
+        assert_eq!(command_engine_url(&Command::Dap(no_override)), None);
+        assert_eq!(command_engine_url(&Command::Version), None);
+    }
+
     /// The refusal names the probed endpoint and both ways to start an engine,
     /// and it carries the pre-push hook's fail-open marker. That marker is a
     /// compatibility contract: without it the hook reads the non-zero exit as
@@ -8003,13 +8072,14 @@ mod tests {
         unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) };
 
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        prepare_local_engine_home(home).unwrap();
+        let home = dir.path().join("fresh-home");
+        std::fs::create_dir_all(&home).unwrap();
+        prepare_local_engine_home(&home, None).unwrap();
         let db = home.join("state").join("preloop.db");
         assert!(db.is_file(), "a fresh home must get a control database");
         let created = std::fs::metadata(&db).unwrap();
 
-        prepare_local_engine_home(home).unwrap();
+        prepare_local_engine_home(&home, None).unwrap();
         let untouched = std::fs::metadata(&db).unwrap();
         assert_eq!(
             (created.len(), created.modified().unwrap()),
@@ -8023,5 +8093,106 @@ mod tests {
             },
             None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
         }
+    }
+
+    /// `preloop serve --store` selects the store, and the first-run
+    /// preparation has to follow it: prepared against the state-dir default
+    /// instead, a fresh home would initialize a database the boot never opens
+    /// and then refuse the empty one it was pointed at.
+    #[test]
+    fn serve_prepares_the_store_it_was_pointed_at() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous_store = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
+        // The explicit selection must win over the environment, exactly as it
+        // does for the boot.
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::store::STORE_URL_ENV,
+                "postgres://ignored",
+            )
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("fresh-home");
+        let custom = dir.path().join("custom.db");
+        std::fs::create_dir_all(&home).unwrap();
+        prepare_local_engine_home(&home, Some(&format!("sqlite://{}", custom.display()))).unwrap();
+
+        assert!(
+            custom.is_file(),
+            "the selected store must be the one initialized"
+        );
+        assert!(
+            !home.join("state").join("preloop.db").exists(),
+            "the state-dir default must stay untouched"
+        );
+
+        match previous_store {
+            Some(previous) => unsafe {
+                std::env::set_var(preloop_runner_server::store::STORE_URL_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
+        }
+    }
+
+    /// The probe's budget follows the endpoint class: loopback is probed
+    /// tightly, anything that crosses a network gets room for a slow round
+    /// trip. One constant for both would either hang the pre-push hook or
+    /// report a healthy remote engine as absent.
+    #[test]
+    fn probe_budget_matches_the_endpoint_class() {
+        for loopback in [
+            "http://127.0.0.1:9090",
+            "http://127.0.0.2:9090",
+            "http://localhost:9090",
+            "http://[::1]:9090",
+        ] {
+            assert_eq!(
+                probe_timeout(loopback),
+                LOOPBACK_PROBE_TIMEOUT,
+                "{loopback}"
+            );
+        }
+        for remote in [
+            "https://ci.example.test",
+            "http://10.0.0.5:9090",
+            "http://preloop.internal:9090",
+            // Not a URL at all: an unrecognizable endpoint is never the local
+            // engine, so it gets the forgiving budget rather than a fast
+            // refusal.
+            "not a url",
+        ] {
+            assert_eq!(probe_timeout(remote), REMOTE_PROBE_TIMEOUT, "{remote}");
+        }
+    }
+
+    /// A remote engine that answers `/healthz` slowly is reachable, not
+    /// absent: the same delayed answer fails the loopback budget and passes
+    /// the remote one. Failing before the fix, when every endpoint was probed
+    /// with the loopback budget.
+    #[tokio::test]
+    async fn a_slow_probe_answer_is_not_read_as_an_absent_engine() {
+        let app = axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = build_client();
+        assert!(
+            probe_engine_health_within(&client, &base, REMOTE_PROBE_TIMEOUT).await,
+            "a delayed answer within the remote budget is reachable"
+        );
+        assert!(
+            !probe_engine_health_within(&client, &base, LOOPBACK_PROBE_TIMEOUT).await,
+            "the loopback budget still refuses a stalled endpoint"
+        );
     }
 }

@@ -141,6 +141,28 @@ fn a_reachable_endpoint_lets_the_command_through_to_its_own_request() {
     );
 }
 
+/// A command that names its own engine is probed there: `dap --url` against a
+/// live endpoint must not be refused because `PRELOOP_URL` happens to be dead.
+#[test]
+fn an_endpoint_override_is_probed_instead_of_the_default() {
+    let stub = StubServer::start();
+    let (endpoint, _addr) = dead_endpoint();
+    let home = tempfile::tempdir().expect("temp home");
+    let output = run(
+        home.path(),
+        &endpoint,
+        &["dap", "run-42", "--url", &stub.endpoint()],
+    );
+    let err = stderr(&output);
+
+    assert!(!err.contains("no engine is running"), "{err}");
+    assert!(!err.contains("PRELOOP_UNREACHABLE"), "{err}");
+    assert!(
+        !home.path().join("preloop.pid").exists(),
+        "the gate never writes a pid file"
+    );
+}
+
 /// `serve` owns the zero-config first run: on a fresh `PRELOOP_HOME` it
 /// initializes the brand-new control database before it binds anything.
 ///
@@ -181,6 +203,49 @@ fn serve_prepares_a_fresh_home_and_starts_nothing_here() {
 
     // The boot's schema check requires exactly this: current, nothing pending.
     let status = run(home.path(), &endpoint, &["store", "status"]);
+    let stdout = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(status.status.success(), "{stdout}{}", stderr(&status));
+    assert!(stdout.contains("initialized"), "{stdout}");
+    assert!(!stdout.contains("not at this build's schema"), "{stdout}");
+}
+
+/// `serve --store` owns the first run of the store it names, not of the
+/// state-dir default: prepared against the default, the boot would open an
+/// empty database elsewhere and refuse it.
+#[test]
+fn serve_prepares_the_store_it_was_pointed_at() {
+    let (endpoint, _addr) = dead_endpoint();
+    let home = tempfile::tempdir().expect("temp home");
+    let store = home.path().join("elsewhere").join("custom.db");
+    std::fs::create_dir_all(store.parent().expect("store parent")).expect("store parent");
+    let store_url = format!("sqlite://{}", store.display());
+
+    let output = run(
+        home.path(),
+        &endpoint,
+        &["serve", "--save", "--store", &store_url],
+    );
+    let err = stderr(&output);
+    assert!(!output.status.success(), "{err}");
+    assert!(
+        err.contains("needs at least one GitHub credential flag to save"),
+        "{err}"
+    );
+
+    assert!(
+        store.is_file(),
+        "serve must initialize the store it was pointed at"
+    );
+    assert!(
+        !home.path().join("state").join("preloop.db").exists(),
+        "the state-dir default must stay untouched"
+    );
+
+    let status = run(
+        home.path(),
+        &endpoint,
+        &["store", "status", "--store", &store_url],
+    );
     let stdout = String::from_utf8_lossy(&status.stdout).into_owned();
     assert!(status.status.success(), "{stdout}{}", stderr(&status));
     assert!(stdout.contains("initialized"), "{stdout}");
