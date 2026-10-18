@@ -544,6 +544,91 @@ control backend replaced) into a fresh control database. See
 | `--active <POLICY>` | In-flight work on unfinished jobs: `refuse` (default), `requeue`, or `cancel`. Claims on already-terminal jobs are settled as history without an override |
 | `--json` | Print the machine-readable report |
 
+## `preloop volumes <COMMAND>`
+
+Read-only volumes the engine mounts. Each holds one host tree — today the runner
+bundle, including the Node externals it carries — named
+`preloop-runner-<digest>` after the digest of the tree, so a new bundle is a new
+volume. The engine collects superseded volumes on its own (`gc`, and the
+`PRELOOP_VOLUMES_*` variables); these commands run that plan by hand, or reclaim
+volumes it deliberately leaves alone. They are offline: they talk to AgentENV
+(`PRELOOP_AENV_BINARY`, default `aenv`) and never bootstrap the engine.
+
+### `preloop volumes list`
+
+Lists the volumes AgentENV holds, with kind, mode, size, status, and the
+runner/Node versions each one was populated from. AgentENV cannot be asked what
+is inside a volume, so the versions come from the index the engine writes when
+it populates one: a volume populated before that index existed, or by another
+host, reports `unknown (pre-manifest or created elsewhere)`.
+
+### `preloop volumes prune [--keep <DIR>]... [--dry-run]`
+
+Deletes every volume that no sandbox mounts, except the tree the engine would
+mount. Without `--keep` that tree is the same selection the pool makes —
+`PRELOOP_RUNNER_BUNDLE` when it names a usable Linux runner bundle, otherwise
+the installed or development bundle beside the binary, including the engine's own
+mirror — plus the standalone Node externals
+(`PRELOOP_RUNNER_EXTERNALS`, else `$PRELOOP_HOME/externals`) when one is
+installed.
+
+AgentENV refuses to delete a mounted volume, and that is reported as `in use`,
+not as a failure. A dry run cannot tell which volumes a sandbox holds (the server
+only reveals a reservation when a delete is attempted), so it reports
+`candidate` instead of claiming a deletion.
+
+Pruning is safe while an engine is running: the provider re-checks that a
+remembered volume still exists before reusing it, and populates it again if it
+was deleted. It is not safe while a volume is being populated: one deleted
+between a populate's create and its first mount fails that populate.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable) |
+| `--dry-run` | Report candidates without deleting anything |
+
+### `preloop volumes gc [--keep <DIR>]... [--dry-run]`
+
+Collects the volumes nothing needs any more. It keeps the trees named with
+`--keep` (without that flag, the same tree selection `prune` keeps), every volume a
+sandbox mounts, every volume this engine published and remembers, every volume
+younger than the grace period or with no recorded creation time, the newest
+superseded volume per kind for a rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`,
+default 1), and any staging volume a populate is writing.
+
+Remembering a volume keeps it only while it can be mounted: a volume AgentENV
+reports as `failed` or `uploading` is kept until its grace period is over and
+then reclaimed as `unusable`, because this engine refuses to mount such a volume
+— keeping it would leave every start on that tree stuck.
+
+It deletes the rest and prints one row per volume — size, kind, age and the reason
+it is kept or deleted — so `--dry-run` shows exactly what a real run does. The
+reasons are `live`, `mounted`, `populating`, `young`, `unknown-age`, `previous`
+and `unmanaged` for kept volumes, and `superseded`, `abandoned` (a staging volume
+whose populate is gone) and `unusable` (a volume AgentENV reports as something
+other than `ready`) for deleted ones. A volume whose age nothing recorded —
+populated by an older build, or by another host — is kept, which is what `prune`
+is for.
+
+A planned deletion that something claimed between the plan and the deletion — a
+populate that started while the listing ran, or a volume this engine published
+for a start that is about to mount it — is printed as `left` and left for the
+next pass. A deletion the server refused for any reason other than a mounted
+volume exits nonzero, as `prune` does, so a caller can tell that the cleanup it
+asked for did not happen.
+
+The engine runs the same plan in the background after it populates a volume and
+every `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600 seconds), so a bundle
+change reclaims the bundle it replaced once the grace period is over. The timer
+starts with the engine, so an engine that only resumes sandboxes it already has
+still collects. `PRELOOP_VOLUMES_GC=off` stops those automatic passes and leaves
+this command.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable) |
+| `--dry-run` | Print the plan without deleting anything |
+
 ## `preloop update [OPTIONS]`
 
 Poll GitHub Releases and atomically install the matching binary.
@@ -652,6 +737,10 @@ uses the configured image, baked locally as-is.
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001); `root` restores root; empty disables switching |
+| `PRELOOP_VOLUMES_GC` | `auto` (default) or `off`: whether the engine collects superseded AgentENV volumes on its own, after it populates one and every `PRELOOP_VOLUMES_GC_INTERVAL_SECS`. `off` leaves `preloop volumes gc` |
+| `PRELOOP_VOLUMES_KEEP_PREVIOUS` | Superseded volumes kept per kind for a rollback (default 1). `0` reclaims every superseded volume |
+| `PRELOOP_VOLUMES_GC_GRACE_SECS` | How long a volume is left alone after it was created (default 3600) |
+| `PRELOOP_VOLUMES_GC_INTERVAL_SECS` | Period between automatic collection passes (default 21600; `0` disables the periodic pass) |
 | `PRELOOP_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
 | `PRELOOP_SYSTEM_TOKEN` | Native API bearer token (also `PRELOOP_TOKEN`) |
 | `PRELOOP_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |

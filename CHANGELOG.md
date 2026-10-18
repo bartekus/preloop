@@ -35,6 +35,31 @@ Releases before v0.27.0 predate the changelog.
   ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
   cargo-zigbuild match `release-runner.yml`.
 
+- **Superseded AgentENV volumes are collected automatically.** A runner bundle
+  change publishes a new content-addressed volume and leaves the old one behind;
+  the engine now reclaims the ones nothing needs — unmounted by any sandbox, past
+  the grace period, beyond the newest one kept for a rollback, and not a tree the
+  engine mounts — in a pass after each populate and every six hours (the timer
+  starts with the engine, so an engine that only resumes sandboxes still
+  collects). A pass never deletes a volume a sandbox mounts (AgentENV refuses), a
+  volume whose creation time nothing recorded, or a staging volume a populate is
+  writing, and every deletion is logged with its name, size and reason. A volume
+  AgentENV reports as something other than `ready` is reclaimed once it is past
+  the grace period — including one this engine published and remembers, which it
+  refuses to mount — so a start that would otherwise stay stuck on it populates
+  again. A volume a populate or a start claims between the plan and the deletion
+  is left for the next pass.
+  `PRELOOP_VOLUMES_GC=off` turns the automatic passes off;
+  `PRELOOP_VOLUMES_KEEP_PREVIOUS` (default 1), `PRELOOP_VOLUMES_GC_GRACE_SECS`
+  (default 3600) and `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600) set the
+  retention.
+
+- **`preloop volumes gc [--keep <DIR>]... [--dry-run]`** prints the plan a pass
+  acts on — one row per volume with its size, kind, age and the reason it is kept
+  or deleted — and deletes it unless `--dry-run` is given. A deletion that fails
+  exits nonzero, as `prune` does. `prune` stays as the explicit one-shot for
+  volumes that have no recorded age.
+
 - **`preloop init` workflow readiness checks.** The five-step wizard can ask for
   a stable HTTPS App webhook URL, scan local and configured repositories for
   missing workflow secrets, and report every `runs-on` label against the
@@ -103,6 +128,18 @@ Releases before v0.27.0 predate the changelog.
   kept in the keychain are copied into the file store the first time they are
   read; the keychain entry is left in place.
 
+- **AgentENV runners mount the runner bundle as a read-only volume**: the
+  complete bundle (including Node externals) is archived once into a
+  content-addressed volume named `preloop-runner-<digest>`, stamped with a
+  `.preloop-bundle.json` manifest saying which runner and Node versions it
+  holds, and clones mount it at start with `aenv start --volume`. Fork bases stay
+  volume-free because AgentENV 0.2.1 cannot snapshot a sandbox with a read-only
+  volume; a new bundle is therefore a new volume rather than a golden rebuild.
+  Writable host mounts are refused, symlinks that would leave the tree and
+  set-user-ID/set-group-ID/sticky bits are stripped, and volume create/populate
+  failures are reported by name with no tar fallback. `preloop volumes list|prune`
+  manages leftovers; `preloop volumes gc` — the plan the engine also runs by
+  itself — collects the superseded ones.
 - **`$BROWSER` is honored when the CLI opens a page.** It is tried first, as
   `xdg-open` reads it, so VS Code and Cursor remote terminals open GitHub's
   setup page on your laptop and forward its port. The platform opener remains
