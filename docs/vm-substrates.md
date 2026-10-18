@@ -171,6 +171,16 @@ even a later engine start can delete it), and deletes the sandbox outright
 when the machine was torn down while it ran. Only a sandbox whose id never
 came back — the engine process itself died mid-start — is left to its TTL.
 
+A stop can also be refused *by smolvm* rather than fail: `machine stop`
+requires the guest agent to advertise `quiesced-shutdown-v1`, and a guest
+agent older than the installed smolvm (≥ 1.16) cannot. The engine therefore
+refuses to boot from a guest-agent rootfs it can prove does not match the
+resolved binary, and prefers the rootfs that ships next to it over a stale
+copy in the data directory; the surfaced error names both rootfs paths, both
+agent hashes, the agent version the guest logged at boot, and the remedy
+(`preloop update --ensure-runtime`). See the troubleshooting entry in
+[VM images](vm-images.md#troubleshooting).
+
 ## Disk sizing
 
 AgentENV materializes a guest root from an overlaybd base and refuses to

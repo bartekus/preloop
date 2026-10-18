@@ -2183,7 +2183,7 @@ async fn cmd_engine(
     let _vm_teardown = VmTeardownOnExit;
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let pool_config = pool_config.ok();
+    let mut pool_config = pool_config.ok();
     let mut backend = None;
     if let Some(config) = &pool_config {
         if !pool_enabled {
@@ -2207,6 +2207,22 @@ async fn cmd_engine(
         let selected = vm_backend()?;
         tracing::info!(backend = selected.as_str(), "VM substrate selected");
         backend = Some(selected);
+    }
+    // Fail the pool fast, once, on a guest-agent rootfs the resolved smolvm
+    // cannot manage. Booting from it would leave every machine unstoppable
+    // ("running guest agent does not support safe shutdown; VM left
+    // unchanged"), which the pool would otherwise retry, with the same opaque
+    // error, for hours. The engine keeps serving so `preloop status` and the
+    // recovery commands still work; the guard's message names both rootfs
+    // paths, both agent hashes, and the remedy.
+    if pool_config.is_some()
+        && backend == Some(VmBackend::Smolvm)
+        && let Err(error) = preloop_vm::agent_rootfs::guard(std::path::Path::new("smolvm"))
+    {
+        tracing::error!("{error}");
+        tracing::error!("runner pool disabled until the smolvm guest agent is repaired");
+        pool_status.set_mode(preloop_observability::status::PoolMode::Disabled);
+        pool_config = None;
     }
 
     let spawn_pool = |config: &RunnerPoolConfig,

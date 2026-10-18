@@ -47,6 +47,24 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A stale pinned guest-agent rootfs can no longer make every VM
+  unstoppable.** The engine exports `SMOLVM_AGENT_ROOTFS` to every smolvm
+  child (the child's `HOME`/data directory is isolated), and an inherited
+  variable wins over the rootfs that ships beside the binary — so after a
+  hand-upgraded smolvm prefix the engine kept booting the old agent found in
+  the data directory, and smolvm ≥ 1.16 refused every `machine stop` with
+  `running guest agent does not support safe shutdown; VM left unchanged;
+  update the guest agent before retrying`, which the pool retried for hours.
+  On Linux the rootfs shipped next to the resolved binary is now the first
+  candidate, and on every platform a candidate that agrees with it is
+  preferred; a boot from a provably mismatched agent is refused up front with
+  both rootfs paths, both agent hashes, the host version, and the remedy.
+  `preloop update --ensure-runtime` refreshes `<data dir>/agent-rootfs` (and
+  records the version in `.preloop-agent-version`) whenever it does not match
+  the installed smolvm, not only when the binary is reinstalled; a refused
+  stop now also names the rootfs Preloop exported and the agent version the
+  guest logged at boot.
+
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
 
 - **The GitHub App JWT breaker is partitioned by App id**: one App's rate

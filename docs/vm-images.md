@@ -632,6 +632,30 @@ ad-hoc `docker run`, and runs the deep-recursion probe pydantic's own
 
 ## Troubleshooting
 
+- **`running guest agent does not support safe shutdown; VM left unchanged;
+  update the guest agent before retrying`**: the guest agent Preloop booted is
+  not the one that shipped with the installed `smolvm`. The engine exports
+  `SMOLVM_AGENT_ROOTFS` on every smolvm child (the child's `HOME`/data
+  directory is isolated, so the rootfs must be named explicitly), and an
+  inherited variable wins over the rootfs beside the binary — so a stale copy
+  in the data directory used to outrank a version-matched one. Smolvm ≥ 1.16
+  requires the `quiesced-shutdown-v1` capability from the agent before it will
+  stop a machine, so a stale agent makes every machine unstoppable and the
+  pool retries the same stop forever. Preloop now prefers the rootfs shipped
+  next to the resolved binary and refuses (with both rootfs paths, both agent
+  hashes, and the host version) before booting from a provably mismatched one.
+  Repair the install with `preloop update --ensure-runtime`, which refreshes
+  `<data dir>/agent-rootfs` whenever it does not match the installed smolvm
+  and records the version in `<data dir>/agent-rootfs/.preloop-agent-version`.
+  By hand, the equivalent is `cp -a <smolvm prefix>/agent-rootfs
+  <data dir>/agent-rootfs`; if `SMOLVM_AGENT_ROOTFS` names the stale tree,
+  unset it. On macOS `<smolvm prefix>` is `~/.smolvm` and `<data dir>` is
+  `~/Library/Application Support/smolvm`; on Linux the prefix is `~/.smolvm`
+  and the data directory is `$XDG_DATA_HOME/smolvm` (default
+  `~/.local/share/smolvm`). The agent version that actually booted is in the
+  machine's console log (`smolvm machine data-dir --name <machine>` +
+  `agent-console.log`), which the engine now appends to the stop error along
+  with the rootfs it exported.
 - **A job misbehaves after a golden change**: the pool caches unpacked pack
 dirs per VM; deleting the per-VM pack cache forces a clean unpack.
 - **Missing toolchain in the VM**: the image does not carry it. `setup-*`
