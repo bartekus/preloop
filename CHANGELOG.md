@@ -44,8 +44,8 @@ Releases before v0.27.0 predate the changelog.
   network is probed with a longer budget than loopback, so an engine that
   answers slowly is not reported absent. The brand-new control-database
   initialization that the background start performed moved to `preloop serve`,
-  so a fresh `PRELOOP_HOME` still serves with no extra step — of the store
-  `--store` / `PRELOOP_STORE_URL` selects, which is the one the boot opens; an
+  so a fresh `PRELOOP_HOME` still serves with no extra step, out of the store
+  `--store` / `PRELOOP_STORE_URL` selects (the same one the boot opens); an
   existing store is still never migrated implicitly. Fixes defect 3 of
   [#658](https://github.com/preloopdev/preloop/issues/658): a `preloop run`
   from the pre-push hook used to start a control plane and a smolVM on the

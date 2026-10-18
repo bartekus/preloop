@@ -562,9 +562,9 @@ preloop store status
 preloop serve
 ```
 
-Fresh local SQLite stores are prepared by supported `preloop serve`,
-`preloop init` and `preloop server install` paths. A serving process never
-initializes or upgrades a store that already exists; use `preloop store
+A fresh local SQLite store is prepared by the supported first-run paths
+(`preloop serve`, `preloop init`, `preloop server install`). A serving process
+never initializes or upgrades a store that already exists; use `preloop store
 migrate` for existing or mismatched schemas. See
 [Control database migrations](control-migrations.md).
 
