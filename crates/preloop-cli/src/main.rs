@@ -520,7 +520,11 @@ pub(crate) fn build_client() -> reqwest::Client {
     // is the runner/guest surface: it deliberately refuses native APIs
     // (`/api/v1/runs` and friends 404 there), so it must never be the
     // default transport for CLI commands.
-    reqwest::Client::builder()
+    //
+    // `with_tls_roots` pins verification to the shared in-process root set:
+    // the platform verifier would consult the OS trust daemon on every
+    // handshake, and that daemon can prompt or hang.
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
         .build()
         .expect("valid HTTP client configuration")
 }
@@ -2475,9 +2479,12 @@ async fn wait_for_engine_socket(
     // and port); the Unix client rides the control socket instead. 500ms
     // timeout, 30s window.
     #[cfg(unix)]
-    let client = reqwest::Client::builder().unix_socket(socket).build()?;
+    let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+        .unix_socket(socket)
+        .build()?;
     #[cfg(not(unix))]
-    let client = reqwest::Client::new();
+    let client =
+        preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder()).build()?;
     let readyz_url = format!("http://{listen}/readyz");
     let start = std::time::Instant::now();
     let mut last_reason: Option<String> = None;

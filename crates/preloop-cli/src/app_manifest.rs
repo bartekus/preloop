@@ -441,7 +441,9 @@ async fn convert(api_base: &str, code: &str) -> Result<AppCredentials> {
     let url = format!("{}/app-manifests/{}/conversions", api_base, urlencode(code));
     // Not `crate::build_client()`: that one targets the engine's native API
     // surface, and this call goes to api.github.com.
-    let response = reqwest::Client::new()
+    let response = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+        .build()
+        .context("building the GitHub manifest client")?
         .post(&url)
         .header("User-Agent", "preloop")
         .header("Accept", "application/vnd.github+json")
@@ -590,10 +592,11 @@ mod tests {
                 async move { register_on(listener, "preloop-local", None, None, &api).await },
             );
 
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        let client = preloop_runner_server::shared_http::with_tls_roots(
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        )
+        .build()
+        .unwrap();
         let form = client
             .get(&base)
             .send()
@@ -696,7 +699,9 @@ mod tests {
                 async move { register_on(listener, "preloop-local", None, None, &api).await },
             );
 
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         let form = client
             .get(&base)
             .send()

@@ -2319,7 +2319,7 @@ async fn ghcr_reachable() -> bool {
 }
 
 fn probe_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
         .user_agent("preloop-init")
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(5))
@@ -2330,7 +2330,7 @@ fn probe_client() -> anyhow::Result<reqwest::Client> {
 // -- OCI references -------------------------------------------------------
 
 fn oci_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
         .user_agent("preloop-init")
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(20))
