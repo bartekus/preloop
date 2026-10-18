@@ -73,12 +73,20 @@ Releases before v0.27.0 predate the changelog.
   On Linux the rootfs shipped next to the resolved binary is now the first
   candidate, and on every platform a candidate that agrees with it is
   preferred; a boot from a provably mismatched agent is refused up front with
-  both rootfs paths, both agent hashes, the host version, and the remedy.
-  `preloop update --ensure-runtime` refreshes `<data dir>/agent-rootfs` (and
-  records the version in `.preloop-agent-version`) whenever it does not match
-  the installed smolvm, not only when the binary is reinstalled; a refused
-  stop now also names the rootfs Preloop exported and the agent version the
-  guest logged at boot.
+  both rootfs paths, both agent hashes, the host version, and the remedy. Two
+  identical trees are not enough on their own: when the agent they hold
+  advertises no `quiesced-shutdown-v1` while the resolved host requires it,
+  the boot is refused too — that is what a smolvm upgraded without its rootfs
+  looks like. `preloop update --ensure-runtime` refreshes the rootfs the engine
+  exports (`<data dir>/agent-rootfs`, where `<data dir>` is `SMOLVM_DATA_DIR`
+  or the effective Preloop home's `smolvm`), keeps the rootfs beside the
+  resolved binary in step, records the version in `.preloop-agent-version`, and
+  repairs the install whenever either tree stops matching the installed
+  smolvm — not only when the binary is reinstalled. It never installs a sibling
+  it has just proven stale, and it refuses to claim a repair while
+  `SMOLVM_AGENT_ROOTFS` pins a tree that does not hold the host's agent. A
+  refused stop now also names the rootfs Preloop exported and the agent version
+  the guest logged at boot.
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
   libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the

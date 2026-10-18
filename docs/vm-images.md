@@ -656,19 +656,43 @@ ad-hoc `docker run`, and runs the deep-recursion probe pydantic's own
   stop a machine, so a stale agent makes every machine unstoppable and the
   pool retries the same stop forever. Preloop now prefers the rootfs shipped
   next to the resolved binary and refuses (with both rootfs paths, both agent
-  hashes, and the host version) before booting from a provably mismatched one.
+  hashes, and the host version) before booting from one it can prove cannot
+  serve that binary — including when both trees hold the same stale agent,
+  which is what a smolvm upgraded without its rootfs looks like.
   Repair the install with `preloop update --ensure-runtime`, which refreshes
-  `<data dir>/agent-rootfs` whenever it does not match the installed smolvm
-  and records the version in `<data dir>/agent-rootfs/.preloop-agent-version`.
-  By hand, the equivalent is `cp -a <smolvm prefix>/agent-rootfs
-  <data dir>/agent-rootfs`; if `SMOLVM_AGENT_ROOTFS` names the stale tree,
-  unset it. On macOS `<smolvm prefix>` is `~/.smolvm` and `<data dir>` is
-  `~/Library/Application Support/smolvm`; on Linux the prefix is `~/.smolvm`
-  and the data directory is `$XDG_DATA_HOME/smolvm` (default
-  `~/.local/share/smolvm`). The agent version that actually booted is in the
-  machine's console log (`smolvm machine data-dir --name <machine>` +
-  `agent-console.log`), which the engine now appends to the stop error along
-  with the rootfs it exported.
+  the rootfs the engine exports (`<data dir>/agent-rootfs`, where `<data dir>`
+  is `$SMOLVM_DATA_DIR` or the effective Preloop home's `smolvm`), keeps the
+  rootfs beside the resolved binary in step with it, and records the version in
+  `<data dir>/agent-rootfs/.preloop-agent-version`. By hand, the equivalent is
+  `cp -a <smolvm prefix>/agent-rootfs <data dir>/agent-rootfs`; if
+  `SMOLVM_AGENT_ROOTFS` names the stale tree, unset it. `<smolvm prefix>` is
+  the directory of the `smolvm` that `PATH` resolves (following symlinks), the
+  official installer's `~/.smolvm` by default; with no `PRELOOP_HOME` the
+  effective Preloop home is `~/.preloop`, so `<data dir>` is `~/.preloop/smolvm`
+  and smolvm's own platform data directory is not what the engine exports. The
+  agent version that actually booted is in the machine's console log (`smolvm
+  machine data-dir --name <machine>` + `agent-console.log`), which the engine
+  now appends to the stop error along with the rootfs it exported.
+
+  The failure reproduces on any host that upgrades smolvm without replacing the
+  rootfs the engine already points at, and the two copies are easy to tell
+  apart — this is a real macOS host, before the fix:
+
+  ```console
+  $ smolvm --version
+  smolvm 1.18.1
+  $ strings ~/.smolvm/agent-rootfs/usr/local/bin/smolvm-agent | grep -c quiesced-shutdown-v1
+  1
+  $ strings "$HOME/Library/Application Support/smolvm/agent-rootfs/usr/local/bin/smolvm-agent" \
+      | grep -c quiesced-shutdown-v1
+  0
+  ```
+
+  The data-directory agent is 1.14.2 and reports no capability while the host
+  requires it, so every `machine stop` is refused. `cargo nextest run -p
+  preloop-vm` covers the same pair with fixtures (the shipped tree, a stale
+  data-directory copy, and a host that answers `smolvm --version`), which is
+  what keeps it from coming back.
 - **A job misbehaves after a golden change**: the pool caches unpacked pack
 dirs per VM; deleting the per-VM pack cache forces a clean unpack.
 - **Missing toolchain in the VM**: the image does not carry it. `setup-*`

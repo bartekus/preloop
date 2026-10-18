@@ -29,9 +29,12 @@
 //!   would pick if Preloop exported nothing.
 //! * The guard refuses only what it can prove — a differing agent digest, or
 //!   an agent without `quiesced-shutdown-v1` under a host that requires that
-//!   handshake. Everything else (an unreadable tree, a host version that
-//!   cannot be read) is a warning: a false refusal takes a working engine
-//!   down, which is worse than the failure it guards against.
+//!   handshake. Two identical trees are not proof of the second: a smolvm
+//!   upgraded without its sibling rootfs keeps the old agent on both paths, so
+//!   the capability is checked whether or not the digests agree. Everything
+//!   else (an unreadable tree, a host version that cannot be read) is a
+//!   warning: a false refusal takes a working engine down, which is worse than
+//!   the failure it guards against.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -82,7 +85,15 @@ pub fn agent_boot_version(console: &str) -> Option<String> {
     let banner = std::str::from_utf8(AGENT_BANNER).ok()?;
     let start = console.find(banner)? + banner.len();
     let tail = console.get(start..)?;
-    let tail = &tail[..tail.len().min(128)];
+    // A guest console log is bytes, not text: kernel and guest messages are
+    // free to carry multi-byte characters, so the window has to end on a
+    // character boundary. Slicing at a fixed offset would panic — inside the
+    // diagnosis of a refused `stop`, which is the last place that may die.
+    let mut end = tail.len().min(128);
+    while !tail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let tail = &tail[..end];
     if let Some(field) = tail.find("\"version\":\"") {
         let value = &tail[field + "\"version\":\"".len()..];
         if let Some(end) = value.find('"') {
@@ -101,6 +112,7 @@ pub struct AgentRootfs {
     path: PathBuf,
     digest: Option<String>,
     version: Option<String>,
+    binary_version: Option<String>,
     capability: bool,
     agent_present: bool,
 }
@@ -115,12 +127,13 @@ impl AgentRootfs {
         let capability = bytes
             .as_deref()
             .is_some_and(|bytes| contains(bytes, QUIESCED_SHUTDOWN_CAPABILITY.as_bytes()));
-        let version =
-            read_version_stamp(path).or_else(|| bytes.as_deref().and_then(version_from_binary));
+        let binary_version = bytes.as_deref().and_then(version_from_binary);
+        let version = read_version_stamp(path).or_else(|| binary_version.clone());
         Self {
             path: path.to_path_buf(),
             digest,
             version,
+            binary_version,
             capability,
             agent_present: bytes.is_some(),
         }
@@ -139,6 +152,16 @@ impl AgentRootfs {
     /// Agent version, from the stamp Preloop wrote or from the binary itself.
     pub fn version(&self) -> Option<&str> {
         self.version.as_deref()
+    }
+
+    /// Version baked into the agent binary, ignoring any stamp beside it.
+    ///
+    /// The stamp records which release the tree was installed from, so it can
+    /// name a version the bytes no longer are — a restored tree, or an agent
+    /// replaced without touching the stamp. `None` when the binary carries no
+    /// readable banner, which is not evidence either way.
+    pub fn binary_version(&self) -> Option<&str> {
+        self.binary_version.as_deref()
     }
 
     /// Whether the agent advertises `quiesced-shutdown-v1`.
@@ -235,16 +258,15 @@ pub fn check(runtime: &Runtime, binary: &Path) -> Result<GuardReport, VmError> {
         _ => false,
     };
     // `--version` is the only way to learn whether this host performs the
-    // shutdown handshake, so it is read only where the answer can matter:
-    // when the two agents provably differ, or when no shipped agent exists to
-    // compare the capability against.
-    let needs_shutdown_handshake = match (&shipped, &exported) {
-        (Some(_), Some(exported)) => !matched && exported.digest().is_some(),
-        (None, Some(exported)) => {
-            exported.agent_present() && !exported.supports_quiesced_shutdown()
-        }
-        _ => false,
-    };
+    // shutdown handshake, so it is read only where the answer can matter: when
+    // the agent Preloop would boot does not advertise the capability. A digest
+    // match does not answer that question — the same stale agent in both trees
+    // matches itself, which is what a smolvm upgraded without its rootfs (or a
+    // restored copy) looks like — so the probe is driven by the exported
+    // agent's own capability, not by whether the two trees agree.
+    let needs_shutdown_handshake = exported
+        .as_ref()
+        .is_some_and(|exported| exported.agent_present() && !exported.supports_quiesced_shutdown());
     let host_version = if needs_shutdown_handshake {
         probe_host_version(binary)
     } else {
@@ -290,27 +312,34 @@ fn evaluate(
         return Decision::Allow { warning: None };
     };
     if let Some(shipped) = shipped {
-        return match (shipped.digest(), exported.digest()) {
-            // Byte-identical agents: nothing to say.
-            (Some(shipped), Some(exported)) if shipped == exported => {
-                Decision::Allow { warning: None }
+        match (shipped.digest(), exported.digest()) {
+            // Different bytes: the exported agent is not the one the binary
+            // shipped with, which is the mismatch this guard refuses.
+            (Some(shipped_digest), Some(exported_digest)) if shipped_digest != exported_digest => {
+                return Decision::Refuse {
+                    report: mismatch_report(binary, exported, shipped, host_version),
+                };
             }
-            (Some(_), Some(_)) => Decision::Refuse {
-                report: mismatch_report(binary, exported, shipped, host_version),
-            },
+            // Byte-identical agents are not proof of a workable pair: a
+            // smolvm upgraded without its sibling rootfs keeps the old agent
+            // on both paths, and that pair cannot be stopped either. The
+            // capability check below is what answers whether it can be.
+            (Some(_), Some(_)) => {}
             // One side is unreadable; refusing would be guessing.
-            _ => Decision::Allow {
-                warning: Some(format!(
-                    "the guest-agent rootfs Preloop would boot from ({}, {}) could not be compared \
-                     with the rootfs shipped next to the resolved smolvm ({}, {}); if a machine later \
-                     cannot be stopped (\"{SHUTDOWN_REFUSAL}\"), run `preloop update --ensure-runtime`",
-                    exported.path().display(),
-                    exported.describe(),
-                    shipped.path().display(),
-                    shipped.describe(),
-                )),
-            },
-        };
+            _ => {
+                return Decision::Allow {
+                    warning: Some(format!(
+                        "the guest-agent rootfs Preloop would boot from ({}, {}) could not be compared \
+                         with the rootfs shipped next to the resolved smolvm ({}, {}); if a machine later \
+                         cannot be stopped (\"{SHUTDOWN_REFUSAL}\"), run `preloop update --ensure-runtime`",
+                        exported.path().display(),
+                        exported.describe(),
+                        shipped.path().display(),
+                        shipped.describe(),
+                    )),
+                };
+            }
+        }
     }
     if !exported.agent_present() {
         return Decision::Allow {
@@ -326,7 +355,7 @@ fn evaluate(
     }
     match host_version.and_then(parse_version) {
         Some(version) if version >= QUIESCED_SHUTDOWN_MIN_HOST => Decision::Refuse {
-            report: capability_report(binary, exported, host_version),
+            report: capability_report(binary, exported, shipped, host_version),
         },
         // An older host never performs the capability handshake.
         Some(_) => Decision::Allow { warning: None },
@@ -370,19 +399,39 @@ fn mismatch_report(
     )
 }
 
-fn capability_report(binary: &Path, exported: &AgentRootfs, host_version: Option<&str>) -> String {
+fn capability_report(
+    binary: &Path,
+    exported: &AgentRootfs,
+    shipped: Option<&AgentRootfs>,
+    host_version: Option<&str>,
+) -> String {
     let host = host_version.unwrap_or("unknown");
+    let remedy = match shipped {
+        Some(shipped) if shipped.path() != exported.path() => format!(
+            "Fix: run `preloop update --ensure-runtime` to refresh {} with the guest agent that \
+             matches smolvm {host}, or `cp -a {} {}`.",
+            exported.path().display(),
+            shipped.path().display(),
+            exported.path().display(),
+        ),
+        // The stale agent is the one that shipped with this very smolvm, so
+        // there is no second tree to copy from: the host's install is what has
+        // to be replaced.
+        _ => format!(
+            "Fix: run `preloop update --ensure-runtime` to install the guest agent that matches \
+             smolvm {host}; if {} came from a smolvm archive, that archive's own agent-rootfs is \
+             the stale copy.",
+            exported.path().display(),
+        ),
+    };
     format!(
         "smolvm guest-agent mismatch: the guest agent Preloop would boot from {} ({}) does not support \
          safe shutdown, but the resolved smolvm ({}) is version {host}, which refuses to stop such a \
          guest (\"{SHUTDOWN_REFUSAL}\"). Every machine Preloop boots would be unstoppable and the runner \
-         pool would retry forever. Fix: run `preloop update --ensure-runtime` to refresh {} with the \
-         guest agent that matches smolvm {host}, or `cp -a <smolvm prefix>/agent-rootfs {}`.",
+         pool would retry forever. {remedy}",
         exported.path().display(),
         exported.describe(),
         binary.display(),
-        exported.path().display(),
-        exported.path().display(),
     )
 }
 
@@ -411,7 +460,7 @@ fn probe_host_version(binary: &Path) -> Option<String> {
 /// where the wrapper script looks before falling back to smolvm's own data
 /// directory, so a sibling of the binary's real location is authoritative.
 pub fn shipped_rootfs(binary: &Path) -> Option<PathBuf> {
-    let resolved = resolve_binary_path(binary)?;
+    let resolved = resolve_binary(binary)?;
     let candidate = resolved.parent()?.join("agent-rootfs");
     candidate.is_dir().then_some(candidate)
 }
@@ -419,7 +468,7 @@ pub fn shipped_rootfs(binary: &Path) -> Option<PathBuf> {
 /// Resolve `binary` the way `Command` does — a bare name is searched for on
 /// `PATH` — then follow every symlink, so a `~/.local/bin/smolvm` shim lands
 /// on the prefix that owns the binary and its rootfs.
-fn resolve_binary_path(binary: &Path) -> Option<PathBuf> {
+pub fn resolve_binary(binary: &Path) -> Option<PathBuf> {
     let candidate = if binary.components().count() == 1 {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
@@ -438,6 +487,11 @@ fn resolve_binary_path(binary: &Path) -> Option<PathBuf> {
 /// candidate order, so identical trees keep their existing precedence), then
 /// the shipped rootfs itself, then the first existing candidate — a layout
 /// with no sibling rootfs keeps the data-directory behavior it had before.
+///
+/// Every candidate has to be a rootfs, not merely a directory: a half-copied
+/// or leftover tree that holds the agent but no `sbin/init` cannot boot a
+/// guest, and exporting one (or letting it shadow the shipped tree) fails
+/// every machine. A candidate that is not a rootfs is not an answer.
 pub fn resolve_exported_rootfs(runtime: &Runtime, binary: Option<&Path>) -> Option<PathBuf> {
     if let Some(explicit) = &runtime.explicit_rootfs {
         return Some(explicit.clone());
@@ -455,11 +509,224 @@ pub fn resolve_exported_rootfs(runtime: &Runtime, binary: Option<&Path>) -> Opti
             let reference = AgentRootfs::inspect(&shipped);
             let matching = candidates.into_iter().find(|candidate| {
                 let inspected = AgentRootfs::inspect(candidate);
-                inspected.digest().is_some() && inspected.digest() == reference.digest()
+                inspected.digest().is_some()
+                    && inspected.digest() == reference.digest()
+                    && looks_like_rootfs(candidate)
             });
             Some(matching.unwrap_or(shipped))
         }
-        None => candidates.into_iter().find(|candidate| candidate.is_dir()),
+        None => candidates
+            .into_iter()
+            .find(|candidate| candidate.is_dir() && looks_like_rootfs(candidate)),
+    }
+}
+
+/// The rootfs Preloop would export, as the resolved smolvm will read it.
+///
+/// Cached: [`resolve_exported_rootfs`] hashes the agent of the shipped tree
+/// and of every candidate, and this runs on the command path
+/// (`smolvm_runtime_env`, once per boot-capable child process). See
+/// [`inputs_fingerprint`] for what makes the cache notice a change.
+pub fn exported_rootfs_cached(runtime: &Runtime, binary: Option<&Path>) -> Option<PathBuf> {
+    let Some(binary) = binary else {
+        // With no binary there is no shipped tree to compare against, and no
+        // stable key to cache under. The callers that pass `None` are
+        // one-shot sessions rather than the command path this cache exists
+        // for.
+        return resolve_exported_rootfs(runtime, None);
+    };
+    let fingerprint = inputs_fingerprint(runtime, binary);
+    if let Some(cached) = cached_entry(&RESOLVED, &fingerprint, |entry| entry.exported.clone()) {
+        return cached;
+    }
+    let exported = resolve_exported_rootfs(runtime, Some(binary));
+    store(
+        &RESOLVED,
+        Resolved {
+            fingerprint,
+            exported: exported.clone(),
+        },
+    );
+    exported
+}
+
+/// [`check`] over the same cached inputs, logging a fresh warning once.
+///
+/// A repair (`preloop update --ensure-runtime`), a replaced rootfs, or a
+/// different binary invalidates the cache, so a verdict can never outlive the
+/// assets it was computed from.
+pub fn check_cached(runtime: &Runtime, binary: &Path) -> Result<GuardReport, VmError> {
+    let fingerprint = inputs_fingerprint(runtime, binary);
+    let cached = cached_entry(&VERDICT, &fingerprint, |entry| {
+        (entry.fresh_warning.clone(), entry.verdict.clone())
+    });
+    let (fresh_warning, verdict) = match cached {
+        Some(cached) => cached,
+        None => {
+            let verdict = match check(runtime, binary) {
+                Ok(report) => Ok(report),
+                Err(VmError::GuestAgentMismatch { report }) => Err(report),
+                Err(error) => Err(error.to_string()),
+            };
+            let fresh_warning = verdict
+                .as_ref()
+                .ok()
+                .and_then(|report| report.warning.clone());
+            store(
+                &VERDICT,
+                Verdict {
+                    fingerprint,
+                    verdict: verdict.clone(),
+                    fresh_warning: fresh_warning.clone(),
+                },
+            );
+            (fresh_warning, verdict)
+        }
+    };
+    if let Some(fresh) = &fresh_warning {
+        tracing::warn!(binary = %binary.display(), "{fresh}");
+    }
+    verdict.map_err(|report| VmError::GuestAgentMismatch { report })
+}
+
+/// The resolved rootfs for one fingerprint.
+#[derive(Clone)]
+struct Resolved {
+    fingerprint: String,
+    exported: Option<PathBuf>,
+}
+
+/// The guard's verdict for one fingerprint.
+#[derive(Clone)]
+struct Verdict {
+    fingerprint: String,
+    verdict: Result<GuardReport, String>,
+    fresh_warning: Option<String>,
+}
+
+/// Last resolution and last verdict, both keyed by [`inputs_fingerprint`].
+///
+/// Process-global because the command path (`smolvm_runtime_env`) resolves the
+/// rootfs without a provider to hang state on. One entry each, not a map: the
+/// inputs are the same for every command a process runs, and a stale entry is
+/// recomputed rather than evicted.
+///
+/// The two are cached separately because [`check`] probes the host by running
+/// `smolvm --version` through [`crate::apply_smolvm_runtime_env`], which
+/// resolves the rootfs again: one combined entry would re-enter its own
+/// computation.
+static RESOLVED: std::sync::Mutex<Option<Resolved>> = std::sync::Mutex::new(None);
+static VERDICT: std::sync::Mutex<Option<Verdict>> = std::sync::Mutex::new(None);
+
+/// One of `slot`'s entries, when it belongs to `fingerprint`.
+///
+/// The lock is only held for the lookup: computing an entry runs the guard,
+/// which resolves the rootfs (and probes the host), so holding it across the
+/// computation would deadlock the command path against itself.
+fn cached_entry<T, R>(
+    slot: &std::sync::Mutex<Option<T>>,
+    fingerprint: &str,
+    project: impl FnOnce(&T) -> R,
+) -> Option<R>
+where
+    T: Fingerprinted,
+{
+    let guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_ref()
+        .filter(|entry| entry.fingerprint() == fingerprint)
+        .map(project)
+}
+
+fn store<T: Fingerprinted>(slot: &std::sync::Mutex<Option<T>>, entry: T) {
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
+}
+
+/// The fingerprint a cache entry was computed under.
+trait Fingerprinted {
+    fn fingerprint(&self) -> &str;
+}
+
+impl Fingerprinted for Resolved {
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+impl Fingerprinted for Verdict {
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+/// Identity of every input the resolution and the guard read, as the host
+/// reports it.
+///
+/// A stat-based fingerprint, not a content hash: hashing the agent binaries is
+/// the work this cache exists to avoid, and a tree that is repaired or
+/// replaced changes the size or mtime of one of the entries recorded here. It
+/// covers the resolved binary (and `PATH`, when the binary is a bare name),
+/// every tree that could be exported, and — inside each tree — the `sbin/init`
+/// that makes it a rootfs at all, the agent binary, and the version stamp
+/// Preloop writes. A byte-identical tree costs a handful of `stat` calls.
+fn inputs_fingerprint(runtime: &Runtime, binary: &Path) -> String {
+    let mut digest = Sha256::new();
+    let resolved = resolve_binary(binary).unwrap_or_else(|| binary.to_path_buf());
+    record_path(&mut digest, "binary", &resolved);
+    if binary.components().count() == 1
+        && let Some(path) = std::env::var_os("PATH")
+    {
+        digest.update(b"PATH\0");
+        digest.update(path.to_string_lossy().as_bytes());
+        digest.update(b"\0");
+    }
+    let mut trees: Vec<PathBuf> = Vec::new();
+    if let Some(explicit) = &runtime.explicit_rootfs {
+        trees.push(explicit.clone());
+    }
+    trees.extend(crate::agent_rootfs_candidates(
+        runtime.host_home.as_deref(),
+        runtime.data_dir.as_deref(),
+        Some(binary),
+    ));
+    for (index, tree) in trees.iter().enumerate() {
+        let index = index.to_string();
+        record_path(&mut digest, &format!("tree{index}"), tree);
+        record_path(
+            &mut digest,
+            &format!("init{index}"),
+            &tree.join("sbin/init"),
+        );
+        record_path(
+            &mut digest,
+            &format!("agent{index}"),
+            &tree.join(AGENT_BINARY),
+        );
+        record_path(
+            &mut digest,
+            &format!("stamp{index}"),
+            &tree.join(VERSION_STAMP),
+        );
+    }
+    hex::encode(digest.finalize())
+}
+
+/// Fold one path's existence, size, and mtime into `digest`.
+fn record_path(digest: &mut Sha256, label: &str, path: &Path) {
+    digest.update(label.as_bytes());
+    digest.update(b"\0");
+    digest.update(path.display().to_string().as_bytes());
+    digest.update(b"\0");
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        digest.update(b"absent\0");
+        return;
+    };
+    digest.update(b"present\0");
+    digest.update(metadata.len().to_le_bytes());
+    if let Ok(modified) = metadata.modified()
+        && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
+    {
+        digest.update(since.as_nanos().to_le_bytes());
     }
 }
 
@@ -687,6 +954,138 @@ mod tests {
         ] {
             assert!(report.contains(&needle), "{needle:?} missing from {report}");
         }
+    }
+
+    #[test]
+    fn identical_agent_trees_are_still_refused_when_the_agent_cannot_stop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = canonical(&dir);
+        // A smolvm upgraded without its sibling rootfs: the binary is 1.30.1
+        // and both trees hold the same pre-1.16 agent, so the digests agree
+        // while the pair is exactly the unstoppable one.
+        let binary = fake_smolvm(&root, Some(MATCHED));
+        let shipped = rootfs(&root, "agent-rootfs", Some(STALE), false, None);
+        let data = rootfs(&root, "data/agent-rootfs", Some(STALE), false, None);
+        assert_eq!(digest_of(&shipped), digest_of(&data));
+
+        let error = check(&runtime(&root), &binary)
+            .expect_err("a matched digest is not proof the agent can stop");
+        let VmError::GuestAgentMismatch { report } = error else {
+            panic!("expected the guest-agent mismatch error, got {error}");
+        };
+
+        assert!(
+            report.contains("does not support safe shutdown"),
+            "{report}"
+        );
+        assert!(
+            report.contains(MATCHED),
+            "the host version is named: {report}"
+        );
+        assert!(
+            report.contains("preloop update --ensure-runtime"),
+            "{report}"
+        );
+        assert!(
+            !report.contains(&format!(
+                "cp -a {} {}",
+                shipped.display(),
+                shipped.display()
+            )),
+            "a tree cannot be copied onto itself: {report}"
+        );
+    }
+
+    #[test]
+    fn identical_agent_trees_are_left_alone_on_a_pre_1_16_host() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = canonical(&dir);
+        let binary = fake_smolvm(&root, Some("1.15.1"));
+        rootfs(&root, "agent-rootfs", Some(STALE), false, None);
+        rootfs(&root, "data/agent-rootfs", Some(STALE), false, None);
+
+        let report = check(&runtime(&root), &binary)
+            .expect("a host that never performs the handshake cannot be broken by it");
+
+        assert!(report.matched);
+        assert_eq!(report.host_version.as_deref(), Some("1.15.1"));
+        assert_eq!(report.warning, None);
+    }
+
+    #[test]
+    fn a_replaced_rootfs_invalidates_the_cached_verdict() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = canonical(&dir);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(&prefix).expect("prefix");
+        let binary = fake_smolvm(&prefix, Some(MATCHED));
+        let runtime = runtime(&root);
+        let stale = rootfs(&root, "data/agent-rootfs", Some(STALE), false, Some(STALE));
+
+        assert_eq!(
+            exported_rootfs_cached(&runtime, Some(&binary)).as_deref(),
+            Some(stale.as_path())
+        );
+        assert!(
+            check_cached(&runtime, &binary).is_err(),
+            "the stale agent cannot serve a {MATCHED} host"
+        );
+
+        // `preloop update --ensure-runtime` repairing the tree must be noticed
+        // by the running engine, not only by the next one.
+        rootfs(
+            &root,
+            "data/agent-rootfs",
+            Some(MATCHED),
+            true,
+            Some(MATCHED),
+        );
+        assert!(
+            check_cached(&runtime, &binary).is_ok(),
+            "the repaired agent must be accepted without a restart"
+        );
+        assert_eq!(
+            exported_rootfs_cached(&runtime, Some(&binary)).as_deref(),
+            Some(stale.as_path())
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_is_not_a_rootfs_is_never_exported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = canonical(&dir);
+        let binary = fake_smolvm(&root, Some(MATCHED));
+        let shipped = rootfs(&root, "agent-rootfs", Some(MATCHED), true, Some(MATCHED));
+        // A half-copied tree: the agent bytes are the shipped ones, but the
+        // entry smolvm boots from is gone.
+        let partial = root.join("data/agent-rootfs");
+        fs::create_dir_all(partial.join("usr/local/bin")).expect("partial");
+        fs::copy(shipped.join(AGENT_BINARY), partial.join(AGENT_BINARY)).expect("copy agent");
+        assert_eq!(digest_of(&partial), digest_of(&shipped));
+
+        let resolved = resolve_exported_rootfs(&runtime(&root), Some(&binary))
+            .expect("the complete tree resolves");
+
+        assert_eq!(
+            resolved, shipped,
+            "an incomplete copy must not shadow the rootfs that can boot"
+        );
+    }
+
+    #[test]
+    fn agent_boot_version_tolerates_multibyte_console_text() {
+        let mut console = String::from("smolvm-agent started, deferred boot work in progress");
+        // Fill the window with multi-byte characters so the 128-byte cut lands
+        // inside one of them, then keep the version past the window.
+        console.push_str(&"é".repeat(80));
+        console.push_str("\"version\":\"1.18.1\"");
+        assert_eq!(agent_boot_version(&console), None);
+
+        let before = format!(
+            "{}é1.30.1",
+            "smolvm-agent started, deferred boot work in progress"
+        );
+        assert_eq!(agent_boot_version(&before).as_deref(), Some("1.30.1"));
     }
 
     #[test]

@@ -757,12 +757,6 @@ pub struct SmolVmProvider {
     /// environment; unit tests substitute a pure lookup so the policy can be
     /// exercised without mutating global state.
     env_lookup: EnvLookup,
-    /// Result of the guest-agent rootfs guard ([`agent_rootfs`]), run once per
-    /// provider: the failure report when the agent Preloop would boot cannot
-    /// serve this binary, `None` when it can. Cached because the guard reads
-    /// and hashes rootfs trees (and may run `smolvm --version`), while every
-    /// boot-capable command consults it.
-    agent_mismatch: Arc<std::sync::OnceLock<Option<String>>>,
 }
 
 impl Default for SmolVmProvider {
@@ -813,7 +807,6 @@ impl SmolVmProvider {
             declared_devices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             reported_version: Arc::new(tokio::sync::OnceCell::new()),
             env_lookup: process_env,
-            agent_mismatch: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -869,20 +862,20 @@ impl SmolVmProvider {
         Ok(command)
     }
 
-    /// The cached guest-agent guard verdict: the one-read refusal report when
-    /// the agent Preloop would export cannot serve this binary.
+    /// The guest-agent guard verdict: the one-read refusal report when the
+    /// agent Preloop would export cannot serve this binary.
+    ///
+    /// The guard reads and hashes whole rootfs trees (and may run `smolvm
+    /// --version`), so [`agent_rootfs::check_cached`] reuses its verdict while
+    /// the binary and the candidate rootfs trees are unchanged — a repair or a
+    /// replacement is picked up without restarting the engine.
     fn agent_mismatch(&self) -> Option<String> {
-        self.agent_mismatch
-            .get_or_init(|| match agent_rootfs::guard(&self.binary) {
-                Ok(report) => {
-                    if let Some(warning) = report.warning {
-                        warn!(binary = %self.binary.display(), "{warning}");
-                    }
-                    None
-                }
-                Err(error) => Some(error.to_string()),
+        agent_rootfs::check_cached(&agent_rootfs::Runtime::from_env(), &self.binary)
+            .err()
+            .and_then(|error| match error {
+                VmError::GuestAgentMismatch { report } => Some(report),
+                _ => None,
             })
-            .clone()
     }
 
     /// Append the guest-agent context to SmolVM's "this guest cannot be
@@ -3102,7 +3095,7 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
     // agent (see [`agent_rootfs`]).
     if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none()
         && let Some(path) =
-            agent_rootfs::resolve_exported_rootfs(&agent_rootfs::Runtime::from_env(), binary)
+            agent_rootfs::exported_rootfs_cached(&agent_rootfs::Runtime::from_env(), binary)
     {
         env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
     }
