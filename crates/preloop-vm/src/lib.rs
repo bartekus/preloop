@@ -2688,48 +2688,53 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
         if roots.is_empty() {
             return Ok(0);
         }
-        let ps = std::process::Command::new("ps")
-            .args(["ax", "-o", "pid=,command="])
+        // launchd's PATH has no /sbin, so the mount table tool is named absolutely.
+        let mounts = std::process::Command::new("/sbin/mount")
             .output()
             .map_err(|source| VmError::Launch {
-                program: "ps".to_owned(),
+                program: "/sbin/mount".to_owned(),
                 source,
             })?;
-        let mounts = std::process::Command::new("mount")
-            .output()
-            .map_err(|source| VmError::Launch {
-                program: "mount".to_owned(),
-                source,
-            })?;
-        let mut detached = 0usize;
-        for mount in orphan_layer_store_mounts(
-            &roots,
-            &String::from_utf8_lossy(&ps.stdout),
-            &String::from_utf8_lossy(&mounts.stdout),
-        ) {
-            match std::process::Command::new("hdiutil")
-                .args(["detach", "-quiet"])
-                .arg(&mount)
-                .status()
-            {
-                Ok(status) if status.success() => {
-                    detached += 1;
-                    info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
-                }
-                Ok(status) => warn!(
-                    mount = %mount.display(),
-                    %status,
-                    "hdiutil detach refused; leaving the layer mount in place"
-                ),
-                Err(error) => warn!(
-                    mount = %mount.display(),
-                    %error,
-                    "hdiutil detach failed to start"
-                ),
-            }
-        }
-        Ok(detached)
+        detach_orphaned_layer_mounts_in(&roots, &String::from_utf8_lossy(&mounts.stdout))
     }
+}
+
+/// The scan → decide → detach pass over one `mount` table, split from the
+/// shell-out above so a test can drive it with a fixture table.
+#[cfg(target_os = "macos")]
+fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Result<usize, VmError> {
+    let ps = std::process::Command::new("ps")
+        .args(["ax", "-o", "pid=,command="])
+        .output()
+        .map_err(|source| VmError::Launch {
+            program: "ps".to_owned(),
+            source,
+        })?;
+    let mut detached = 0usize;
+    for mount in orphan_layer_store_mounts(roots, &String::from_utf8_lossy(&ps.stdout), mount_table)
+    {
+        match std::process::Command::new("hdiutil")
+            .args(["detach", "-quiet"])
+            .arg(&mount)
+            .status()
+        {
+            Ok(status) if status.success() => {
+                detached += 1;
+                info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
+            }
+            Ok(status) => warn!(
+                mount = %mount.display(),
+                %status,
+                "hdiutil detach refused; leaving the layer mount in place"
+            ),
+            Err(error) => warn!(
+                mount = %mount.display(),
+                %error,
+                "hdiutil detach failed to start"
+            ),
+        }
+    }
+    Ok(detached)
 }
 
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
@@ -4007,9 +4012,11 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// The detach pass shells out to `mount` and `hdiutil`; a fake pair on
-    /// `PATH` records the exact argv, so the whole scan → decide → detach
-    /// path is covered without attaching a disk image.
+    /// The detach pass reads the `mount` table it is handed and shells out to
+    /// `hdiutil`; a fake `hdiutil` on `PATH` records the exact argv, so the
+    /// whole scan → decide → detach path is covered without attaching a disk
+    /// image. The table is passed in because `mount` is named absolutely
+    /// (`/sbin/mount`), so it cannot be faked on `PATH`.
     #[cfg(target_os = "macos")]
     #[test]
     fn detach_orphaned_layer_mounts_detaches_each_mount_without_a_hypervisor() {
@@ -4025,15 +4032,11 @@ mod tests {
         let bin = home.join("fake-bin");
         std::fs::create_dir_all(&bin).unwrap();
         let canonical = std::fs::canonicalize(&orphan).unwrap();
-        let mount = bin.join("mount");
-        std::fs::write(
-            &mount,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \\\n  '/dev/disk3s5 on / (apfs, local, read-only, sealed)' \\\n  '/dev/disk9s1 on {}/pack/layers-cs (apfs, local, journaled, nobrowse)'\n",
-                canonical.display()
-            ),
-        )
-        .unwrap();
+        let mount_table = format!(
+            "/dev/disk3s5 on / (apfs, local, read-only, sealed)\n\
+             /dev/disk9s1 on {}/pack/layers-cs (apfs, local, journaled, nobrowse)\n",
+            canonical.display()
+        );
         let hdiutil = bin.join("hdiutil");
         std::fs::write(
             &hdiutil,
@@ -4041,14 +4044,13 @@ mod tests {
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
-        for tool in [&mount, &hdiutil] {
-            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        std::fs::set_permissions(&hdiutil, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _path = PathPrependGuard::prepend(&bin);
 
         // The real `ps` runs: no `_boot-vm` names this fixture home, so the
         // mount is provably orphaned.
-        let detached = detach_orphaned_layer_mounts().expect("detach");
+        let detached =
+            detach_orphaned_layer_mounts_in(&machine_data_roots(), &mount_table).expect("detach");
         assert_eq!(detached, 1, "the orphaned layer mount must be detached");
         assert_eq!(
             std::fs::read_to_string(&log).expect("fake hdiutil log"),
