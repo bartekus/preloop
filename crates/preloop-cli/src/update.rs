@@ -2221,18 +2221,27 @@ mod tests {
     fn the_shutdown_handshake_is_required_only_from_hosts_that_use_it() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let without = agent_tree(root, "without", "1.30.1", false);
+        // A pre-1.16 agent: it carries no handshake, and such a host never
+        // performs one.
+        let old = agent_tree(root, "old", "1.15.1", false);
+        // A modern agent without the handshake: only a host that requires it
+        // can be broken by that pair.
+        let incapable = agent_tree(root, "incapable", "1.30.1", false);
 
         assert!(
-            agent_rootfs_serves(&without, "1.15.1"),
+            agent_rootfs_serves(&old, "1.15.1"),
             "a host that never performs the handshake cannot be broken by it"
         );
         assert!(
-            !agent_rootfs_serves(&without, "1.30.1"),
+            !agent_rootfs_serves(&incapable, "1.30.1"),
             "a {}.{}.{}+ host refuses to stop an agent without the capability",
             preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.0,
             preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.1,
             preloop_vm::agent_rootfs::QUIESCED_SHUTDOWN_MIN_HOST.2,
+        );
+        assert!(
+            !agent_rootfs_serves(&old, "1.30.1"),
+            "a pre-1.16 agent is not the modern host's agent"
         );
     }
 
