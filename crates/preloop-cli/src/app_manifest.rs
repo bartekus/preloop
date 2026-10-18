@@ -401,6 +401,7 @@ pub(crate) fn ssh_session_from_env(get: impl Fn(&str) -> Option<String>) -> bool
     ["SSH_CONNECTION", "SSH_TTY"]
         .iter()
         .any(|key| get(key).is_some_and(|value| !value.trim().is_empty()))
+}
 /// Exchange the one-time manifest code for the App's credentials.
 async fn convert(api_base: &str, code: &str) -> Result<AppCredentials> {
     let url = format!("{}/app-manifests/{}/conversions", api_base, urlencode(code));

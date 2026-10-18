@@ -48,6 +48,29 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **`preloop serve` (and `preloop init --mode foreground`) is the only way an
+  engine starts.** Every command that talks to an
+  engine — `run` and `rerun` included, plus `status`, `logs`, `cancel`,
+  `shell`, `debug`, `dap`, `push` and `webhooks` — requires one that is
+  already running: it probes the endpoint it would use (`PRELOOP_URL`, else
+  the local default) and, when nothing answers, exits non-zero naming that
+  endpoint and how to start one (`preloop serve` in the foreground, `preloop
+  server install` for a supervised service) instead of booting a background
+  engine. Local and administrative commands (`plan`, `store`, `setup`,
+  `doctor`, `secret`, `update`, `version`, `build-golden`, `golden-path`, and
+  `init` outside `--mode foreground`) never contact one. A set `PRELOOP_URL` no
+  longer implies a live engine, and no command falls back to a local one. The
+  refusal keeps the `PRELOOP_UNREACHABLE` marker the pre-push hook fails open
+  on, so a missing engine stays a soft gate. A `PRELOOP_URL` that crosses a
+  network is probed with a longer budget than loopback, so an engine that
+  answers slowly is not reported absent. The brand-new control-database
+  initialization that the background start performed moved to `preloop serve`,
+  so a fresh `PRELOOP_HOME` still serves with no extra step, out of the store
+  `--store` / `PRELOOP_STORE_URL` selects (the same one the boot opens); an
+  existing store is still never migrated implicitly. Fixes defect 3 of
+  [#658](https://github.com/preloopdev/preloop/issues/658): a `preloop run`
+  from the pre-push hook used to start a control plane and a smolVM on the
+  developer's machine. The hook's other two defects are tracked separately.
 - **SmolVM floor and golden pin move to 1.30.1** (`smolvm_min_version` and
   `smolvm_golden_version` in `versions.toml`). The floor now also covers the
   x86_64 virtio device budget SmolVM 1.23.0 raised to 19 MMIO IRQ lines, which
@@ -209,8 +232,9 @@ Releases before v0.27.0 predate the changelog.
   failed with `config-secrets key conflict`. Preloop now refuses to mint while
   sealed values exist and names what to unlock. A `secrets.key` that disagrees
   with the store is settled by which key opens the sealed values, and the losing
-  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. A failed
-  background engine start now prints the engine's last log lines (#653).
+  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. (The background
+  engine start that logged its last lines on failure was removed with #658; see
+  the entry under *Changed*.)
 
 - **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
   RUSTSEC-2026-0369 (insecure symlink and permission handling during archive

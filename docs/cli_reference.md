@@ -32,14 +32,28 @@ Usage: preloop <COMMAND>
 | `update` | Poll GitHub Releases and atomically self-update |
 | `serve` | Run the control plane + microVM runner pool in the foreground |
 
-`preloop run` auto-starts the engine when no server is reachable
-(`ensure_engine_running`); `serve` is the explicit foreground server.
+**Only `preloop serve` and `preloop init --mode foreground` start an engine**
+(`engine` is `serve`'s former name). Every command that talks to an engine —
+`run`, `rerun`, `status`, `logs`, `cancel`, `shell`, `debug`, `dap`, `push`,
+`webhooks` — requires one that is already running: it probes `PRELOOP_URL`
+(default `http://127.0.0.1:9090`) and, when nothing answers, exits non-zero
+naming the probed endpoint and how to start one — `preloop serve` for the
+foreground, `preloop server install` for a supervised service. `preloop run`
+is included: it submits work to an engine, it does not boot one (issue #658).
+Local and administrative commands (`plan`, `store`, `setup`, `doctor`,
+`secret`, `update`, `version`, `build-golden`, `golden-path`, and `init`
+outside `--mode foreground`) neither probe nor start an engine, so `preloop
+store migrate` still prepares a database with no engine running.
+A loopback endpoint is probed with a tight budget (500 ms) so a silent local
+engine refuses at once; an endpoint that crosses a network gets 5 s, so a
+healthy but slow remote engine is not reported absent.
 
 ---
 
 ## `preloop run [OPTIONS]`
 
-Submit a workflow and stream its events until terminal.
+Submit a workflow and stream its events until terminal. Requires a running
+engine (`preloop serve`); it does not start one.
 
 | Flag | Description |
 |---|---|
@@ -492,9 +506,11 @@ bootstrap the engine.
 
 ### `preloop store migrate [OPTIONS]`
 
-Initialize or upgrade the schema. `preloop serve` never applies migrations;
-run this command explicitly. SQLite migrations take a pre-migration backup by
-default when the database exists and has pending migrations.
+Initialize or upgrade the schema. `preloop serve` initializes only a brand-new
+local store and otherwise never applies migrations; run this command
+explicitly to upgrade an existing store. SQLite migrations take a
+pre-migration backup by default when the database exists and has pending
+migrations.
 
 | Flag | Description |
 |---|---|
@@ -542,6 +558,14 @@ Poll GitHub Releases and atomically install the matching binary.
 
 Run the control plane and microVM runner pool in the foreground — the
 self-hosting entry point (webhook + Checks endpoints, microVM provisioning).
+**The only foreground entry point that starts an engine** (`preloop init
+--mode foreground` runs this same mode): every command that talks to an engine
+requires one that is already running and exits non-zero when it finds none
+(issue #658), while local and administrative commands never contact one.
+On a fresh `PRELOOP_HOME` it initializes the brand-new control database — the
+one `--store` / `PRELOOP_STORE_URL` selects, which is also the one the boot
+opens; an existing store is never migrated here (`preloop store migrate`), and
+a Postgres store is the operator's to provision.
 
 | Flag | Description |
 |---|---|
