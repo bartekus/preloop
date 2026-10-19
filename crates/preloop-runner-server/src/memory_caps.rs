@@ -724,6 +724,7 @@ pub(crate) fn remove_run_everywhere(
     for plan_id in &keys.plan_ids {
         inner.plan_secret_masker.remove(plan_id);
         inner.plan_secret_masker_pending.remove(plan_id);
+        inner.plan_runtime_masks.remove(plan_id);
     }
 
     RunRemoval {
