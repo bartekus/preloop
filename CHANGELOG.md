@@ -252,8 +252,13 @@ Releases before v0.27.0 predate the changelog.
   never happened. `run_job` now consumes it: regex hints compile once per job
   and join the same scan as value masks on every runner egress — durable step
   logs, check-run annotations, the live-log drain, and the retroactive re-mask —
-  and variable hints mask the named variable's value. A hint whose pattern does
-  not compile is skipped with a warning.
+  and variable hints mask the named variable's value. The assembled step log
+  (`log_content`, and every slice and upload derived from it) additionally takes
+  the pattern pass over the whole text with line preservation, so a hint whose
+  pattern spans a newline still redacts it while the record count — and every
+  line checkpoint — stays intact. A hint whose pattern does not compile is
+  skipped with a warning. The completion `environment.url` guard applies the
+  hint patterns too, so a URL matching one is dropped rather than published.
 
 - **Credential-shaped container and service `env:` values are masked.** A
   service declared as `services: db: env: POSTGRES_PASSWORD: …` showed the value
@@ -261,9 +266,12 @@ Releases before v0.27.0 predate the changelog.
   trace, and in service `docker logs` output. Values whose `env` name matches
   PASSWORD, PASSWD, SECRET, TOKEN, API_KEY, APIKEY, PRIVATE_KEY, CREDENTIAL, or
   ACCESS_KEY (case-insensitive) are now registered as job masks before the first
-  recorded docker line, so every sink shows `***`. The match deliberately
-  over-masks (a `TOKEN_BUDGET=5` becomes `***`) — documented at the registration
-  site.
+  recorded docker line, so every sink shows `***`; an empty workflow value is
+  passed as a bare `-e KEY`, which makes Docker inherit the key from the runner
+  process, so the runner's own value for a credential-shaped key is registered
+  too. The match deliberately over-masks (a `TOKEN_BUDGET=5` becomes `***`) —
+  documented at the registration site. The container-create error paths that
+  embed docker output mask it as well.
 
 - **Minted OIDC `id_token`s are redacted from logs.** A step that curls
   `ACTIONS_ID_TOKEN_REQUEST_URL` and echoes the response leaked the bearer JWT
@@ -272,7 +280,13 @@ Releases before v0.27.0 predate the changelog.
   stream masker in place (the withheld tail is flushed through the rebuilt
   masker, so no log bytes are dropped), so both the live feed and the persisted
   log show `***`. Unrelated content is unchanged. Registration is node-local,
-  like the existing claim-time scope merges.
+  like the existing claim-time scope merges, and bounded: each scope keeps the
+  64 most recent registrations and drops the oldest first, so a job that mints a
+  token per call cannot grow the scope — or rebuild every live masker from a
+  longer list on each mint — for the run's life. Retention removes the run's own
+  scope entry with its plan scopes. The per-log masker mutex is held across the
+  append of a widened masker's flushed tail, so a concurrent append never
+  interleaves with it.
 - **GitHub Apps created by the manifest flow now subscribe to
   `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
   signal joins the creation-time `default_events`, and `actions: read` joins

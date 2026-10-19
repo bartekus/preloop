@@ -944,16 +944,24 @@ fn tainted_segment_ranges(
 /// the scan consumes them in order. Merged regions replace with a single
 /// [`MASK_MARKER`]; touching matches stay one marker so re-masking is
 /// idempotent even for patterns that match marker text.
+///
+/// Sorts and merges in place, over the sorted input itself: a dense hint set
+/// (a pattern matching most characters of a multi-megabyte line reports spans
+/// of the same order) pays no second buffer for the merged list.
 fn merge_pattern_spans(spans: &mut Vec<(usize, usize)>) {
     spans.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-    for span in spans.drain(..) {
-        match merged.last_mut() {
-            Some(last) if span.0 <= last.1 => last.1 = last.1.max(span.1),
-            _ => merged.push(span),
+    let mut merged = 0;
+    for index in 0..spans.len() {
+        let span = spans[index];
+        if merged > 0 && span.0 <= spans[merged - 1].1 {
+            let last = &mut spans[merged - 1];
+            last.1 = last.1.max(span.1);
+            continue;
         }
+        spans[merged] = span;
+        merged += 1;
     }
-    *spans = merged;
+    spans.truncate(merged);
 }
 
 /// Transformed variants of a secret value that must all be masked.

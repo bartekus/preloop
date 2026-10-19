@@ -2,6 +2,16 @@ use super::*;
 
 // Timeline, logs, completion
 
+/// Most runtime-minted mask values kept per scope (a plan id and its run id).
+///
+/// A job with `id-token: write` can mint a distinct JWT per call, and every
+/// mint widens the scope, the cached resolution entries, and every live log
+/// masker — none of which is bounded by the log-memory caps. The cap bounds all
+/// of them at once; the oldest registration is dropped first, which is the value
+/// closest to its 300 s expiry (see `oidc::TOKEN_TTL_SECS`). Provider-derived
+/// values are never dropped.
+const MAX_RUNTIME_MASKS_PER_SCOPE: usize = 64;
+
 /// Whether a timeline record describes a step rather than a container.
 ///
 /// Shared by the annotation projection and the manifest reconciliation below,
@@ -267,16 +277,29 @@ fn push_mask_value(values: &mut Vec<String>, value: &str) {
 /// [`extend`](Self::extend) rebuilds from `sources ∪ {value}` and carries the
 /// withheld tail over, so a secret split across the rebuild still matches on
 /// the reassembled stream.
+///
+/// `runtime` tracks which sources arrived at runtime (as opposed to the
+/// provider-derived values the masker was seeded with) so the runtime portion
+/// can be capped: the withheld tail is flushed through the *old* masker before
+/// the rebuild, so dropping the oldest runtime value never emits a byte the
+/// old masker had redacted.
 pub struct PlanLogMasker {
     masker: preloop_gha_protocol::masking::StreamingMasker,
     sources: Vec<String>,
+    /// Runtime-registered sources, oldest first; the ones
+    /// [`extend`](Self::extend) may drop once the cap is reached.
+    runtime: Vec<String>,
 }
 
 impl PlanLogMasker {
-    fn new(sources: Vec<String>) -> Self {
+    fn new(sources: Vec<String>, runtime: Vec<String>) -> Self {
         let masker =
             preloop_gha_protocol::masking::StreamingMasker::new(sources.iter().map(String::as_str));
-        Self { masker, sources }
+        Self {
+            masker,
+            sources,
+            runtime,
+        }
     }
 
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
@@ -295,11 +318,24 @@ impl PlanLogMasker {
     /// boundary, and whatever the rebuilt masker still withholds stays
     /// withheld. Returns the bytes that became safe to emit; the caller
     /// appends them to the log before any later output.
+    ///
+    /// The runtime portion of the source list is capped at
+    /// [`MAX_RUNTIME_MASKS_PER_SCOPE`]: a job minting a token per call must not
+    /// grow every live masker for the run's life. The oldest runtime value goes
+    /// first — it is the one nearest its expiry — and the provider-derived
+    /// values stay whatever the cap does.
     fn extend(&mut self, value: &str) -> Vec<u8> {
         if value.is_empty() || self.sources.iter().any(|source| source == value) {
             return Vec::new();
         }
         self.sources.push(value.to_owned());
+        self.runtime.push(value.to_owned());
+        while self.runtime.len() > MAX_RUNTIME_MASKS_PER_SCOPE {
+            let evicted = self.runtime.remove(0);
+            if let Some(position) = self.sources.iter().position(|source| source == &evicted) {
+                self.sources.remove(position);
+            }
+        }
         let tail = self.masker.finish();
         self.masker = preloop_gha_protocol::masking::StreamingMasker::new(
             self.sources.iter().map(String::as_str),
@@ -351,17 +387,26 @@ pub async fn append_log(
             // a mint can land between the resolution above and here, and the
             // masker must never start narrower than the scope already active.
             let mut sources = secrets.as_ref().clone();
-            if let Some(runtime) = inner.plan_runtime_masks.get(&plan_id) {
-                for value in runtime {
+            let mut runtime = Vec::new();
+            if let Some(registered) = inner.plan_runtime_masks.get(&plan_id) {
+                for value in registered {
                     push_mask_value(&mut sources, value);
+                    push_mask_value(&mut runtime, value);
                 }
             }
-            let handle = std::sync::Arc::new(tokio::sync::Mutex::new(PlanLogMasker::new(sources)));
+            let handle = std::sync::Arc::new(tokio::sync::Mutex::new(PlanLogMasker::new(
+                sources, runtime,
+            )));
             inner.log_stream_maskers.insert(key.clone(), handle.clone());
             handle
         }
     };
-    let masked = masker.lock().await.push(&body);
+    // Hold the per-key guard across the segment append and the preview update:
+    // a concurrent OIDC mint widens this same masker, and releasing the guard
+    // between producing the masked chunk and writing it would let the widened
+    // masker's withheld tail land before this chunk.
+    let mut guard = masker.lock().await;
+    let masked = guard.push(&body);
     if let Err(error) = shared
         .state
         .log_segments
@@ -599,6 +644,12 @@ pub(crate) async fn resolve_plan_secret_list(
 /// no bytes are dropped). A concurrent append either observes the value
 /// everywhere or entirely predates the mint — the value cannot exist in log
 /// content older than this call.
+///
+/// The registration is bounded: at most [`MAX_RUNTIME_MASKS_PER_SCOPE`] values
+/// per scope, oldest dropped first, in the registry, the cached entries and the
+/// live maskers alike. `id-token: write` lets a job mint a distinct JWT per
+/// call, and an unbounded set would grow with the run — and rebuild every live
+/// masker from a longer list on every mint — for as long as the server lives.
 pub(crate) async fn register_runtime_mask_value(
     shared: &Arc<SharedState>,
     plan_id: &str,
@@ -616,17 +667,7 @@ pub(crate) async fn register_runtime_mask_value(
             if scope.is_empty() {
                 continue;
             }
-            let runtime = inner
-                .plan_runtime_masks
-                .entry(scope.to_owned())
-                .or_default();
-            push_mask_value(runtime, value);
-            if let Some(cached) = inner.plan_secret_masker.get_mut(scope) {
-                push_mask_value(std::sync::Arc::make_mut(cached), value);
-            }
-            if let Some((cached, _deadline)) = inner.plan_secret_masker_pending.get_mut(scope) {
-                push_mask_value(std::sync::Arc::make_mut(cached), value);
-            }
+            register_scope_runtime_value(&mut inner, scope, value);
         }
         for (key, handle) in &inner.log_stream_maskers {
             if key.starts_with(&prefix) {
@@ -636,9 +677,13 @@ pub(crate) async fn register_runtime_mask_value(
     }
     // Widen the running streaming maskers outside the state lock (their
     // mutexes are per log key; appending the spilled tail mirrors
-    // `flush_log_stream_maskers`).
+    // `flush_log_stream_maskers`). The per-key guard is held across the append
+    // of the flushed tail and the preview update: an append that took the
+    // mutex first writes its whole chunk before this tail, and one that takes
+    // it later waits — a log never interleaves two writers' bytes.
     for (key, handle) in handles {
-        let spilled = handle.lock().await.extend(value);
+        let mut guard = handle.lock().await;
+        let spilled = guard.extend(value);
         if spilled.is_empty() {
             continue;
         }
@@ -658,6 +703,56 @@ pub(crate) async fn register_runtime_mask_value(
             .or_default()
             .extend_from_slice(&spilled);
         inner.log_bytes_total = inner.log_bytes_total.saturating_add(spilled.len());
+    }
+}
+
+/// Register a runtime-minted `value` under `scope`: the runtime registry, the
+/// cached resolution entries, and (in the caller) the live log maskers.
+///
+/// The registry keeps at most [`MAX_RUNTIME_MASKS_PER_SCOPE`] values per scope
+/// and drops the oldest — a job with `id-token: write` mints a distinct JWT per
+/// call, and an uncapped list would grow for the run's whole life. An evicted
+/// value leaves the cached scope lists with it, so one bound governs every
+/// structure that holds runtime values. Values already registered are a no-op:
+/// the caches were widened when the value first arrived and every later cache
+/// write merges the registry.
+fn register_scope_runtime_value(inner: &mut InnerState, scope: &str, value: &str) {
+    let evicted = {
+        let runtime = inner
+            .plan_runtime_masks
+            .entry(scope.to_owned())
+            .or_default();
+        if runtime.iter().any(|existing| existing == value) {
+            return;
+        }
+        runtime.push(value.to_owned());
+        if runtime.len() > MAX_RUNTIME_MASKS_PER_SCOPE {
+            let evicted = runtime.remove(0);
+            warn!(
+                scope,
+                cap = MAX_RUNTIME_MASKS_PER_SCOPE,
+                "runtime mask registry at its cap; oldest registered value dropped"
+            );
+            Some(evicted)
+        } else {
+            None
+        }
+    };
+    for cached in [
+        inner.plan_secret_masker.get_mut(scope),
+        inner
+            .plan_secret_masker_pending
+            .get_mut(scope)
+            .map(|(cached, _deadline)| cached),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let cached = std::sync::Arc::make_mut(cached);
+        if let Some(evicted) = &evicted {
+            cached.retain(|existing| existing != evicted);
+        }
+        push_mask_value(cached, value);
     }
 }
 
@@ -1778,5 +1873,51 @@ mod tests {
             !statuses.contains(&ExecutionStatus::Success),
             "a step result must not be published as the job's status; saw {statuses:?}"
         );
+    }
+
+    /// A job with `id-token: write` can mint a distinct JWT per call; the
+    /// registrations must stay bounded per scope, with the oldest evicted first
+    /// (it is the one nearest its 300 s expiry) and provider-derived values
+    /// untouched.
+    #[test]
+    fn runtime_mask_registrations_are_capped_per_scope() {
+        let mut inner = InnerState::default();
+        let scope = "plan-1";
+        inner.plan_secret_masker.insert(
+            scope.to_owned(),
+            Arc::new(vec!["provider-secret".to_owned()]),
+        );
+        let mut newest = String::new();
+        for index in 0..MAX_RUNTIME_MASKS_PER_SCOPE + 8 {
+            newest = format!("minted-{index}");
+            register_scope_runtime_value(&mut inner, scope, &newest);
+        }
+
+        let runtime = &inner.plan_runtime_masks[scope];
+        assert_eq!(runtime.len(), MAX_RUNTIME_MASKS_PER_SCOPE);
+        assert!(
+            runtime.contains(&newest),
+            "the newest mint stays registered"
+        );
+        assert!(
+            !runtime.contains(&"minted-0".to_owned()),
+            "the oldest mint is evicted first"
+        );
+
+        let cached = &inner.plan_secret_masker[scope];
+        assert!(
+            cached.contains(&"provider-secret".to_owned()),
+            "provider values are never dropped: {cached:?}"
+        );
+        assert!(cached.contains(&newest));
+        assert!(
+            !cached.contains(&"minted-0".to_owned()),
+            "an evicted value leaves the cached scope: {cached:?}"
+        );
+
+        // Re-registering a known value is a no-op, not a second entry.
+        let before = inner.plan_runtime_masks[scope].len();
+        register_scope_runtime_value(&mut inner, scope, &newest);
+        assert_eq!(inner.plan_runtime_masks[scope].len(), before);
     }
 }

@@ -433,6 +433,34 @@ impl JobContext {
         )
     }
 
+    /// Does any registered `MaskType::Regex` hint match `text`?
+    ///
+    /// The environment-URL guard asks the same question the mask scan asks —
+    /// would this text disclose something the job's hints call secret — without
+    /// rewriting the text (the official `JobExtension.FinalizeJob` drops a URL
+    /// whose masked form differs from the raw value). Value masks cover only
+    /// registered values, so a URL matching only a pattern hint (the engine's
+    /// `scheme://user:password@host` shape, say) would otherwise be published
+    /// while the same span is redacted from the logs.
+    pub fn matches_pattern_mask(&self, text: &str) -> bool {
+        let guard = self.pattern_masks.read();
+        let patterns = match &guard {
+            Ok(patterns) => patterns.as_slice(),
+            // A poisoned lock degrades to value-only masking, like
+            // [`Self::mask_secrets`].
+            Err(_) => return false,
+        };
+        let mut spans = Vec::new();
+        for pattern in patterns {
+            spans.clear();
+            pattern.find_spans(text, &mut spans);
+            if !spans.is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Mask secret values in a string (longest secrets first to prevent partial matches).
     ///
     /// Transform-aware: every secret is also matched by its encoded variants

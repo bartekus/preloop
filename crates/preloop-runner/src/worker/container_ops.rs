@@ -545,9 +545,12 @@ pub async fn start_job_container(
         .to_owned();
 
     if container_id.is_empty() {
+        // This error text leaves the runner through the caller's `##[error]`
+        // line, which no later mask pass rewrites: mask the captured output at
+        // the message.
         anyhow::bail!(
             "Failed to create job container — no ID returned (output: {})",
-            result.join(" | ")
+            job.mask_secrets(&result.join(" | "))
         );
     }
 
@@ -698,10 +701,12 @@ pub async fn start_service_container(
         .to_owned();
 
     if container_id.is_empty() {
+        // See `start_job_container`: the error text is the one docker-output
+        // surface no later mask pass rewrites.
         anyhow::bail!(
             "Failed to create service container '{}' — no ID returned (output: {})",
             service.alias,
-            result.join(" | ")
+            job.mask_secrets(&result.join(" | "))
         );
     }
 
@@ -1500,9 +1505,14 @@ fn is_credential_env_name(name: &str) -> bool {
 /// NAME=VALUE` step-log line, its `debug!` trace, service `docker logs`
 /// output, and `docker inspect` env dumps.
 ///
-/// Scope is exactly the values passed as `-e NAME=VALUE` — the
-/// workflow-authored job-container `env:` and each service's `env:`, after
-/// the engine-origin rewrite. The `-e KEY` inherit form carries no value.
+/// Two forms carry a value. The explicit `-e NAME=VALUE` form passes the
+/// workflow-authored job-container `env:` and each service's `env:`. The
+/// `-e KEY` form (a workflow value that is empty, inlined as a bare key, as
+/// `push_docker_create_env` does for the proxy vars) makes Docker copy `KEY`
+/// out of the runner process's own environment: whatever the host has for a
+/// credential-shaped name then reaches the container — and the `docker
+/// inspect` env dump immediately after `docker create` — so the host value is
+/// registered too.
 ///
 /// The name heuristic (PASSWORD, PASSWD, SECRET, TOKEN, API_KEY, APIKEY,
 /// PRIVATE_KEY, CREDENTIAL, ACCESS_KEY) deliberately over-masks: a false
@@ -1510,15 +1520,35 @@ fn is_credential_env_name(name: &str) -> bool {
 /// is accepted — a false positive costs a redacted log line, while a false
 /// negative leaks a credential.
 fn register_credential_env_masks(args: &[String], job: &mut JobContext) {
+    register_credential_env_masks_lookup(args, job, |name| std::env::var(name).ok());
+}
+
+/// [`register_credential_env_masks`] with the runner's environment behind a
+/// `lookup` closure, so tests can supply an inherited value without writing
+/// the process environment (`set_var` is unsafe under edition 2024 and this
+/// crate forbids `unsafe`).
+fn register_credential_env_masks_lookup(
+    args: &[String],
+    job: &mut JobContext,
+    lookup: impl Fn(&str) -> Option<String>,
+) {
     for pair in args.windows(2).filter(|pair| pair[0] == "-e") {
-        // `-e KEY` (empty-value inherit form) has no value to register.
-        let Some((name, value)) = pair[1].split_once('=') else {
-            continue;
-        };
-        if value.is_empty() || !is_credential_env_name(name) {
-            continue;
+        match pair[1].split_once('=') {
+            Some((name, value)) => {
+                if value.is_empty() || !is_credential_env_name(name) {
+                    continue;
+                }
+                job.add_mask(value);
+            }
+            None => {
+                if !is_credential_env_name(&pair[1]) {
+                    continue;
+                }
+                if let Some(value) = lookup(&pair[1]).filter(|value| !value.is_empty()) {
+                    job.add_mask(&value);
+                }
+            }
         }
-        job.add_mask(value);
     }
 }
 
@@ -2620,10 +2650,12 @@ mod tests {
         assert!(job.masks.contains("http://172.18.0.1:9198/token"));
     }
 
-    /// The `-e KEY` inherit form carries no value to register, and nothing
-    /// else about it changes.
+    /// The `-e KEY` inherit form carries no workflow value: Docker copies `KEY`
+    /// out of the runner's own environment, and the `docker inspect` dump right
+    /// after `docker create` records it, so the host value is registered when
+    /// the name is credential-shaped — and only then.
     #[test]
-    fn empty_credential_env_values_register_no_mask() {
+    fn inherited_credential_env_values_are_masked() {
         let service = credential_service(HashMap::from([
             ("DB_PASSWORD".to_string(), String::new()),
             ("PATH".to_string(), "/bin".to_string()),
@@ -2635,8 +2667,26 @@ mod tests {
         let refs = arg_refs(&args);
         record_docker_command(&refs, &job, &mut log);
 
+        // Neither name is set in the runner's environment here: nothing to
+        // register, and the argv keeps the bare-key form.
         assert!(job.masks.is_empty(), "{:?}", job.masks);
         assert!(log[0].contains("-e DB_PASSWORD"), "{}", log[0]);
         assert!(!log[0].contains("DB_PASSWORD="), "{}", log[0]);
+
+        // With the host value present it joins the mask set, so the value the
+        // container inherits and `docker inspect` echoes shows as `***`.
+        let mut job = mask_test_job();
+        let args = vec![
+            "create".to_owned(),
+            "-e".to_owned(),
+            "DB_PASSWORD".to_owned(),
+            "-e".to_owned(),
+            "PATH".to_owned(),
+        ];
+        register_credential_env_masks_lookup(&args, &mut job, |name| {
+            (name == "DB_PASSWORD").then(|| "host-hunter2".to_owned())
+        });
+        assert_eq!(job.masks.len(), 1, "{:?}", job.masks);
+        assert_eq!(job.mask_secrets("password=host-hunter2"), "password=***");
     }
 }

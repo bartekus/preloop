@@ -2234,7 +2234,10 @@ pub struct InnerState {
     /// already logging, so they are tracked separately and merged into every
     /// scope write (`plan_secret_masker`/`plan_secret_masker_pending`) and
     /// into every cold resolution — a resolution that raced a registration
-    /// must never cache a scope that predates it.
+    /// must never cache a scope that predates it. Each scope holds at most
+    /// `MAX_RUNTIME_MASKS_PER_SCOPE` values (oldest dropped first: a job may
+    /// mint a token per call), and a run's entries are dropped with the run
+    /// (see `memory_caps::remove_run_everywhere`).
     pub plan_runtime_masks: BTreeMap<String, Vec<String>>,
     /// Chunk-boundary-safe streaming log maskers for the AzDO append path,
     /// keyed by log key (`{plan_id}/{log_id}`). Each masker holds a
