@@ -17,7 +17,7 @@ Compatibility does not mean reproducing GitHub's internal service topology. Prel
 
 ## Protocol target
 
-The current protocol target is **`actions/runner` v2.336.0**, pinned by `runner_version` in `versions.toml`. The bundled `preloop-runner` follows the official Listener/Worker split; the control plane can also accept an official runner in supported external-runner configurations.
+The current protocol target is **`actions/runner` v2.337.0**, pinned by `runner_version` in `versions.toml`. The bundled `preloop-runner` follows the official Listener/Worker split; the control plane can also accept an official runner in supported external-runner configurations.
 
 A GitHub App can trigger the compatible REST surface with:
 
@@ -41,7 +41,7 @@ To replay the configured golden set locally, use `just conform`. A runner-watch 
 
 ```sh
 runner-watch conform \
-  --runner 2.336.0 \
+  --runner 2.337.0 \
   --preloop-url http://127.0.0.1:9090
 ```
 
