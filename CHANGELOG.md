@@ -245,6 +245,34 @@ Releases before v0.27.0 predate the changelog.
   the action-download path logs a WARN with its run and reason, and a local
   composite source that cannot be read is treated as incomplete, never
   remembered as an empty answer.
+
+- **Runner mask hints are now applied in job logs.** The engine already stamped
+  `maskHints` (regex and variable) into every job message, but the runner
+  ignored the list, so pattern-shaped redaction the official runner performs
+  never happened. `run_job` now consumes it: regex hints compile once per job
+  and join the same scan as value masks on every runner egress — durable step
+  logs, check-run annotations, the live-log drain, and the retroactive re-mask —
+  and variable hints mask the named variable's value. A hint whose pattern does
+  not compile is skipped with a warning.
+
+- **Credential-shaped container and service `env:` values are masked.** A
+  service declared as `services: db: env: POSTGRES_PASSWORD: …` showed the value
+  verbatim on the `##[command]docker create … -e` line, in the docker debug
+  trace, and in service `docker logs` output. Values whose `env` name matches
+  PASSWORD, PASSWD, SECRET, TOKEN, API_KEY, APIKEY, PRIVATE_KEY, CREDENTIAL, or
+  ACCESS_KEY (case-insensitive) are now registered as job masks before the first
+  recorded docker line, so every sink shows `***`. The match deliberately
+  over-masks (a `TOKEN_BUDGET=5` becomes `***`) — documented at the registration
+  site.
+
+- **Minted OIDC `id_token`s are redacted from logs.** A step that curls
+  `ACTIONS_ID_TOKEN_REQUEST_URL` and echoes the response leaked the bearer JWT
+  into its log. The token endpoint now registers each minted `id_token` into the
+  job's server-side mask scope before the response is sent, widening the running
+  stream masker in place (the withheld tail is flushed through the rebuilt
+  masker, so no log bytes are dropped), so both the live feed and the persisted
+  log show `***`. Unrelated content is unchanged. Registration is node-local,
+  like the existing claim-time scope merges.
 - **GitHub Apps created by the manifest flow now subscribe to
   `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
   signal joins the creation-time `default_events`, and `actions: read` joins
