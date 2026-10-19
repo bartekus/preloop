@@ -6313,7 +6313,13 @@ mod tests {
             Self::with_workspace(temp, ws_dir).await
         }
 
+        /// Build the fixture's engine.
+        ///
+        /// Completes the process-wide outbound client first, so its one-time
+        /// TLS root build cannot land inside a poll budget one of these tests
+        /// asserts on (same reasoning as [`poll_only_shared`]).
         async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+            std::sync::LazyLock::force(&crate::shared_http::CLIENT);
             let event_sha = if ws_dir.join(".github/workflows").is_dir() {
                 commit_workspace(&ws_dir)
             } else {
