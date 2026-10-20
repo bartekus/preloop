@@ -48,18 +48,33 @@ Releases before v0.27.0 predate the changelog.
   those tools were installed. The launcher now exports the sourced entries and
   keeps the image's PATH, using the fallback only when the image declares none.
 - **Guest parity residue from the runner image is cleaned at bake time, and
-  custom bases are no longer mistaken for it.** `ping` gets `cap_net_raw+ep`
-  back (an OCI layer carries no file capabilities), and the official golden's
-  bake host `/etc/hosts` mapping is dropped and `/etc/fstab` entries naming
-  Azure disks this guest does not have are commented out with their original
-  text, so `systemd-remount-fs.service` no longer fails on every boot. A
-  user-provided base now preserves `/etc/hosts` and `/etc/fstab` unchanged by
-  default: a routable custom alias or an `/etc/fstab` device attached later is
-  not cloud residue. `PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1` opts a custom base
-  into the official cleanup when that base is itself a cloud image dump.
-  Systemd guests also get `systemd-resolved`'s upstream pinned in
-  `resolved.conf` (an image's own `DNS=` is never touched) and the
-  Azure/cloud-init/snap/apt units the hosted image never runs masked.
+  custom bases keep their own policy.** `ping` gets `cap_net_raw+ep` back (an
+  OCI layer carries no file capabilities), the official golden's bake host
+  `/etc/hosts` mapping is dropped, and `/etc/fstab` entries naming Azure disks
+  this guest does not have are commented out with their original text, so
+  `systemd-remount-fs.service` no longer fails on every boot. Systemd guests
+  also get `systemd-resolved`'s upstream pinned in `resolved.conf` (an
+  image's own `DNS=`, including a `resolved.conf.d` drop-in, is never touched)
+  and the Azure/cloud-init/snap/apt units the hosted image never runs masked.
+  A user-provided base now preserves all of that policy by default: its
+  `/etc/hosts` and `/etc/fstab` stay unchanged, its `systemd-sysctl.service`
+  and snap/apt units stay enabled (so its `/etc/sysctl.conf` and
+  `/etc/sysctl.d` tuning still applies), its `ping` is not modified, and its
+  resolver and per-machine sysctl values are not rewritten.
+  `PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1` opts a custom base into the whole
+  hosted policy when that base is itself a cloud image dump. Official release
+  bakes set it explicitly because their base is a digest-pinned reference,
+  not the official-golden sentinel.
+- **Resolver rewrites keep `search`, `domain` and compatible options.** The
+  bake and per-machine steps used to replace `/etc/resolv.conf` with only the
+  stub, one upstream and a fixed `options edns0 trust-ad` line, so a short
+  corporate name that depended on `search corp.example` or on `ndots` stopped
+  resolving in guest steps and containers. Both paths now keep every
+  configured upstream nameserver, all `search`/`domain` directives and the
+  image's options (adding the hosted defaults only when absent), and remain
+  idempotent. The write is still atomic and replaces a symlinked file with a
+  regular one, and the per-machine application follows the base's policy:
+  only the official or explicitly opted-in hosted policy rewrites it.
 - **The job workspace uses the hosted `work` folder.** A job's checkout now
   lands at `<runner-root>/work/<repo>/<repo>` and `RUNNER_WORKSPACE` is
   exported; `_work` is the official runner's self-hosted default, and workflows
