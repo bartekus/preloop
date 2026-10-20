@@ -707,8 +707,35 @@ impl<'a> StepContext<'a> {
     /// cap. Callers that only peek near the head must use `log_head`.
     /// (Residual: disk-scale logs rematerialize here as pre-PR; the
     /// write-path caps bound per-line copies, not total file size.)
+    ///
+    /// The assembled text carries the job's `MaskType::Regex` hints (see
+    /// [`Self::mask_assembled_log`]).
     pub fn log_content(&self) -> String {
-        Self::read_log_file(&self.log_file, None)
+        self.mask_assembled_log(Self::read_log_file(&self.log_file, None))
+    }
+
+    /// Apply the job's `MaskType::Regex` hints to a whole assembled log.
+    ///
+    /// The write path ([`Self::write_chunk`]) sees one physical line at a time
+    /// and masks each of them exactly as the official runner does, so a hint
+    /// whose pattern can span a newline (`(?s)…`, `\s+`) has nothing to match
+    /// against there. The assembled text is what leaves the runner — the
+    /// uploaded step log, the merged job log, the debug excerpt — so it gets
+    /// the same pattern pass over the whole text. Line preservation keeps the
+    /// physical record count, and therefore every line checkpoint
+    /// [`Self::log_content_since`] slices by, intact. A job without pattern
+    /// hints (no `MaskType::Regex` in its message) returns the text untouched.
+    fn mask_assembled_log(&self, content: String) -> String {
+        let has_patterns = self
+            .job
+            .pattern_masks
+            .read()
+            .map(|patterns| !patterns.is_empty())
+            .unwrap_or(false);
+        if !has_patterns || content.is_empty() {
+            return content;
+        }
+        self.job.mask_secrets_preserving_lines_with(&content, &[])
     }
 
     /// Bounded prefix of the step log for diagnostic scans. Never use for
@@ -1252,6 +1279,32 @@ mod tests {
             content.len()
         );
         assert!(content.contains("pad-8"), "tail of recorded log missing");
+    }
+
+    /// A hint whose pattern spans a newline has nothing to match against on
+    /// the per-line write path; the assembled log is where it applies, and
+    /// line preservation keeps the record count — and the checkpoints slicing
+    /// by line — valid.
+    #[test]
+    fn assembled_log_applies_cross_line_pattern_hints() {
+        let mut job = make_job();
+        job.apply_mask_hints(&[preloop_gha_protocol::azdo::MaskHint {
+            hint_type: preloop_gha_protocol::azdo::MaskType::Regex,
+            value: "(?s)BEGIN.*END".to_owned(),
+        }]);
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.write_chunk(b"BEGIN\ncross-line-token\nEND\ntail\n");
+
+        // Per-line masking cannot see the span: the pattern needs the newline.
+        assert!(
+            ctx.log_lines.iter().any(|l| l.contains("cross-line-token")),
+            "the per-line path cannot match a cross-line pattern"
+        );
+
+        let content = ctx.log_content();
+        assert!(!content.contains("cross-line-token"), "{content}");
+        assert!(content.contains("***"), "{content}");
+        assert_eq!(content.lines().count(), 4, "{content}");
     }
 
     /// Diagnostic path stays bounded: log_head returns at most the budget
