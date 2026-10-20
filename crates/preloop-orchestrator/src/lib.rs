@@ -20,7 +20,7 @@ use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use preloop_vm::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use preloop_vm::{
-    MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
+    MachineName, MachineRole, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
 use serde::Deserialize;
@@ -4644,7 +4644,14 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
             .collect(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
-        guest_volumes: Vec::new(),
+        // The official runner pack has the known empty-state layout; any
+        // other pack is the operator's and keeps its packed container state.
+        role: if is_official_golden(&env_spec.base) {
+            MachineRole::OfficialPack
+        } else {
+            MachineRole::CustomPack
+        },
+        guest_volumes: None,
         workload_init: None,
     };
     let unpacked: Result<(), OrchestratorError> = async {
@@ -4815,7 +4822,8 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
             .collect(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
-        guest_volumes: Vec::new(),
+        role: MachineRole::Image,
+        guest_volumes: None,
         workload_init: None,
     };
     provider.create(&spec).await?;
@@ -5009,7 +5017,11 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         sockets: Vec::new(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
-        guest_volumes: Vec::new(),
+        // This machine's root filesystem is about to be packed. Its container
+        // state must stay in the overlay `pack create` captures, never on a
+        // storage-disk directory the pack does not include.
+        role: MachineRole::Builder,
+        guest_volumes: None,
         workload_init: None,
     };
     provider.create(&spec).await?;
@@ -7735,7 +7747,17 @@ async fn provision_runner<P: VmProvider + 'static>(
                 .collect(),
             dns: config.dns.clone(),
             rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
-            guest_volumes: Vec::new(),
+            // A direct create from the packed artifact is a runtime pack with
+            // the source's state policy. Without a pack it boots the image and
+            // gets no pack launch defaults.
+            role: if !from_packed {
+                MachineRole::Image
+            } else if is_official_golden(&environment.base) {
+                MachineRole::OfficialPack
+            } else {
+                MachineRole::CustomPack
+            },
+            guest_volumes: None,
             workload_init: None,
         };
         provider.create(&spec).await?;
@@ -14385,7 +14407,8 @@ fi"#,
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         };
         let surviving = MachineName::new("lifecycle-test-golden").unwrap();
@@ -14950,7 +14973,8 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
-                guest_volumes: Vec::new(),
+                role: MachineRole::Image,
+                guest_volumes: None,
                 workload_init: None,
             })
             .await
@@ -15024,7 +15048,8 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
-                guest_volumes: Vec::new(),
+                role: MachineRole::Image,
+                guest_volumes: None,
                 workload_init: None,
             })
             .await
@@ -15183,7 +15208,8 @@ fi"#,
                     sockets: Vec::new(),
                     dns: None,
                     rosetta: false,
-                    guest_volumes: Vec::new(),
+                    role: MachineRole::Image,
+                    guest_volumes: None,
                     workload_init: None,
                 })
                 .await

@@ -33,11 +33,17 @@ Releases before v0.27.0 predate the changelog.
   gives the guest `systemctl`, `journald`, `systemd-resolved` and Docker's
   `systemd` cgroup driver, and mounts `/var/lib/docker` and
   `/var/lib/containerd` on the machine's own storage disk so Docker picks
-  `overlay2` instead of degrading to `fuse-overlayfs`. Both are provider
-  defaults for pack machines only: the OCI-image builder keeps its container
-  state inside the overlay `pack create` captures. `PRELOOP_SMOLVM_WORKLOAD_INIT`
-  and `PRELOOP_SMOLVM_GUEST_VOLUMES` override them (an empty value disables the
-  default).
+  `overlay2` instead of degrading to `fuse-overlayfs`. The guest-local mounts
+  are a default only for the official runner pack, whose two directories are
+  known empty placeholders: a custom pack keeps its baked container state
+  visible unless `PRELOOP_SMOLVM_GUEST_VOLUMES` (or an explicit machine list)
+  opts in. The systemd workload applies to runtime packs and can be overridden
+  by `PRELOOP_SMOLVM_WORKLOAD_INIT`; an empty value disables either default.
+  The golden builder is never given guest-local volumes or a replaced
+  workload: its container state must stay in the overlay `pack create`
+  captures. The resolved launch settings are part of the golden identity, so
+  changing either override rebuilds or re-unpacks the golden instead of
+  adopting one with the previous PID 1 or mounts.
 - **The runner sees the image's whole environment, not just its PATH.** The
   guest launcher sourced `/etc/environment` without `set -a`, so entries such
   as `ImageOS`, `ImageVersion`, `JAVA_HOME*`, `LANG` and `DEBIAN_FRONTEND`

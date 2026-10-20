@@ -226,11 +226,33 @@ pub struct GuestVolume(PathBuf);
 
 impl GuestVolume {
     /// Validate and construct a guest-local volume path.
+    ///
+    /// The value is passed as one `--volume` argument, and smolvm decides the
+    /// volume's shape from its text: a `:` separates `host:guest[:ro]`. A
+    /// colon here would therefore turn a supposedly guest-local directory
+    /// into a host export, bypassing [`VolumeMount`]'s source and read-only
+    /// validation, so it is rejected. Control bytes (including NUL) are
+    /// rejected too: they cannot be represented in a command argument and
+    /// only ever come from a malformed override. Ordinary punctuation,
+    /// spaces, and non-ASCII path bytes are valid and stay valid.
     pub fn new(value: impl Into<PathBuf>) -> Result<Self, VmError> {
         let value = value.into();
         if !value.is_absolute() {
             return Err(VmError::InvalidSpec(format!(
                 "guest volume path must be absolute: {}",
+                value.display()
+            )));
+        }
+        let bytes = value.as_os_str().as_encoded_bytes();
+        if bytes.contains(&b':') {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must not contain `:` (smolvm reads it as host:guest): {}",
+                value.display()
+            )));
+        }
+        if bytes.iter().any(u8::is_ascii_control) {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must not contain control characters: {}",
                 value.display()
             )));
         }
@@ -256,25 +278,26 @@ impl From<GuestVolume> for String {
     }
 }
 
-/// Guest-local state directories every pack-based machine gets by default.
+/// Guest-local state directories the official runner pack gets by default.
 ///
 /// These are the two paths docker and containerd must own to run their
-/// overlay-backed drivers. The default applies to machines booted from a
-/// golden pack (the golden itself and a direct create from its payload); a
-/// pack is also never a *builder*, which boots from the OCI image and must
-/// keep its container state in the overlay that `pack create` captures — a
-/// storage-disk directory is not packed, so putting the builder's
-/// `/var/lib/docker` on one would silently drop the bake's preloaded images.
+/// overlay-backed drivers. The default is opt-in per [`MachineRole`]: only
+/// [`MachineRole::OfficialPack`] uses it, because the published runner pack's
+/// two directories are known empty placeholders. A custom pack may carry
+/// preloaded images in them and a [`MachineRole::Builder`]'s writes there are
+/// not part of the pack at all, so neither gets the default.
 pub const DEFAULT_GUEST_VOLUMES: [&str; 2] = ["/var/lib/docker", "/var/lib/containerd"];
 
 /// Host override for [`DEFAULT_GUEST_VOLUMES`]: a comma-separated list of
-/// absolute guest paths, applied to pack-based machines that do not declare
-/// their own [`MachineSpec::guest_volumes`]. An empty value turns the default
-/// off (no guest-local volumes).
+/// absolute guest paths, applied to runtime pack machines that do not declare
+/// their own [`MachineSpec::guest_volumes`]. An empty value turns guest-local
+/// volumes off. Builders ignore it: their container state must stay in the
+/// overlay that `pack create` captures.
 pub const SMOLVM_GUEST_VOLUMES_ENV: &str = "PRELOOP_SMOLVM_GUEST_VOLUMES";
 
-/// Host override for the workload a pack-based machine is started with, on top
-/// of whatever entrypoint/cmd the pack itself carries.
+/// Host override for the workload a runtime pack machine is started with, on
+/// top of whatever entrypoint/cmd the pack itself carries. Ignored by the
+/// golden builder, whose pack's own entrypoint is what it exports.
 ///
 /// Unset: [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. Empty: `None` — the pack's own
 /// entrypoint/cmd runs, which is the behaviour before systemd became the
@@ -362,6 +385,44 @@ pub enum SecretSource {
     HostFile(PathBuf),
 }
 
+/// What a machine is for, and where its root filesystem came from.
+///
+/// The provider used to infer "pack-based" from the image path alone and apply
+/// the runtime defaults to every such machine. That conflated three very
+/// different cases: the official runner layout (whose container-state
+/// directories are disposable), an arbitrary operator pack (whose preloaded
+/// images live in exactly those directories), and a one-shot builder (whose
+/// root filesystem is about to be packed, so state on the storage disk is not
+/// captured). The caller states the role explicitly instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineRole {
+    /// Booted from an OCI image and not treated as a pack: no pack launch
+    /// defaults. This is what image machines and non-pack backends use.
+    #[default]
+    Image,
+    /// A one-shot machine whose root filesystem is packed into a golden.
+    ///
+    /// The builder's container state must stay in the overlay that `pack
+    /// create` captures: a guest-local volume lives on the storage disk, which
+    /// is not part of the pack, so mounting one would hide the source state
+    /// and drop it from the artifact. No default guest volumes or workload
+    /// override apply; an explicit [`MachineSpec::guest_volumes`] or
+    /// [`MachineSpec::workload_init`] is still honoured.
+    Builder,
+    /// A final runtime machine created from the official runner pack, whose
+    /// `/var/lib/docker` and `/var/lib/containerd` are known to be empty
+    /// placeholders. This is the one role that opts into
+    /// [`DEFAULT_GUEST_VOLUMES`] and [`DEFAULT_SMOLVM_WORKLOAD_INIT`].
+    OfficialPack,
+    /// A final runtime machine created from an operator-supplied pack (or a
+    /// pack baked from a custom image). Its container state was packed for a
+    /// reason: no default guest-local volume may be mounted over it. The
+    /// operator can still opt in explicitly with
+    /// [`MachineSpec::guest_volumes`] or [`SMOLVM_GUEST_VOLUMES_ENV`].
+    CustomPack,
+}
+
 /// Persistent VM configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineSpec {
@@ -394,20 +455,26 @@ pub struct MachineSpec {
     /// Enable Rosetta 2 x86_64 translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: bool,
+    /// What this machine is for: image, pack builder, or a runtime pack from
+    /// the official or a custom source. See [`MachineRole`].
+    #[serde(default)]
+    pub role: MachineRole,
     /// Guest-local persistent directories on the machine's own disk.
     ///
     /// Passed through as smolvm's bare-path `--volume` form, alongside (never
-    /// instead of) [`MachineSpec::volumes`]. Empty means "whatever the
-    /// provider's default is" — for smolvm, [`DEFAULT_GUEST_VOLUMES`] on a
-    /// pack-based machine; an explicit list replaces that default.
+    /// instead of) [`MachineSpec::volumes`]. `None` leaves the choice to the
+    /// role's provider default ([`DEFAULT_GUEST_VOLUMES`] only for
+    /// [`MachineRole::OfficialPack`]); `Some([])` explicitly disables guest
+    /// volumes, and `Some(list)` asks for exactly that list.
     #[serde(default)]
-    pub guest_volumes: Vec<GuestVolume>,
+    pub guest_volumes: Option<Vec<GuestVolume>>,
     /// Workload a *pack-based* machine runs, overriding the pack's own
     /// entrypoint/cmd.
     ///
     /// `None` means "whatever the provider's default is" — for smolvm, the
     /// [`SMOLVM_WORKLOAD_INIT_ENV`] switch and then
-    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. Ignored for image machines, whose
+    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. `Some([])` explicitly leaves the
+    /// pack's own entrypoint/cmd in place. Ignored for image machines, whose
     /// workload handling (the keep-alive fallback for an image with no usable
     /// startup command) is unchanged.
     #[serde(default)]
@@ -429,28 +496,35 @@ impl MachineSpec {
 
     /// The guest-local volumes this machine's create command carries.
     ///
-    /// An explicit [`MachineSpec::guest_volumes`] wins verbatim. Otherwise
-    /// `configured` (the [`SMOLVM_GUEST_VOLUMES_ENV`] value) replaces the
-    /// [`DEFAULT_GUEST_VOLUMES`] default, an empty value disables it, and
-    /// `is_pack` gates whether either applies at all: a pack-based machine is
-    /// the golden or a direct create from its payload, while the golden
-    /// *builder* boots the OCI image and must keep its container state inside
-    /// the overlay `pack create` captures.
+    /// `explicit` is [`MachineSpec::guest_volumes`]: `Some([])` disables guest
+    /// volumes and `Some(list)` names them exactly. When it is `None`, the
+    /// role decides:
+    ///
+    /// * [`MachineRole::OfficialPack`] takes `configured` (the
+    ///   [`SMOLVM_GUEST_VOLUMES_ENV`] value, where an empty value disables)
+    ///   or [`DEFAULT_GUEST_VOLUMES`];
+    /// * [`MachineRole::CustomPack`] takes the same configured override, but
+    ///   defaults to none so an operator's packed container state stays
+    ///   visible;
+    /// * [`MachineRole::Builder`] and [`MachineRole::Image`] get none, and
+    ///   ignore the host override: a builder's storage-disk writes are not
+    ///   captured by `pack create`.
     pub fn resolve_guest_volumes(
-        explicit: &[GuestVolume],
+        explicit: Option<&[GuestVolume]>,
         configured: Option<&str>,
-        is_pack: bool,
+        role: MachineRole,
     ) -> Result<Vec<GuestVolume>, VmError> {
-        if !explicit.is_empty() {
+        if let Some(explicit) = explicit {
             return Ok(explicit.to_vec());
         }
-        if !is_pack {
+        let runtime_pack = matches!(role, MachineRole::OfficialPack | MachineRole::CustomPack);
+        if !runtime_pack {
             return Ok(Vec::new());
         }
-        let list = configured.unwrap_or("").trim();
-        if configured.is_some() {
+        if let Some(configured) = configured {
             // An override, including an empty one (which turns the guest-local
             // volumes off): parsed as the same comma-separated guest paths.
+            let list = configured.trim();
             return if list.is_empty() {
                 Ok(Vec::new())
             } else {
@@ -461,35 +535,45 @@ impl MachineSpec {
                     .collect()
             };
         }
-        DEFAULT_GUEST_VOLUMES
-            .iter()
-            .copied()
-            .map(GuestVolume::new)
-            .collect()
+        if role == MachineRole::OfficialPack {
+            return DEFAULT_GUEST_VOLUMES
+                .iter()
+                .copied()
+                .map(GuestVolume::new)
+                .collect();
+        }
+        Ok(Vec::new())
     }
 
     /// The workload command a pack-based machine is created with.
     ///
-    /// An explicit [`MachineSpec::workload_init`] wins, then `configured` (the
-    /// [`SMOLVM_WORKLOAD_INIT_ENV`] value, where an empty value means "leave
-    /// the pack's entrypoint/cmd alone"), then
-    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. `is_pack` gates all three: an image
-    /// machine keeps the existing keep-alive handling, and a pack's own
-    /// entrypoint is what a `None` result leaves in place.
+    /// `explicit` is [`MachineSpec::workload_init`]: `Some([])` explicitly
+    /// leaves the pack's own entrypoint/cmd in place, and a non-empty command
+    /// wins over the host switch. With `None`, the role decides:
+    /// [`MachineRole::OfficialPack`] and [`MachineRole::CustomPack`] take
+    /// `configured` (the [`SMOLVM_WORKLOAD_INIT_ENV`] value, where an empty
+    /// value disables) or [`DEFAULT_SMOLVM_WORKLOAD_INIT`]; a builder only
+    /// gets what was asked for explicitly, and an image machine gets nothing
+    /// (its keep-alive handling is separate).
     pub fn resolve_workload_init(
         explicit: Option<&[String]>,
         configured: Option<&str>,
-        is_pack: bool,
+        role: MachineRole,
     ) -> Option<Vec<String>> {
-        if !is_pack {
-            return None;
+        match role {
+            MachineRole::Image => None,
+            MachineRole::Builder => {
+                explicit.and_then(|command| (!command.is_empty()).then(|| command.to_vec()))
+            }
+            MachineRole::OfficialPack | MachineRole::CustomPack => {
+                if let Some(command) = explicit {
+                    return (!command.is_empty()).then(|| command.to_vec());
+                }
+                let value = configured.unwrap_or(DEFAULT_SMOLVM_WORKLOAD_INIT);
+                let command: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+                (!command.is_empty()).then_some(command)
+            }
         }
-        if let Some(command) = explicit.filter(|command| !command.is_empty()) {
-            return Some(command.to_vec());
-        }
-        let value = configured.unwrap_or(DEFAULT_SMOLVM_WORKLOAD_INIT);
-        let command: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
-        (!command.is_empty()).then_some(command)
     }
 }
 
@@ -1648,24 +1732,19 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             spec.name.as_str().into(),
         ];
-        // `.smolmachine` packs and other local files go through `--from`.
-        // Docker-save OCI archives (`.tar`) are image inputs, not packs:
-        // smolvm's `--image` accepts them and sets up virtiofs mounts the
-        // same way it does for registry images, while `--from` machines do
-        // not (bare rootfs directories lose mounts entirely).
-        let is_pack = spec.image.ends_with(".smolmachine")
-            || (Path::new(&spec.image).is_file() && !spec.image.ends_with(".tar"));
+        let is_pack = is_pack_image(&spec.image);
         if is_pack {
             args.extend(["--from".into(), spec.image.clone()]);
         } else {
             args.extend(["--image".into(), spec.image.clone()]);
         }
-        // A pack-based machine gets its workload from here (the systemd-as-PID-1
-        // switch); an image machine's workload handling stays below, untouched.
+        // A runtime pack gets its workload from here (the systemd-as-PID-1
+        // switch); an image machine's workload handling stays below, untouched,
+        // and a builder only runs an explicitly requested command.
         let workload_init = MachineSpec::resolve_workload_init(
             spec.workload_init.as_deref(),
             (self.env_lookup)(SMOLVM_WORKLOAD_INIT_ENV).as_deref(),
-            is_pack,
+            spec.role,
         );
         args.extend([
             "--cpus".into(),
@@ -1716,9 +1795,9 @@ impl VmProvider for SmolVmProvider {
         // form: the directory then lives on the machine's own disk instead of
         // its overlay root, which is what an overlay2-backed dockerd needs.
         for volume in MachineSpec::resolve_guest_volumes(
-            &spec.guest_volumes,
+            spec.guest_volumes.as_deref(),
             (self.env_lookup)(SMOLVM_GUEST_VOLUMES_ENV).as_deref(),
-            is_pack,
+            spec.role,
         )? {
             args.extend(["--volume".into(), volume.as_path().display().to_string()]);
         }
@@ -3596,6 +3675,17 @@ fn read_tar_json_member(tar_path: &Path, member: &str) -> Option<serde_json::Val
     None
 }
 
+/// Whether an image string names a packed machine rather than an OCI input.
+///
+/// `.smolmachine` packs and other local files go through `--from`.
+/// Docker-save OCI archives (`.tar`) are image inputs, not packs: smolvm's
+/// `--image` accepts them and sets up virtiofs mounts the same way it does for
+/// registry images, while `--from` machines do not (bare rootfs directories
+/// lose mounts entirely).
+fn is_pack_image(image: &str) -> bool {
+    image.ends_with(".smolmachine") || (Path::new(image).is_file() && !image.ends_with(".tar"))
+}
+
 fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
     if spec.image.trim().is_empty()
         || spec.cpus == 0
@@ -3605,6 +3695,16 @@ fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
         return Err(VmError::InvalidSpec(
             "image, CPU, memory, and storage must be non-zero".into(),
         ));
+    }
+    if matches!(
+        spec.role,
+        MachineRole::OfficialPack | MachineRole::CustomPack
+    ) && !is_pack_image(&spec.image)
+    {
+        return Err(VmError::InvalidSpec(format!(
+            "a runtime pack role requires a packed image: {}",
+            spec.image
+        )));
     }
     for mount in &spec.volumes {
         if !mount.host.is_absolute() || !mount.guest.is_absolute() {
@@ -4439,7 +4539,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         };
         let create_provider = provider.clone();
@@ -4772,7 +4873,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         };
         let create_error = provider.create(&spec).await.unwrap_err();
@@ -4883,7 +4985,8 @@ mod tests {
             }],
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         };
 
@@ -5031,7 +5134,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         };
         assert_eq!(super::DeclaredDevices::default().total(), 0);
@@ -5061,15 +5165,55 @@ mod tests {
         assert_eq!(spec.declared_devices().total(), 3);
     }
 
-    /// A guest-local volume is a bare guest path, so a relative one can never
-    /// be expressed: `smolvm --volume` would read it as a host mount.
+    /// A guest-local volume is a bare guest path. A relative one, a colon (the
+    /// `host:guest[:ro]` delimiter), or a control byte would change the CLI
+    /// form or cannot be passed at all, so those are rejected at every
+    /// constructor: direct, serde, and the environment override.
     #[test]
-    fn guest_volume_paths_must_be_absolute() {
+    fn guest_volume_paths_must_fit_the_bare_path_cli_form() {
         assert!(GuestVolume::new("/var/lib/docker").is_ok());
+        assert!(GuestVolume::new("/srv/my state").is_ok());
+        assert!(GuestVolume::new("/srv/docker.sock").is_ok());
+        assert!(GuestVolume::new("/srv/データ").is_ok());
         let relative = GuestVolume::new("var/lib/docker").unwrap_err();
         assert!(
             matches!(&relative, VmError::InvalidSpec(message) if message.contains("absolute")),
             "{relative:?}"
+        );
+        for value in ["/host/cache:/guest/cache", "/var/lib/do:cker"] {
+            let colon = GuestVolume::new(value).unwrap_err();
+            assert!(
+                matches!(&colon, VmError::InvalidSpec(message) if message.contains("host:guest")),
+                "{colon:?}"
+            );
+        }
+        for value in [
+            "/var/lib/docker\0",
+            "/var/lib/dock\ner",
+            "/var/lib/dock\t er",
+        ] {
+            let control = GuestVolume::new(value).unwrap_err();
+            assert!(
+                matches!(&control, VmError::InvalidSpec(message) if message.contains("control")),
+                "{control:?}"
+            );
+        }
+        // The serde constructor is the same validation: a persisted or
+        // deserialized machine cannot smuggle a host mount through.
+        assert!(
+            serde_json::from_str::<GuestVolume>("\"/host/cache:/guest/cache\"").is_err(),
+            "deserialization must reject the host:guest form"
+        );
+        // The host override goes through the same constructor.
+        let invalid = MachineSpec::resolve_guest_volumes(
+            None,
+            Some("/host/cache:/guest/cache"),
+            MachineRole::OfficialPack,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&invalid, VmError::InvalidSpec(message) if message.contains("host:guest")),
+            "{invalid:?}"
         );
         assert_eq!(
             GuestVolume::new("/var/lib/containerd").unwrap().as_path(),
@@ -5077,91 +5221,161 @@ mod tests {
         );
     }
 
-    /// The default guest-local volumes reach a pack-based machine (the golden
-    /// and a direct create from its payload) and only that: the OCI-image
-    /// builder must keep its container state inside the overlay the pack
-    /// captures.
+    /// The default guest-local volumes are opt-in per role: only the official
+    /// runner pack opts into the known layout. A custom pack keeps its packed
+    /// container state visible, and a builder never mounts over state the pack
+    /// cannot capture. `Some([])` is the explicit off switch alongside an
+    /// empty host override.
     #[test]
-    fn guest_volumes_default_to_the_runtime_state_dirs_for_pack_machines() {
-        let pack = |configured: Option<&str>| {
-            MachineSpec::resolve_guest_volumes(&[], configured, true)
+    fn guest_volumes_follow_the_machine_role_and_honour_explicit_disable() {
+        let paths = |configured: Option<&str>, role| {
+            MachineSpec::resolve_guest_volumes(None, configured, role)
                 .expect("valid")
                 .into_iter()
                 .map(|volume| volume.as_path().display().to_string())
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            pack(None),
+            paths(None, MachineRole::OfficialPack),
             vec![
                 "/var/lib/docker".to_owned(),
                 "/var/lib/containerd".to_owned()
             ]
         );
         assert_eq!(
-            pack(Some("/var/lib/docker,/var/lib/containerd,/srv/state")),
-            vec![
-                "/var/lib/docker".to_owned(),
-                "/var/lib/containerd".to_owned(),
-                "/srv/state".to_owned()
-            ]
+            paths(
+                Some("/var/lib/docker,/srv/state"),
+                MachineRole::OfficialPack
+            ),
+            vec!["/var/lib/docker".to_owned(), "/srv/state".to_owned()]
         );
         // An empty override is the documented off switch.
-        assert!(pack(Some("")).is_empty());
-        assert!(pack(Some("   ")).is_empty());
-        // An image machine gets none of the default ...
+        assert!(paths(Some(""), MachineRole::OfficialPack).is_empty());
+        assert!(paths(Some("   "), MachineRole::OfficialPack).is_empty());
+        // An ordinary custom pack defaults to no mounts: its
+        // /var/lib/docker may be exactly where its preloaded images live.
+        assert!(paths(None, MachineRole::CustomPack).is_empty());
+        // An operator can still opt a custom pack in explicitly.
+        assert_eq!(
+            paths(Some("/srv/state"), MachineRole::CustomPack),
+            vec!["/srv/state".to_owned()]
+        );
+        // Builders and image machines never take the host override: the
+        // builder's writes would land on a disk `pack create` does not pack.
+        for role in [MachineRole::Builder, MachineRole::Image] {
+            assert!(paths(None, role).is_empty());
+            assert!(paths(Some("/var/lib/docker"), role).is_empty());
+        }
+        // An explicit list (including the empty one) is honoured wherever it
+        // is asked for and beats the host override.
+        let explicit = vec![GuestVolume::new("/srv/state").unwrap()];
+        assert_eq!(
+            MachineSpec::resolve_guest_volumes(
+                Some(&explicit),
+                Some("/host:guest"),
+                MachineRole::Image
+            )
+            .expect("valid"),
+            explicit
+        );
         assert!(
-            MachineSpec::resolve_guest_volumes(&[], None, false)
+            MachineSpec::resolve_guest_volumes(Some(&[]), None, MachineRole::OfficialPack)
                 .expect("valid")
                 .is_empty()
         );
-        // ... but an explicit list is honoured wherever it is asked for.
-        let explicit = vec![GuestVolume::new("/srv/state").unwrap()];
-        assert_eq!(
-            MachineSpec::resolve_guest_volumes(&explicit, None, false).expect("valid"),
-            explicit
-        );
         // A configured relative path is a typo, not a silent no-op.
-        let invalid =
-            MachineSpec::resolve_guest_volumes(&[], Some("/var/lib/docker,relative"), true)
-                .unwrap_err();
+        let invalid = MachineSpec::resolve_guest_volumes(
+            None,
+            Some("/var/lib/docker,relative"),
+            MachineRole::OfficialPack,
+        )
+        .unwrap_err();
         assert!(
             matches!(&invalid, VmError::InvalidSpec(message) if message.contains("absolute")),
             "{invalid:?}"
         );
     }
 
-    /// Pack-based machines run systemd as PID 1 by default, the override can
-    /// name another command, an empty override restores the pack's own
-    /// entrypoint, and image machines keep the existing keep-alive path.
+    /// Runtime packs run systemd as PID 1 by default, the override can name
+    /// another command, an empty override restores the pack's own entrypoint,
+    /// `Some([])` is an explicit disable, and builders/image machines keep
+    /// their own workload unless a builder asks for one.
     #[test]
-    fn workload_init_defaults_to_systemd_for_pack_machines() {
-        let pack = |configured: Option<&str>| {
-            MachineSpec::resolve_workload_init(None, configured, true)
-                .expect("pack machines have a workload by default")
+    fn workload_init_follows_the_machine_role_and_honours_explicit_disable() {
+        let pack = |configured: Option<&str>, role| {
+            MachineSpec::resolve_workload_init(None, configured, role)
+                .expect("runtime packs have a workload by default")
         };
-        assert_eq!(pack(None), vec!["/sbin/init".to_owned()]);
         assert_eq!(
-            pack(Some("/lib/systemd/systemd --system")),
+            pack(None, MachineRole::OfficialPack),
+            vec!["/sbin/init".to_owned()]
+        );
+        assert_eq!(
+            pack(None, MachineRole::CustomPack),
+            vec!["/sbin/init".to_owned()]
+        );
+        assert_eq!(
+            pack(
+                Some("/lib/systemd/systemd --system"),
+                MachineRole::OfficialPack
+            ),
             vec!["/lib/systemd/systemd".to_owned(), "--system".to_owned()]
         );
         assert_eq!(
-            pack(Some("  /sbin/init  ")),
+            pack(Some("  /sbin/init  "), MachineRole::OfficialPack),
             vec!["/sbin/init".to_owned()],
             "surrounding whitespace is trimmed, not passed as an argument"
         );
-        assert!(MachineSpec::resolve_workload_init(None, Some(""), true).is_none());
-        assert!(MachineSpec::resolve_workload_init(None, Some("   "), true).is_none());
+        assert!(
+            MachineSpec::resolve_workload_init(None, Some(""), MachineRole::OfficialPack).is_none()
+        );
+        assert!(
+            MachineSpec::resolve_workload_init(None, Some("   "), MachineRole::CustomPack)
+                .is_none()
+        );
+        // The explicit empty list disables even when the host switch is set.
+        assert!(
+            MachineSpec::resolve_workload_init(
+                Some(&[]),
+                Some("/sbin/init"),
+                MachineRole::CustomPack
+            )
+            .is_none()
+        );
         // An explicit per-machine command wins over the host switch.
         let explicit = vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()];
         assert_eq!(
-            MachineSpec::resolve_workload_init(Some(&explicit), Some(""), true),
+            MachineSpec::resolve_workload_init(
+                Some(&explicit),
+                Some(""),
+                MachineRole::OfficialPack
+            ),
+            Some(explicit.clone())
+        );
+        // A builder runs only what was asked for: its default is the pack's
+        // own entrypoint, not a workload that writes over the state it exports.
+        assert!(MachineSpec::resolve_workload_init(None, None, MachineRole::Builder).is_none());
+        assert!(
+            MachineSpec::resolve_workload_init(None, Some("/sbin/init"), MachineRole::Builder)
+                .is_none()
+        );
+        assert_eq!(
+            MachineSpec::resolve_workload_init(
+                Some(&explicit),
+                Some("/sbin/init"),
+                MachineRole::Builder
+            ),
             Some(explicit)
         );
         // Image machines never get one: their keep-alive handling is separate.
-        assert!(MachineSpec::resolve_workload_init(None, None, false).is_none());
+        assert!(MachineSpec::resolve_workload_init(None, None, MachineRole::Image).is_none());
         assert!(
-            MachineSpec::resolve_workload_init(Some(&["/sbin/init".to_owned()]), None, false)
-                .is_none()
+            MachineSpec::resolve_workload_init(
+                Some(&["/sbin/init".to_owned()]),
+                None,
+                MachineRole::Image
+            )
+            .is_none()
         );
     }
 
@@ -5251,7 +5465,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         };
         provider.create(&spec).await.expect("create");

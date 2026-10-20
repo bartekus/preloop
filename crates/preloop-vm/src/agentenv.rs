@@ -2360,7 +2360,8 @@ mod tests {
             }],
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: crate::MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         };
         let error = validate_spec(&spec).unwrap_err();
@@ -2384,7 +2385,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: crate::MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         };
         assert!(validate_spec(&base()).is_ok());
@@ -2514,7 +2516,8 @@ mod tests {
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
-            guest_volumes: Vec::new(),
+            role: crate::MachineRole::Image,
+            guest_volumes: None,
             workload_init: None,
         }
     }

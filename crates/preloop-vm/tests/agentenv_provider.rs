@@ -13,8 +13,8 @@
 
 use preloop_vm::agentenv::AgentEnvProvider;
 use preloop_vm::{
-    MachineName, MachineSpec, MachineState, NetworkPolicy, SocketMount, VmError, VmProvider,
-    VolumeMount,
+    MachineName, MachineRole, MachineSpec, MachineState, NetworkPolicy, SocketMount, VmError,
+    VmProvider, VolumeMount,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -406,7 +406,8 @@ fn spec(name: &str, image: &str) -> MachineSpec {
         sockets: Vec::new(),
         dns: None,
         rosetta: false,
-        guest_volumes: Vec::new(),
+        role: MachineRole::Image,
+        guest_volumes: None,
         workload_init: None,
     }
 }
