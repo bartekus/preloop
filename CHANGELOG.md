@@ -14,6 +14,9 @@ Releases before v0.27.0 predate the changelog.
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
   rejected the retried job's otherwise valid runtime token with HTTP 403.
+- **Direct Docker actions retain their image reference.** Job messages carrying
+  a `containerRegistry` reference now select the `docker://` action handler
+  instead of being reconstructed as an empty remote-action reference.
 - **Container DNS reaches systemd-resolved's stub, so `/etc/hosts` aliases
   resolve inside a compose network.** A GitHub-hosted runner's container
   resolves a `postgres.localhost`-style service alias because its host's
