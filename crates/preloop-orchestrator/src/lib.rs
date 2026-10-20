@@ -2274,6 +2274,58 @@ pub fn golden_ping_capability_script(ping: &str) -> String {
     )
 }
 
+/// Whether a golden bake may normalize the base image's cloud/builder residue.
+///
+/// The official runner image is captured from an Azure VM, so its `/etc/hosts`
+/// and `/etc/fstab` carry the bake host's own entries. A custom base is the
+/// operator's image: a routable `/etc/hosts` alias may name a real service, and
+/// an `/etc/fstab` device may be attached later (a network or lazily mounted
+/// volume), so neither file can be classified as residue from its contents
+/// alone. There is no reliable provenance heuristic: an address or hostname is
+/// not proof of Azure, and a missing device node is not proof of a stale mount.
+/// The policy therefore comes from how the base was selected, never from text
+/// that happens to look like a cloud image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoldenResiduePolicy {
+    /// Normalize bake-host and Azure residue (official runner images).
+    Clean,
+    /// Preserve `/etc/hosts` and `/etc/fstab` exactly as supplied.
+    Preserve,
+}
+
+/// Opt a custom base into the official image's cloud-residue cleanup.
+///
+/// The official golden always cleans regardless of this variable. A custom
+/// base is only cleaned when the operator sets this to a value other than
+/// empty, `0`, or `false`, which is the escape hatch for a custom base that is
+/// itself a cloud VM dump. Enabling it can drop an intentional routable
+/// `/etc/hosts` mapping and comment out an `/etc/fstab` device that is not
+/// present at bake time.
+pub const GOLDEN_CLEAN_CLOUD_RESIDUE_ENV: &str = "PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE";
+
+/// Resolve the residue policy for a base image.
+///
+/// Official goldens always clean. Custom bases preserve by default. The opt-in
+/// is read while the environment fingerprint is computed, so turning it on
+/// rotates the artifact instead of adopting a golden baked under the other
+/// policy.
+pub fn golden_residue_policy(base: &str) -> GoldenResiduePolicy {
+    golden_residue_policy_with(base, clean_cloud_residue_opted_in())
+}
+
+fn golden_residue_policy_with(base: &str, opted_in: bool) -> GoldenResiduePolicy {
+    if is_official_golden(base) || opted_in {
+        GoldenResiduePolicy::Clean
+    } else {
+        GoldenResiduePolicy::Preserve
+    }
+}
+
+fn clean_cloud_residue_opted_in() -> bool {
+    std::env::var(GOLDEN_CLEAN_CLOUD_RESIDUE_ENV)
+        .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false"))
+}
+
 /// Strip the bake host's own mapping out of `/etc/hosts`.
 ///
 /// The runner image is dumped from a machine that was itself a runner, so its
@@ -2317,11 +2369,6 @@ fn golden_hosts_cleanup_script_at(hosts: &str) -> String {
          else echo 'preloop: warning: could not read {hosts} for cleaning' >&2; fi; \
          rm -f \"$tmp\""
     )
-}
-
-/// [`golden_hosts_cleanup_script_at`] against the guest's real `/etc/hosts`.
-fn golden_hosts_cleanup_script() -> String {
-    golden_hosts_cleanup_script_at("/etc/hosts")
 }
 
 /// Drop `/etc/fstab` entries whose device this guest does not have.
@@ -2394,9 +2441,29 @@ fn golden_fstab_cleanup_script_at(fstab: &str, disk: &str) -> String {
     )
 }
 
-/// [`golden_fstab_cleanup_script_at`] against the guest's real `/etc/fstab`.
-fn golden_fstab_cleanup_script() -> String {
-    golden_fstab_cleanup_script_at("/etc/fstab", "/dev")
+/// The residue steps a bake runs for `policy`, against the real paths.
+///
+/// A custom base yields no step at all: nothing rewrites the files before the
+/// pack captures them, so a user alias or mount survives the bake byte for
+/// byte.
+fn golden_residue_cleanup_steps(policy: GoldenResiduePolicy) -> Vec<String> {
+    golden_residue_cleanup_steps_at(policy, "/etc/hosts", "/etc/fstab", "/dev")
+}
+
+/// [`golden_residue_cleanup_steps`] against the files a shell test substitutes.
+fn golden_residue_cleanup_steps_at(
+    policy: GoldenResiduePolicy,
+    hosts: &str,
+    fstab: &str,
+    disk: &str,
+) -> Vec<String> {
+    match policy {
+        GoldenResiduePolicy::Clean => vec![
+            golden_hosts_cleanup_script_at(hosts),
+            golden_fstab_cleanup_script_at(fstab, disk),
+        ],
+        GoldenResiduePolicy::Preserve => Vec::new(),
+    }
 }
 
 /// The units a hosted runner never runs, and a preloop guest should not either.
@@ -2720,6 +2787,11 @@ fn guest_sysctl_script_at(root: &str) -> String {
 /// entry that also carries `localhost` keeps it, and a line left with no name
 /// at all is dropped.
 ///
+/// Only lines that name the machine's own hostname are rewritten. Every other
+/// line — including a custom routable alias the image supplied — is printed
+/// back byte for byte, so the runtime hostname repair never becomes a second
+/// policy that deletes an operator's mapping.
+///
 /// Idempotent: a machine whose name already resolves locally — the baked
 /// golden itself, a fork that ran this once, or a GitHub-shaped
 /// interface-address mapping — exits without touching `/etc/hosts`. The
@@ -2793,6 +2865,9 @@ fn guest_hostname_script_at(hosts: &str) -> String {
            /^[[:space:]]*#/ {{ print; next }} \
            {{ \
              n = split($0, field, /[[:space:]]+/); \
+             has = 0; \
+             for (i = 2; i <= n; i++) if (field[i] == host) {{ has = 1; break; }} \
+             if (!has) {{ print; next; }} \
              out = \"\"; names = 0; \
              for (i = 1; i <= n; i++) {{ \
                if (i > 1 && field[i] == host) continue; \
@@ -3040,33 +3115,43 @@ pub fn golden_glibc_check_script() -> &'static str {
      }"
 }
 
-/// The complete golden contract for a configured image: the image is used
-/// exactly as it is, and this is everything Preloop adds.
+/// The complete golden contract for a configured image: the runner machinery
+/// every golden needs, plus the residue normalization its base's provenance
+/// allows.
 ///
-/// GitHub-runner machinery only — the account jobs run as (with its home,
-/// `work` and passwordless sudo), the ownership of the paths they write, the
-/// writable tool cache with `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in
-/// `/etc/environment`, the glibc requirement above, the image's apt package
-/// indices ([`golden_apt_lists_script`]), and the pieces of bake-host residue a
-/// container-image dump carries — `ping`'s file capability
-/// ([`golden_ping_capability_script`]), the bake host's own `/etc/hosts`
-/// mapping ([`golden_hosts_cleanup_script`]) and the Azure disks its
-/// `/etc/fstab` still names ([`golden_fstab_cleanup_script`]). It also
-/// prepares a systemd guest ([`golden_systemd_parity_script`]) and points the
-/// resolver file at the resolved stub ([`guest_resolver_stub_script`]). No
-/// packages, no toolchains, no PATH or environment overrides: on a hosted
-/// runner a missing `bash`, `git` or `docker` fails the step that needs it, and
-/// the same is true here.
+/// GitHub-runner machinery — the account jobs run as (with its home, `work` and
+/// passwordless sudo), the ownership of the paths they write, the writable tool
+/// cache with `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in `/etc/environment`,
+/// the glibc requirement above, the image's apt package indices
+/// ([`golden_apt_lists_script`]), and `ping`'s file capability
+/// ([`golden_ping_capability_script`]). It also prepares a systemd guest
+/// ([`golden_systemd_parity_script`]) and points the resolver file at the
+/// resolved stub ([`guest_resolver_stub_script`]). No packages, no toolchains,
+/// no PATH or environment overrides: on a hosted runner a missing `bash`, `git`
+/// or `docker` fails the step that needs it, and the same is true here.
+///
+/// The bake-host `/etc/hosts` mapping and the Azure/cloud `/etc/fstab` entries
+/// are cleaned only under [`GoldenResiduePolicy::Clean`]. A custom base gets
+/// [`GoldenResiduePolicy::Preserve`] by default, so its two host policy files
+/// survive the bake unchanged; the other steps above still run, because they
+/// are the runner contract rather than residue cleanup. See
+/// [`golden_residue_policy`].
 ///
 /// The text is also the fingerprint input for configured images (see
 /// `EnvironmentSpec::from_base`), so editing a step rebuilds every golden baked
 /// from an image instead of adopting one the old contract produced.
-pub fn golden_contract_script(user: &str, uid: u32) -> String {
-    golden_contract_steps(user, uid).join("; ")
+pub fn golden_contract_script(user: &str, uid: u32, residue: GoldenResiduePolicy) -> String {
+    golden_contract_steps(user, uid, residue).join("; ")
+}
+
+/// The contract a base image's golden is built with, using the provenance
+/// policy resolved from `base`.
+pub(crate) fn golden_contract_for_base(base: &str, user: &str, uid: u32) -> String {
+    golden_contract_script(user, uid, golden_residue_policy(base))
 }
 
 /// The contract's statements in order; [`golden_contract_script`] joins them.
-pub fn golden_contract_steps(user: &str, uid: u32) -> Vec<String> {
+pub fn golden_contract_steps(user: &str, uid: u32, residue: GoldenResiduePolicy) -> Vec<String> {
     // `PRELOOP_RUNNER_USER=root` restores the old "run as root" behavior, and
     // `as_runner_user` runs the runner unchanged for it. The account steps must
     // skip then: creating and chowning a `root` account (and moving its home
@@ -3079,14 +3164,13 @@ pub fn golden_contract_steps(user: &str, uid: u32) -> Vec<String> {
         steps.push(golden_ownership_script(uid));
     }
     steps.push(golden_apt_lists_script());
-    // The bake host's own `/etc/hosts` mapping is dropped here, the image's
-    // Azure `/etc/fstab` entries are commented out, and `ping`'s capability
-    // restored: all three are image residue that every fork would otherwise
-    // inherit, and all three are cheaper to fix once per golden than per
-    // machine. None touches the runner's groups, so they stay ahead of the
-    // membership step below.
-    steps.push(golden_hosts_cleanup_script());
-    steps.push(golden_fstab_cleanup_script());
+    // Only the official image (or a custom base whose operator opted in) has
+    // its `/etc/hosts` mapping and `/etc/fstab` rewritten: those files are
+    // policy, and a custom image's routable alias or not-yet-attached device
+    // is indistinguishable from residue by content alone. `ping`'s capability
+    // is runner machinery, so it applies to every base. Neither touches the
+    // runner's groups, so these stay ahead of the membership step below.
+    steps.extend(golden_residue_cleanup_steps(residue));
     steps.push(golden_ping_capability_script("/usr/bin/ping"));
     // The systemd preparation is bake-time only: it is gated on the systemd
     // binaries rather than on a running systemd, because the SmolVM builder has
@@ -4630,7 +4714,7 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
     vm_telemetry_register(config, golden, "golden", Some(&spec));
     await_guest_ready(provider.as_ref(), golden).await?;
     prepare_rosetta_multiarch(provider.as_ref(), golden, false).await?;
-    apply_golden_contract(provider.as_ref(), config, golden).await?;
+    apply_golden_contract(provider.as_ref(), config, golden, &env_spec.base).await?;
     if provider.capabilities().runner_bundle_carries_externals {
         link_runner_externals(provider.as_ref(), golden).await?;
     }
@@ -4656,10 +4740,11 @@ async fn apply_golden_contract<P: VmProvider>(
     provider: &P,
     config: &RunnerPoolConfig,
     name: &MachineName,
+    base: &str,
 ) -> Result<(), OrchestratorError> {
     let user = config.runner_user.as_deref().unwrap_or(DEFAULT_RUNNER_USER);
     let uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
-    let contract = golden_contract_script(user, uid);
+    let contract = golden_contract_for_base(base, user, uid);
     let output = provider
         .exec(
             name,
@@ -4824,7 +4909,9 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         let _ = provider.delete(&name).await;
         return Err(error);
     }
-    if let Err(error) = apply_golden_contract(provider.as_ref(), config, &name).await {
+    if let Err(error) =
+        apply_golden_contract(provider.as_ref(), config, &name, &env_spec.base).await
+    {
         // A golden whose runner account is wrong cannot run a job: every step
         // fails on permissions, which reads as flaky CI. A gold build that
         // cannot satisfy the contract (no glibc loader, no way to escalate to
@@ -7541,7 +7628,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         vm_telemetry_register(config, name, "runner", Some(&spec));
         if !from_packed {
             await_guest_ready(provider.as_ref(), name).await?;
-            apply_golden_contract(provider.as_ref(), config, name).await?;
+            apply_golden_contract(provider.as_ref(), config, name, &environment.base).await?;
             if provider.capabilities().runner_bundle_carries_externals {
                 link_runner_externals(provider.as_ref(), name).await?;
             }
@@ -9034,7 +9121,11 @@ chmod +x "$dest/bin/node"
     /// runner account everything it writes.
     #[test]
     fn golden_contract_requires_glibc_and_hands_over_the_runner_paths() {
-        let contract = golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID);
+        let contract = golden_contract_script(
+            DEFAULT_RUNNER_USER,
+            DEFAULT_RUNNER_UID,
+            GoldenResiduePolicy::Clean,
+        );
         assert!(
             contract.contains("/lib64/ld-linux-*.so.*"),
             "the glibc loader probe must be part of the contract: {contract}"
@@ -9588,6 +9679,7 @@ done
             "127.0.0.1 localhost\n\
              10.1.0.59 runnervm.bnlheokxlokujiv1ylew4udf0c.gx.internal.cloudapp.net runnervmvrwv9\n\
              10.1.0.60 localhost runnervmvrwv9\n\
+             10.20.30.40\tinternal-api.example\n\
              # a comment that mentions runnervmvrwv9\n",
         )
         .unwrap();
@@ -9645,10 +9737,11 @@ done
             "127.0.0.1 localhost\n\
              10.1.0.59 runnervm.bnlheokxlokujiv1ylew4udf0c.gx.internal.cloudapp.net\n\
              10.1.0.60 localhost\n\
+             10.20.30.40\tinternal-api.example\n\
              # a comment that mentions runnervmvrwv9\n\
              127.0.0.1 runnervmvrwv9\n",
             "the machine's name must leave the foreign mapping, other names and \
-             comments untouched"
+             comments untouched; an unrelated custom alias keeps its exact bytes"
         );
         let after = std::process::Command::new("/bin/sh")
             .args(["-c", "getent hosts \"$(hostname)\""])
@@ -10157,11 +10250,157 @@ done
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        // And the golden contract carries the step.
+        // The official contract carries the step; a custom base does not.
+        let official = golden_contract_script(
+            DEFAULT_RUNNER_USER,
+            DEFAULT_RUNNER_UID,
+            GoldenResiduePolicy::Clean,
+        );
         assert!(
-            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
-                .contains(&golden_fstab_cleanup_script()),
-            "the golden contract must carry the fstab cleanup"
+            official.contains(&golden_fstab_cleanup_script_at("/etc/fstab", "/dev")),
+            "the official golden contract must carry the fstab cleanup"
+        );
+        assert!(
+            official.contains(&golden_hosts_cleanup_script_at("/etc/hosts")),
+            "the official golden contract must carry the hosts cleanup"
+        );
+    }
+
+    /// Only the official image is classified as cloud residue. A custom base
+    /// preserves both files unless its operator explicitly opts in; there is
+    /// no content-based guess (an address or hostname is not proof of Azure).
+    #[test]
+    fn residue_policy_follows_base_provenance() {
+        let official = crate::environment::OFFICIAL_GOLDEN;
+        let custom = "ghcr.io/acme/base@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        assert_eq!(
+            golden_residue_policy_with(official, false),
+            GoldenResiduePolicy::Clean
+        );
+        assert_eq!(
+            golden_residue_policy_with(official, true),
+            GoldenResiduePolicy::Clean,
+            "the official golden always cleans"
+        );
+        assert_eq!(
+            golden_residue_policy_with(custom, false),
+            GoldenResiduePolicy::Preserve,
+            "a custom base is preserved by default, including an Azure-looking one"
+        );
+        assert_eq!(
+            golden_residue_policy_with(custom, true),
+            GoldenResiduePolicy::Clean,
+            "the opt-in is the only way a custom base is cleaned"
+        );
+        assert_eq!(
+            golden_residue_policy_with("10.1.0.59.cloudapp.example", false),
+            GoldenResiduePolicy::Preserve,
+            "residue must never be inferred from an address or hostname"
+        );
+    }
+
+    /// A custom base's `/etc/hosts` routable alias and its `/etc/fstab` entry
+    /// for a device that is not attached at bake time survive the bake byte for
+    /// byte. The same fixture run under the official policy proves the cleanup
+    /// would have removed them, so this is a policy gate rather than a fixture
+    /// that never exercised the cleanup.
+    #[cfg(unix)]
+    #[test]
+    fn custom_base_preserves_hosts_and_fstab_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let fstab = temp.path().join("fstab");
+        let disk = temp.path().join("dev");
+        std::fs::create_dir_all(&disk).unwrap();
+        let host = String::from_utf8_lossy(
+            &std::process::Command::new("hostname")
+                .output()
+                .expect("hostname must run")
+                .stdout,
+        )
+        .trim()
+        .to_owned();
+        assert!(!host.is_empty(), "the fixture needs this machine's name");
+        let custom_alias = "10.20.30.40 internal-api.example";
+        let stale_uuid = "UUID=4fb3aaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let hosts_fixture = format!(
+            "127.0.0.1 localhost\n\
+             10.9.9.9 {host}\n\
+             {custom_alias}\n"
+        );
+        let fstab_fixture = format!(
+            "# custom mounts\n\
+             {stale_uuid} /srv ext4 defaults 0 2\n\
+             tmpfs /tmp tmpfs defaults 0 0\n"
+        );
+        std::fs::write(&hosts, &hosts_fixture).unwrap();
+        std::fs::write(&fstab, &fstab_fixture).unwrap();
+
+        let custom = "ghcr.io/acme/base@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let steps = golden_residue_cleanup_steps_at(
+            golden_residue_policy_with(custom, false),
+            hosts.to_str().unwrap(),
+            fstab.to_str().unwrap(),
+            disk.to_str().unwrap(),
+        );
+        assert!(
+            steps.is_empty(),
+            "a custom base must not receive a hosts or fstab rewrite: {steps:?}"
+        );
+        // A bake joins the steps; an empty list runs no shell at all.
+        assert!(steps.join("; ").is_empty());
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), hosts_fixture);
+        assert_eq!(std::fs::read_to_string(&fstab).unwrap(), fstab_fixture);
+
+        // The contract the bake actually runs proves the same: neither cleanup
+        // is present, and both files' custom content is therefore untouched.
+        let contract = golden_contract_for_base(custom, "runner", 1001);
+        assert!(
+            !contract.contains("dropped stale fstab entry"),
+            "a custom contract must not rewrite /etc/fstab: {contract}"
+        );
+        assert!(
+            !contract.contains("could not drop the bake host mapping"),
+            "a custom contract must not rewrite /etc/hosts: {contract}"
+        );
+
+        // Same fixture, official policy: the routable alias and the absent
+        // device are exactly what the cleanup removes.
+        for step in golden_residue_cleanup_steps_at(
+            GoldenResiduePolicy::Clean,
+            hosts.to_str().unwrap(),
+            fstab.to_str().unwrap(),
+            disk.to_str().unwrap(),
+        ) {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &step])
+                .output()
+                .expect("the cleanup shell must run");
+            assert!(
+                output.status.success(),
+                "the cleanup must not fail: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let cleaned_hosts = std::fs::read_to_string(&hosts).unwrap();
+        assert!(
+            !cleaned_hosts.contains(custom_alias),
+            "the official cleanup drops the custom routable alias: {cleaned_hosts}"
+        );
+        assert!(
+            cleaned_hosts.contains(&format!("10.9.9.9 {host}")),
+            "the guest's own mapping survives: {cleaned_hosts}"
+        );
+        let cleaned_fstab = std::fs::read_to_string(&fstab).unwrap();
+        assert!(
+            cleaned_fstab.contains(&format!(
+                "# preloop: dropped stale fstab entry: {stale_uuid}"
+            )),
+            "the official cleanup comments out the absent device: {cleaned_fstab}"
+        );
+        assert!(
+            cleaned_fstab.lines().any(|line| line.starts_with("tmpfs ")),
+            "pseudo-filesystems survive: {cleaned_fstab}"
         );
     }
 
@@ -10344,8 +10583,12 @@ done
         // And the golden carries the step: an AgentENV restore keeps the baked
         // file, which is what the daemon the guest's systemd starts reads.
         assert!(
-            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
-                .contains(&guest_resolver_stub_script()),
+            golden_contract_script(
+                DEFAULT_RUNNER_USER,
+                DEFAULT_RUNNER_UID,
+                GoldenResiduePolicy::Clean,
+            )
+            .contains(&guest_resolver_stub_script()),
             "the golden contract must carry the resolver step"
         );
     }
@@ -10688,8 +10931,12 @@ done
 
         // And the golden contract carries the step.
         assert!(
-            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
-                .contains(&golden_systemd_parity_script()),
+            golden_contract_script(
+                DEFAULT_RUNNER_USER,
+                DEFAULT_RUNNER_UID,
+                GoldenResiduePolicy::Clean,
+            )
+            .contains(&golden_systemd_parity_script()),
             "the golden contract must carry the systemd preparation"
         );
     }
@@ -11573,7 +11820,8 @@ done
     /// would-be `root` account's home would leave the image broken.
     #[test]
     fn root_runner_user_skips_the_account_and_ownership_steps() {
-        let contract = golden_contract_script("root", DEFAULT_RUNNER_UID);
+        let contract =
+            golden_contract_script("root", DEFAULT_RUNNER_UID, GoldenResiduePolicy::Clean);
         assert!(
             !contract.contains("useradd"),
             "root must not be created as an account: {contract}"
@@ -11872,7 +12120,7 @@ fi"#,
     /// nothing the contract runs after it can change the runner's groups.
     #[test]
     fn kvm_membership_is_the_last_group_write_in_the_golden_contract() {
-        let steps = golden_contract_steps("runner", 1001);
+        let steps = golden_contract_steps("runner", 1001, GoldenResiduePolicy::Clean);
         let membership = steps
             .iter()
             .position(|step| step.contains("usermod -aG kvm runner"))
@@ -12024,11 +12272,15 @@ fi"#,
             ),
             (
                 "golden_contract_script".to_owned(),
-                golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+                golden_contract_script(
+                    DEFAULT_RUNNER_USER,
+                    DEFAULT_RUNNER_UID,
+                    GoldenResiduePolicy::Clean,
+                ),
             ),
             (
                 "golden_contract_script (root)".to_owned(),
-                golden_contract_script("root", DEFAULT_RUNNER_UID),
+                golden_contract_script("root", DEFAULT_RUNNER_UID, GoldenResiduePolicy::Clean),
             ),
             (
                 "restore_apt_lists_script".to_owned(),
@@ -14985,7 +15237,7 @@ fi"#,
         let config = test_config(false);
         let name = MachineName::new("lifecycle-test-builder").unwrap();
 
-        apply_golden_contract(provider.as_ref(), &config, &name)
+        apply_golden_contract(provider.as_ref(), &config, &name, &config.base_image)
             .await
             .expect("the contract applies to the image as-is");
 
@@ -14997,13 +15249,18 @@ fi"#,
         // The contract travels base64-encoded inside the root-or-sudo wrapper,
         // which is what makes it work whether the exec lands as root or as an
         // image-declared user with passwordless sudo.
-        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_script(
+        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_for_base(
+            &config.base_image,
             DEFAULT_RUNNER_USER,
             DEFAULT_RUNNER_UID,
         ));
         assert!(
             events.iter().any(|event| event.contains(&contract)),
             "the golden contract must run on the builder: {events:?}"
+        );
+        assert!(
+            !contract.is_empty(),
+            "the custom-base contract must still be applied"
         );
         assert!(
             events.iter().any(|event| event.contains("sudo -n sh")),
@@ -15071,7 +15328,8 @@ fi"#,
                 || event.contains(&format!("start:{}", golden.as_str()))),
             "the golden must be frozen as the fork base: {events:?}"
         );
-        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_script(
+        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_for_base(
+            &config.base_image,
             DEFAULT_RUNNER_USER,
             DEFAULT_RUNNER_UID,
         ));

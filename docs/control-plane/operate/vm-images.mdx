@@ -53,11 +53,28 @@ preloop build-golden \
   --output dist/acme-aarch64
 ```
 
-`PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` changes the keyless Sigstore identity match; `PRELOOP_BASE_IMAGE_PUBKEY` switches verification to a public key. The base-image verification checks a Cosign signature and SPDX attestation. A configured image is used as-is; add organization-wide packages to that image rather than expecting `build-golden` to install a package list.
+`PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` changes the keyless Sigstore identity match; `PRELOOP_BASE_IMAGE_PUBKEY` switches verification to a public key. The base-image verification checks a Cosign signature and SPDX attestation. A configured image is used as supplied plus the runner contract; add organization-wide packages to that image rather than expecting `build-golden` to install a package list.
+
+### Custom bases and cloud residue
+
+A custom base keeps `/etc/hosts` and `/etc/fstab` exactly as supplied. A bake does not guess which routable mapping or which not-yet-attached device is residue, because a custom image's `10.20.30.40 internal-api.example` alias or an `/etc/fstab` entry for a volume attached after boot is indistinguishable from stale cloud state by content alone.
+
+The official runner image is a captured Azure VM, so it is classified differently: its bake always drops the bake host's own `/etc/hosts` mapping and comments out `/etc/fstab` entries whose device does not exist in that guest. To apply the same cleanup to a custom base that is itself a cloud VM dump, opt in:
+
+```sh
+PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1 preloop build-golden ...
+PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1 preloop serve
+```
+
+Only `1`, `true`, `yes`, or `on` enable it; empty, `0`, and `false` leave it off. Enabling it can delete an intentional routable `/etc/hosts` mapping that does not name the guest hostname and can comment out an `/etc/fstab` device that is not present at bake time. Use it only when the base is a cloud or builder image dump, not for an organization's hand-maintained image.
+
+The residue policy is part of a custom environment's fingerprint, so changing the opt-in rebuilds the custom golden instead of adopting one baked under the other policy.
 
 ## What the bake and guest setup provide
 
-The served pool defaults to the `runner` account (UID 1001), writable `work`, `/opt/hostedtoolcache`, and the `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` environment entries. The launcher sources `/etc/environment` with exports and keeps the image's PATH (the pool's list is only the fallback when the image declares none). A bake attempts to write `/etc/preloop-bake.json`, checks for a glibc loader, refreshes apt indexes when apt exists, restores `ping`'s file capability, drops the bake host's own `/etc/hosts` mapping, comments out `/etc/fstab` entries naming disks this guest does not have, and prepares systemd (resolved upstream, resolver stub, Azure/cloud/snap unit masks). The contract does not choose language toolchains; use setup actions or a job container.
+The served pool defaults to the `runner` account (UID 1001), writable `work`, `/opt/hostedtoolcache`, and the `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` environment entries. The launcher sources `/etc/environment` with exports and keeps the image's PATH (the pool's list is only the fallback when the image declares none). A bake attempts to write `/etc/preloop-bake.json`, checks for a glibc loader, refreshes apt indexes when apt exists, restores `ping`'s file capability, and prepares systemd (resolved upstream, resolver stub, Azure/cloud/snap unit masks). On the official runner image, and on a custom base only with `PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE`, it also drops the bake host's own `/etc/hosts` mapping and comments out `/etc/fstab` entries naming disks this guest does not have.
+
+The rest of the contract still applies to a custom base: it creates or updates the runner account and ownership, refreshes apt indices when apt exists, restores `ping`'s capability, masks the Azure/cloud/snap/apt units it ships if it is a systemd image, appends `DNS=` to `resolved.conf` when that file exists and does not already set it, and points `/etc/resolv.conf` at the resolved stub. Those steps are runner machinery, not cloud-residue cleanup. The contract does not choose language toolchains; use setup actions or a job container.
 
 At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stack limit with unlimited hard limit and 65536 soft/hard file descriptors. Per-machine initialization applies:
 
@@ -67,7 +84,7 @@ At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stac
 | `fs.inotify.max_user_watches` | `655360` |
 | `fs.inotify.max_user_instances` | `1280` |
 
-The engine also verifies that the guest hostname resolves to a local address and removes stale foreign mappings. It points `/etc/resolv.conf` at systemd-resolved's `127.0.0.53` stub while keeping the guest's configured upstream nameservers, and re-applies it inside every runner launch — the SmolVM agent rewrites the file before each start and interactive run. That is what lets a container resolve a compose `/etc/hosts` alias such as `postgres.localhost`; no `daemon.json` `dns` entry is written, because a loopback address there becomes the container's own loopback. A guest that cannot publish a resolved stub keeps its resolver and logs why.
+The engine also verifies that the guest hostname resolves to a local address and removes stale mappings *of that hostname only*; unrelated aliases on the same line and other lines are kept. It points `/etc/resolv.conf` at systemd-resolved's `127.0.0.53` stub while keeping the guest's configured upstream nameservers, and re-applies it inside every runner launch — the SmolVM agent rewrites the file before each start and interactive run. That is what lets a container resolve a compose `/etc/hosts` alias such as `postgres.localhost`; no `daemon.json` `dns` entry is written, because a loopback address there becomes the container's own loopback. A guest that cannot publish a resolved stub keeps its resolver and logs why.
 
 A machine booted from a packed golden runs `/sbin/init` as its workload, so the guest has systemd as PID 1 and Docker's `systemd` cgroup driver, and keeps `/var/lib/docker` and `/var/lib/containerd` on its own storage disk so Docker uses `overlay2` rather than `fuse-overlayfs`. See `PRELOOP_SMOLVM_WORKLOAD_INIT` and `PRELOOP_SMOLVM_GUEST_VOLUMES` for the overrides; OCI-image machines, including the golden builder, are unaffected. The guest does not expose `/dev/kvm`: workloads that need nested virtualization must run on a runner outside the microVM pool.
 

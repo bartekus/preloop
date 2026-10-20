@@ -181,7 +181,10 @@ impl EnvironmentSpec {
             "golden": if is_official_golden(&base) {
                 crate::official_golden_source()
             } else {
-                crate::golden_contract_script(user, uid)
+                // Includes the provenance-aware residue policy: a custom base
+                // preserves `/etc/hosts` and `/etc/fstab`, and toggling the
+                // opt-in changes this text and therefore the fingerprint.
+                crate::golden_contract_for_base(&base, user, uid)
             },
             // Rosetta x86_64 translation exists only on Apple Silicon hosts.
             // The golden prep installs the amd64 loader + libc so dynamically
@@ -321,9 +324,10 @@ mod tests {
         let bumped: Vec<String> = pins.iter().map(|pin| format!("{pin}-bumped")).collect();
         let normalized = serde_json::json!({
             "base": "ghcr.io/acme/runner:latest",
-            "golden": crate::golden_contract_script(
+            "golden": crate::golden_contract_for_base(
+                "ghcr.io/acme/runner:latest",
                 crate::DEFAULT_RUNNER_USER,
-                crate::DEFAULT_RUNNER_UID
+                crate::DEFAULT_RUNNER_UID,
             ),
             "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
             "node_externals": bumped,
@@ -387,9 +391,10 @@ mod tests {
         );
         assert_ne!(
             official.fingerprint,
-            expected(&crate::golden_contract_script(
+            expected(&crate::golden_contract_for_base(
+                OFFICIAL_GOLDEN,
                 crate::DEFAULT_RUNNER_USER,
-                crate::DEFAULT_RUNNER_UID
+                crate::DEFAULT_RUNNER_UID,
             )),
             "the official golden is published, not baked here"
         );

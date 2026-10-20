@@ -47,14 +47,19 @@ Releases before v0.27.0 predate the changelog.
   `/opt/pipx_bin`, `~/.local/bin` and `/usr/local/.ghcup/bin` unreachable while
   those tools were installed. The launcher now exports the sourced entries and
   keeps the image's PATH, using the fallback only when the image declares none.
-- **Guest parity residue from the runner image is cleaned at bake time.**
-  `ping` gets `cap_net_raw+ep` back (an OCI layer carries no file
-  capabilities), the bake host's own `/etc/hosts` mapping is dropped, and
-  `/etc/fstab` entries naming Azure disks this guest does not have are
-  commented out with their original text, so `systemd-remount-fs.service` no
-  longer fails on every boot. Systemd guests also get `systemd-resolved`'s
-  upstream pinned in `resolved.conf` (an image's own `DNS=` is never touched)
-  and the Azure/cloud-init/snap/apt units the hosted image never runs masked.
+- **Guest parity residue from the runner image is cleaned at bake time, and
+  custom bases are no longer mistaken for it.** `ping` gets `cap_net_raw+ep`
+  back (an OCI layer carries no file capabilities), and the official golden's
+  bake host `/etc/hosts` mapping is dropped and `/etc/fstab` entries naming
+  Azure disks this guest does not have are commented out with their original
+  text, so `systemd-remount-fs.service` no longer fails on every boot. A
+  user-provided base now preserves `/etc/hosts` and `/etc/fstab` unchanged by
+  default: a routable custom alias or an `/etc/fstab` device attached later is
+  not cloud residue. `PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1` opts a custom base
+  into the official cleanup when that base is itself a cloud image dump.
+  Systemd guests also get `systemd-resolved`'s upstream pinned in
+  `resolved.conf` (an image's own `DNS=` is never touched) and the
+  Azure/cloud-init/snap/apt units the hosted image never runs masked.
 - **The job workspace uses the hosted `work` folder.** A job's checkout now
   lands at `<runner-root>/work/<repo>/<repo>` and `RUNNER_WORKSPACE` is
   exported; `_work` is the official runner's self-hosted default, and workflows
