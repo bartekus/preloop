@@ -282,10 +282,13 @@ impl From<GuestVolume> for String {
 ///
 /// These are the two paths docker and containerd must own to run their
 /// overlay-backed drivers. The default is opt-in per [`MachineRole`]: only
-/// [`MachineRole::OfficialPack`] uses it, because the published runner pack's
-/// two directories are known empty placeholders. A custom pack may carry
-/// preloaded images in them and a [`MachineRole::Builder`]'s writes there are
-/// not part of the pack at all, so neither gets the default.
+/// [`MachineRole::OfficialPack`] uses it. The published official golden is
+/// built for this managed layout, with those paths created on the machine's
+/// own storage disk. A custom pack can carry state in them and a
+/// [`MachineRole::Builder`]'s writes there are not part of the pack at all, so
+/// neither gets the default. A guest-local volume starts empty: this default
+/// must never be used where existing state has to stay visible, and it does
+/// not migrate anything.
 pub const DEFAULT_GUEST_VOLUMES: [&str; 2] = ["/var/lib/docker", "/var/lib/containerd"];
 
 /// Host override for [`DEFAULT_GUEST_VOLUMES`]: a comma-separated list of
@@ -299,15 +302,20 @@ pub const SMOLVM_GUEST_VOLUMES_ENV: &str = "PRELOOP_SMOLVM_GUEST_VOLUMES";
 /// top of whatever entrypoint/cmd the pack itself carries. Ignored by the
 /// golden builder, whose pack's own entrypoint is what it exports.
 ///
-/// Unset: [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. Empty: `None` — the pack's own
-/// entrypoint/cmd runs, which is the behaviour before systemd became the
-/// guest's PID 1 and the escape hatch for a golden whose image has no usable
-/// init. Any other value is the command, split on whitespace.
+/// Unset: the role default — the managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`] for
+/// an [`MachineRole::OfficialPack`], or the pack's own entrypoint/cmd for a
+/// [`MachineRole::CustomPack`]. Empty: the pack's own entrypoint/cmd runs,
+/// which is also the escape hatch for a golden whose image has no usable init.
+/// Any other value is the command, split on whitespace.
 pub const SMOLVM_WORKLOAD_INIT_ENV: &str = "PRELOOP_SMOLVM_WORKLOAD_INIT";
 
-/// Workload that runs a pack-based machine's systemd, giving the guest the
+/// Workload that runs a runtime pack machine's systemd, giving the guest the
 /// hosted runner's init: `systemctl`, `journald`, `systemd-resolved` and
 /// docker's `systemd` cgroup driver all depend on PID 1 being systemd.
+///
+/// This is the default for [`MachineRole::OfficialPack`] only. A
+/// [`MachineRole::CustomPack`] keeps its own entrypoint unless the operator
+/// names a command with [`SMOLVM_WORKLOAD_INIT_ENV`].
 ///
 /// Applied as the `-- <COMMAND>` block of `machine create`, which overrides
 /// the pack's recorded entrypoint at launch. Measured at smolvm 1.30.1 on
@@ -410,16 +418,19 @@ pub enum MachineRole {
     /// override apply; an explicit [`MachineSpec::guest_volumes`] or
     /// [`MachineSpec::workload_init`] is still honoured.
     Builder,
-    /// A final runtime machine created from the official runner pack, whose
-    /// `/var/lib/docker` and `/var/lib/containerd` are known to be empty
-    /// placeholders. This is the one role that opts into
-    /// [`DEFAULT_GUEST_VOLUMES`] and [`DEFAULT_SMOLVM_WORKLOAD_INIT`].
+    /// A final runtime machine created from the official runner pack. The
+    /// published golden is built for Preloop's managed layout, so this is the
+    /// one role that opts into [`DEFAULT_GUEST_VOLUMES`] and
+    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. The guest-local directories start
+    /// empty; do not use this role for a pack whose state there must survive.
     OfficialPack,
     /// A final runtime machine created from an operator-supplied pack (or a
-    /// pack baked from a custom image). Its container state was packed for a
-    /// reason: no default guest-local volume may be mounted over it. The
-    /// operator can still opt in explicitly with
-    /// [`MachineSpec::guest_volumes`] or [`SMOLVM_GUEST_VOLUMES_ENV`].
+    /// pack baked from a custom image). Its container state and init were
+    /// packed for a reason: no default guest-local volume may be mounted over
+    /// them, and the pack's own entrypoint/cmd runs unless the operator names
+    /// a workload. Opt in explicitly with [`MachineSpec::guest_volumes`],
+    /// [`MachineSpec::workload_init`], [`SMOLVM_GUEST_VOLUMES_ENV`], or
+    /// [`SMOLVM_WORKLOAD_INIT_ENV`].
     CustomPack,
 }
 
@@ -468,15 +479,16 @@ pub struct MachineSpec {
     /// volumes, and `Some(list)` asks for exactly that list.
     #[serde(default)]
     pub guest_volumes: Option<Vec<GuestVolume>>,
-    /// Workload a *pack-based* machine runs, overriding the pack's own
+    /// Workload a *runtime pack* machine runs, overriding the pack's own
     /// entrypoint/cmd.
     ///
-    /// `None` means "whatever the provider's default is" — for smolvm, the
-    /// [`SMOLVM_WORKLOAD_INIT_ENV`] switch and then
-    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. `Some([])` explicitly leaves the
-    /// pack's own entrypoint/cmd in place. Ignored for image machines, whose
-    /// workload handling (the keep-alive fallback for an image with no usable
-    /// startup command) is unchanged.
+    /// `None` means "whatever the provider's default is": for smolvm, the
+    /// [`SMOLVM_WORKLOAD_INIT_ENV`] switch and then the role default — the
+    /// managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`] for an official pack, the
+    /// pack's own entrypoint for a custom pack. `Some([])` explicitly leaves
+    /// the pack's own entrypoint/cmd in place. Ignored for image machines,
+    /// whose workload handling (the keep-alive fallback for an image with no
+    /// usable startup command) is unchanged.
     #[serde(default)]
     pub workload_init: Option<Vec<String>>,
 }
@@ -549,30 +561,38 @@ impl MachineSpec {
     ///
     /// `explicit` is [`MachineSpec::workload_init`]: `Some([])` explicitly
     /// leaves the pack's own entrypoint/cmd in place, and a non-empty command
-    /// wins over the host switch. With `None`, the role decides:
-    /// [`MachineRole::OfficialPack`] and [`MachineRole::CustomPack`] take
-    /// `configured` (the [`SMOLVM_WORKLOAD_INIT_ENV`] value, where an empty
-    /// value disables) or [`DEFAULT_SMOLVM_WORKLOAD_INIT`]; a builder only
-    /// gets what was asked for explicitly, and an image machine gets nothing
-    /// (its keep-alive handling is separate).
+    /// wins. With `None`, the role decides:
+    ///
+    /// * [`MachineRole::OfficialPack`] uses `configured` (the
+    ///   [`SMOLVM_WORKLOAD_INIT_ENV`] value, where an empty value disables) or
+    ///   the managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`];
+    /// * [`MachineRole::CustomPack`] keeps the pack's own entrypoint/cmd
+    ///   unless `configured` names a command: a custom pack's init is part of
+    ///   the source the operator chose, not something Preloop replaces;
+    /// * [`MachineRole::Builder`] and [`MachineRole::Image`] only get what was
+    ///   asked for explicitly (the builder is never given an ambient default).
     pub fn resolve_workload_init(
         explicit: Option<&[String]>,
         configured: Option<&str>,
         role: MachineRole,
     ) -> Option<Vec<String>> {
+        let parse = |value: &str| {
+            let command: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+            (!command.is_empty()).then_some(command)
+        };
+        // An image machine's workload handling is the separate keep-alive
+        // path; this override never applies to it.
+        if role == MachineRole::Image {
+            return None;
+        }
+        if let Some(command) = explicit {
+            return (!command.is_empty()).then(|| command.to_vec());
+        }
         match role {
             MachineRole::Image => None,
-            MachineRole::Builder => {
-                explicit.and_then(|command| (!command.is_empty()).then(|| command.to_vec()))
-            }
-            MachineRole::OfficialPack | MachineRole::CustomPack => {
-                if let Some(command) = explicit {
-                    return (!command.is_empty()).then(|| command.to_vec());
-                }
-                let value = configured.unwrap_or(DEFAULT_SMOLVM_WORKLOAD_INIT);
-                let command: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
-                (!command.is_empty()).then_some(command)
-            }
+            MachineRole::Builder => None,
+            MachineRole::OfficialPack => parse(configured.unwrap_or(DEFAULT_SMOLVM_WORKLOAD_INIT)),
+            MachineRole::CustomPack => configured.and_then(parse),
         }
     }
 }
@@ -5296,87 +5316,71 @@ mod tests {
         );
     }
 
-    /// Runtime packs run systemd as PID 1 by default, the override can name
-    /// another command, an empty override restores the pack's own entrypoint,
-    /// `Some([])` is an explicit disable, and builders/image machines keep
-    /// their own workload unless a builder asks for one.
+    /// Only the official pack gets the managed systemd workload by default. A
+    /// custom pack keeps its own entrypoint unless the host switch or the spec
+    /// names one, and a builder never takes an ambient default.
     #[test]
     fn workload_init_follows_the_machine_role_and_honours_explicit_disable() {
-        let pack = |configured: Option<&str>, role| {
-            MachineSpec::resolve_workload_init(None, configured, role)
-                .expect("runtime packs have a workload by default")
+        let resolve = |explicit: Option<&[String]>, configured: Option<&str>, role| {
+            MachineSpec::resolve_workload_init(explicit, configured, role)
         };
         assert_eq!(
-            pack(None, MachineRole::OfficialPack),
-            vec!["/sbin/init".to_owned()]
+            resolve(None, None, MachineRole::OfficialPack),
+            Some(vec!["/sbin/init".to_owned()])
         );
+        // A custom pack's init is part of the source the operator chose.
+        assert!(resolve(None, None, MachineRole::CustomPack).is_none());
         assert_eq!(
-            pack(None, MachineRole::CustomPack),
-            vec!["/sbin/init".to_owned()]
-        );
-        assert_eq!(
-            pack(
+            resolve(
+                None,
                 Some("/lib/systemd/systemd --system"),
                 MachineRole::OfficialPack
             ),
-            vec!["/lib/systemd/systemd".to_owned(), "--system".to_owned()]
+            Some(vec![
+                "/lib/systemd/systemd".to_owned(),
+                "--system".to_owned()
+            ])
         );
         assert_eq!(
-            pack(Some("  /sbin/init  "), MachineRole::OfficialPack),
-            vec!["/sbin/init".to_owned()],
+            resolve(
+                None,
+                Some("/lib/systemd/systemd --system"),
+                MachineRole::CustomPack
+            ),
+            Some(vec![
+                "/lib/systemd/systemd".to_owned(),
+                "--system".to_owned()
+            ]),
+            "the host switch is an explicit opt-in for a custom pack"
+        );
+        assert_eq!(
+            resolve(None, Some("  /sbin/init  "), MachineRole::OfficialPack),
+            Some(vec!["/sbin/init".to_owned()]),
             "surrounding whitespace is trimmed, not passed as an argument"
         );
-        assert!(
-            MachineSpec::resolve_workload_init(None, Some(""), MachineRole::OfficialPack).is_none()
-        );
-        assert!(
-            MachineSpec::resolve_workload_init(None, Some("   "), MachineRole::CustomPack)
-                .is_none()
-        );
+        assert!(resolve(None, Some(""), MachineRole::OfficialPack).is_none());
+        assert!(resolve(None, Some("   "), MachineRole::CustomPack).is_none());
         // The explicit empty list disables even when the host switch is set.
-        assert!(
-            MachineSpec::resolve_workload_init(
-                Some(&[]),
-                Some("/sbin/init"),
-                MachineRole::CustomPack
-            )
-            .is_none()
-        );
+        assert!(resolve(Some(&[]), Some("/sbin/init"), MachineRole::CustomPack).is_none());
         // An explicit per-machine command wins over the host switch.
         let explicit = vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()];
-        assert_eq!(
-            MachineSpec::resolve_workload_init(
-                Some(&explicit),
-                Some(""),
-                MachineRole::OfficialPack
-            ),
-            Some(explicit.clone())
-        );
+        for role in [MachineRole::OfficialPack, MachineRole::CustomPack] {
+            assert_eq!(
+                resolve(Some(&explicit), Some(""), role),
+                Some(explicit.clone())
+            );
+        }
         // A builder runs only what was asked for: its default is the pack's
         // own entrypoint, not a workload that writes over the state it exports.
-        assert!(MachineSpec::resolve_workload_init(None, None, MachineRole::Builder).is_none());
-        assert!(
-            MachineSpec::resolve_workload_init(None, Some("/sbin/init"), MachineRole::Builder)
-                .is_none()
-        );
+        assert!(resolve(None, None, MachineRole::Builder).is_none());
+        assert!(resolve(None, Some("/sbin/init"), MachineRole::Builder).is_none());
         assert_eq!(
-            MachineSpec::resolve_workload_init(
-                Some(&explicit),
-                Some("/sbin/init"),
-                MachineRole::Builder
-            ),
+            resolve(Some(&explicit), Some("/sbin/init"), MachineRole::Builder),
             Some(explicit)
         );
         // Image machines never get one: their keep-alive handling is separate.
-        assert!(MachineSpec::resolve_workload_init(None, None, MachineRole::Image).is_none());
-        assert!(
-            MachineSpec::resolve_workload_init(
-                Some(&["/sbin/init".to_owned()]),
-                None,
-                MachineRole::Image
-            )
-            .is_none()
-        );
+        assert!(resolve(None, None, MachineRole::Image).is_none());
+        assert!(resolve(Some(&["/sbin/init".to_owned()]), None, MachineRole::Image).is_none());
     }
 
     /// `--dns` only reaches a guest on the TSI backend, where a systemd guest

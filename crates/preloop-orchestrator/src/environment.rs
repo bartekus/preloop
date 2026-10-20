@@ -283,9 +283,9 @@ fn launch_identity(
     configured_workload_init: Option<&str>,
 ) -> Value {
     // Every runtime golden on a file-pack backend is a pack. The official
-    // layout is the only one whose container-state directories are known to
-    // be disposable; a custom base keeps its packed state unless the operator
-    // opts in through the override.
+    // golden is built for the managed layout; a custom base keeps its packed
+    // container state and its own entrypoint unless the operator opts in
+    // through an override.
     let role = if is_official_golden(base) {
         MachineRole::OfficialPack
     } else {
@@ -418,7 +418,7 @@ mod tests {
             "node_externals": bumped,
             "launch": {
                 "guest_volumes": Vec::<String>::new(),
-                "workload_init": ["/sbin/init"],
+                "workload_init": null,
             },
         });
         let bumped_fingerprint = hex_digest(&serde_json::to_vec(&normalized).unwrap());
@@ -466,14 +466,15 @@ mod tests {
             )
         };
         let default = launched(None, None);
-        // A custom base already defaults to no guest volumes, so the empty
-        // override is the same effective launch, not a new identity.
+        // A custom base already defaults to no guest volumes and its own
+        // entrypoint, so the empty overrides are the same effective launch,
+        // not a new identity.
         assert_eq!(default.fingerprint, launched(Some(""), None).fingerprint);
+        assert_eq!(default.fingerprint, launched(None, Some("")).fingerprint);
         for (name, other) in [
             ("a guest-volume list", launched(Some("/srv/state"), None)),
-            ("disabled workload", launched(None, Some(""))),
             (
-                "different workload",
+                "a named workload",
                 launched(None, Some("/lib/systemd/systemd")),
             ),
         ] {

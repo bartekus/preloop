@@ -761,9 +761,9 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
 
     /// A custom pack is the operator's data. Its `/var/lib/docker` may hold
     /// the preloaded images the pack exists for, so no default guest-local
-    /// volume may be mounted over it; only an explicit opt-in (the spec or
-    /// the host override) adds one. The systemd workload is not destructive
-    /// to that state and still applies.
+    /// volume may be mounted over it, and its own entrypoint/cmd is what runs
+    /// unless the operator names a workload. Only explicit opt-ins (the spec
+    /// or the host override) add either.
     #[tokio::test]
     async fn custom_pack_machines_keep_their_packed_container_state() {
         let (directory, executable) = fake_smolvm();
@@ -786,11 +786,10 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
             !args.iter().any(|arg| arg == "--volume"),
             "a custom pack must not get default guest volumes: {args:?}"
         );
-        let separator = args
-            .iter()
-            .position(|arg| arg == "--")
-            .expect("custom packs still run the systemd workload");
-        assert_eq!(&args[separator + 1..], ["/sbin/init"], "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg == "--"),
+            "a custom pack keeps its own entrypoint/cmd: {args:?}"
+        );
 
         // An explicit list is the opt-in for a custom pack that wants the
         // guest-local layout anyway.
@@ -893,6 +892,34 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
                 .windows(2)
                 .any(|pair| pair == ["--volume", "/var/lib/docker"]),
             "an explicit list replaces the built-in default: {args:?}"
+        );
+
+        // A custom pack likewise keeps its own entrypoint unless the spec
+        // names a workload, and then exactly that command runs.
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("acme.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("acme-golden").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::CustomPack;
+        spec.workload_init = Some(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "sleep 1".to_owned(),
+        ]);
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+        let args = captured_args(&executable);
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("the explicit workload must be passed");
+        assert_eq!(
+            &args[separator + 1..],
+            ["/bin/sh", "-c", "sleep 1"],
+            "{args:?}"
         );
     }
 

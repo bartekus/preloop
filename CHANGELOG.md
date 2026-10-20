@@ -28,17 +28,16 @@ Releases before v0.27.0 predate the changelog.
   stub on a freshly resumed guest; no `daemon.json` `dns` override is written,
   since a loopback address there becomes the container's own loopback and every
   lookup fails. A guest with no resolved stub keeps its resolver and logs why.
-- **Pack-based guests boot systemd as PID 1 and keep container state on ext4.**
-  `machine create --from <pack>` now runs `/sbin/init` as the workload, which
-  gives the guest `systemctl`, `journald`, `systemd-resolved` and Docker's
-  `systemd` cgroup driver, and mounts `/var/lib/docker` and
+- **Official-pack guests get managed systemd and ext4 container state.**
+  A runtime machine from the official pack runs `/sbin/init` as the workload,
+  which gives the guest `systemctl`, `journald`, `systemd-resolved` and
+  Docker's `systemd` cgroup driver, and mounts `/var/lib/docker` and
   `/var/lib/containerd` on the machine's own storage disk so Docker picks
-  `overlay2` instead of degrading to `fuse-overlayfs`. The guest-local mounts
-  are a default only for the official runner pack, whose two directories are
-  known empty placeholders: a custom pack keeps its baked container state
-  visible unless `PRELOOP_SMOLVM_GUEST_VOLUMES` (or an explicit machine list)
-  opts in. The systemd workload applies to runtime packs and can be overridden
-  by `PRELOOP_SMOLVM_WORKLOAD_INIT`; an empty value disables either default.
+  `overlay2` instead of degrading to `fuse-overlayfs`. Those guest-local
+  directories start empty; nothing migrates existing state into them. A custom
+  pack keeps its baked container state and its own entrypoint/cmd unless
+  `PRELOOP_SMOLVM_WORKLOAD_INIT`, `PRELOOP_SMOLVM_GUEST_VOLUMES`, or an
+  explicit machine list opts in (an empty value disables the managed default).
   The golden builder is never given guest-local volumes or a replaced
   workload: its container state must stay in the overlay `pack create`
   captures. The resolved launch settings are part of the golden identity, so
