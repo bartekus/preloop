@@ -14,6 +14,32 @@ Releases before v0.27.0 predate the changelog.
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
   rejected the retried job's otherwise valid runtime token with HTTP 403.
+- **`github.token` and `GITHUB_TOKEN` populate on github.com registrations**
+  (#626): `preloop-runner configure` now records which control plane the
+  runner registered against (`.runner` `controlPlane`, derived from the
+  `--url` host), and a `.runner` written before that field existed is
+  classified from the `gitHubUrl` it already carries, so an upgraded runner
+  recovers the token surface without re-registering. On a github.com
+  registration, `github.token` and the `GITHUB_TOKEN` env var resolve from
+  the job's `system.github.token` variable (or its `github_token` alias) —
+  mirroring the official runner, which builds `githubContext["token"]` from
+  that variable in `ExecutionContext.InitializeJob` — so `gh`,
+  `github-script`, and checkout's `${{ github.token }}` default authenticate
+  instead of seeing an empty value. Engine registrations keep the fence:
+  there the claim owns that slot, holding the GitHub credential it minted
+  (which the runner reads from the `github.token` context) or nothing at all,
+  and it is never exported to a step. The job-scoped runtime JWT is delivered
+  through `SystemVssConnection` and never enters that variable or the step
+  environment. On both planes a workflow's own `env: GITHUB_TOKEN` no longer
+  replaces `${{ github.token }}`, and the
+  `base64("x-access-token:<token>")` header actions/checkout persists is
+  masked for either alias. `secrets.GITHUB_TOKEN` resolution is unchanged in
+  both modes. Missing, unreadable, or malformed `.runner` metadata now fails
+  the job before any workflow, container, or service work instead of silently
+  selecting the engine plane; an unknown `controlPlane` value or an
+  unparseable `gitHubUrl` is an error, and job execution reuses the
+  registration state validated at worker startup rather than re-reading
+  `.runner` per job.
 
 ## [0.35.0] - 2026-10-19
 

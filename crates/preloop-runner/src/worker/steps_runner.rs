@@ -253,12 +253,11 @@ pub async fn run_steps(
 
     // Build "Set up job" log content matching official runner
     {
-        let runner_name = job.env.get("RUNNER_NAME").cloned().unwrap_or_else(|| {
-            crate::settings::RunnerConfig::load(std::path::Path::new("."))
-                .ok()
-                .map(|c| c.settings.agent_name)
-                .unwrap_or_else(|| "preloop-runner".to_string())
-        });
+        let runner_name = job
+            .env
+            .get("RUNNER_NAME")
+            .cloned()
+            .unwrap_or_else(|| "preloop-runner".to_string());
         let machine_name = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
