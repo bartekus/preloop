@@ -497,6 +497,22 @@ fn build_step_list_parses_action_reference() {
 }
 
 #[test]
+fn container_registry_reference_selects_docker_action() {
+    let steps = [serde_json::json!({
+        "id": "container-step",
+        "reference": {
+            "type": "containerRegistry",
+            "image": "alpine:3.20"
+        }
+    })];
+    let result = build_step_list(&steps, &serde_json::json!({}));
+    assert!(
+        matches!(&result[0].step_type, StepType::Action { uses, .. } if uses == "docker://alpine:3.20"),
+        "containerRegistry must dispatch as a Docker action, not an empty repository reference"
+    );
+}
+
+#[test]
 fn build_step_list_parses_github_template_token_maps() {
     let steps = vec![serde_json::json!({
         "id": "step1",
