@@ -393,6 +393,7 @@ Releases before v0.27.0 predate the changelog.
   gets a 10 s deadline, and after one unanswered call the store is treated as
   unavailable for the rest of the process. Platform revocation checks no longer
   apply; a CA added to the OS store is picked up on restart.
+
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
   libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the
