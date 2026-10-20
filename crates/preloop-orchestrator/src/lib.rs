@@ -152,6 +152,22 @@ fn runner_volumes(
     }
     Ok(volumes)
 }
+/// Volumes that may be attached to a fork base. AgentENV cannot snapshot a
+/// sandbox while a read-only volume is mounted, so those mounts are attached
+/// to each clone instead.
+fn fork_base_volumes<P: VmProvider>(provider: &P, volumes: Vec<VolumeMount>) -> Vec<VolumeMount> {
+    if provider
+        .capabilities()
+        .fork_bases_may_mount_read_only_volumes
+    {
+        volumes
+    } else {
+        volumes
+            .into_iter()
+            .filter(|volume| !volume.read_only)
+            .collect()
+    }
+}
 
 /// Populate the host-side externals directory, validating the manifest and
 /// binary version for each runtime instead of merely checking for a file.
@@ -285,7 +301,12 @@ fn externals_complete(externals_root: &Path) -> bool {
 /// can run at all — unlike the release directory, which is root-owned when the
 /// engine runs unprivileged.
 fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
-    config.externals_dir.join("runner-bundle")
+    mirror_bundle_dir_in(&config.externals_dir)
+}
+
+/// [`mirror_bundle_dir`] from the externals directory alone.
+fn mirror_bundle_dir_in(externals_dir: &Path) -> PathBuf {
+    externals_dir.join("runner-bundle")
 }
 
 /// The bundle directory actually mounted into guests at `/opt/preloop/bin`.
@@ -298,23 +319,50 @@ fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
 /// `<root>/externals` symlink dangled, so every JS action step failed with
 /// `bundled nodeXX is missing` long after the pool reported itself ready.
 fn effective_runner_bundle(config: &RunnerPoolConfig) -> Result<PathBuf, OrchestratorError> {
-    if externals_complete(&config.runner_bundle.join("externals")) {
-        return Ok(config.runner_bundle.clone());
+    effective_runner_bundle_path(
+        &config.runner_bundle,
+        &config.externals_dir,
+        &config.runner_binary_name,
+    )
+}
+
+/// The bundle [`effective_runner_bundle`] would mount, without a pool config.
+///
+/// Split out so `preloop runner-volumes prune` can name the same tree the engine
+/// mounts — including the engine-owned mirror — and keep its volume.
+pub fn effective_runner_bundle_path(
+    bundle: &Path,
+    externals_dir: &Path,
+    runner_binary_name: &str,
+) -> Result<PathBuf, OrchestratorError> {
+    if externals_complete(&bundle.join("externals")) {
+        return Ok(bundle.to_path_buf());
     }
-    let mirror = mirror_bundle_dir(config);
-    if mirror.join(&config.runner_binary_name).is_file()
-        && externals_complete(&mirror.join("externals"))
-    {
+    let mirror = mirror_bundle_dir_in(externals_dir);
+    if mirror.join(runner_binary_name).is_file() && externals_complete(&mirror.join("externals")) {
         return Ok(mirror);
     }
     Err(OrchestratorError::Config(format!(
         "no runner bundle with complete node externals: release bundle {} and \
          engine-owned mirror {} are both incomplete; check network egress to \
          nodejs.org and the host externals at {}",
-        config.runner_bundle.display(),
+        bundle.display(),
         mirror.display(),
-        config.externals_dir.join("externals").display(),
+        externals_dir.join("externals").display(),
     )))
+}
+
+/// The version pins stamped into every AgentENV runner volume.
+///
+/// `versions.toml` is compiled into this crate (and the CLI) by `build.rs`, not
+/// into `preloop-vm`, which archives the tree — so the provider is handed the
+/// manifest by whoever constructs it.
+pub fn runner_bundle_manifest() -> preloop_vm::agentenv::volume::BundleManifest {
+    preloop_vm::agentenv::volume::BundleManifest::new(
+        RUNNER_VERSION,
+        NODE20_EXTERNALS_VERSION,
+        NODE24_EXTERNALS_VERSION,
+    )
 }
 
 /// Publish an engine-owned bundle carrying the runner binary and the validated
@@ -1373,9 +1421,10 @@ async fn download_prebaked_golden_with_space(
         }
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
-        .build()
+    let client = match preloop_runner_server::shared_http::with_tls_roots(
+        reqwest::Client::builder().timeout(GOLDEN_DOWNLOAD_TIMEOUT),
+    )
+    .build()
     {
         Ok(client) => client,
         Err(error) => {
@@ -1720,9 +1769,10 @@ async fn download_oci_golden(
         warn!(reference, "invalid OCI golden reference");
         return Ok(false);
     };
-    let client = match reqwest::Client::builder()
-        .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
-        .build()
+    let client = match preloop_runner_server::shared_http::with_tls_roots(
+        reqwest::Client::builder().timeout(GOLDEN_DOWNLOAD_TIMEOUT),
+    )
+    .build()
     {
         Ok(client) => client,
         Err(error) => {
@@ -2447,17 +2497,69 @@ fn guest_hostname_script_at(hosts: &str) -> String {
 /// `sudo: unable to resolve host` into the apply's stderr before the name is
 /// fixed.
 pub fn guest_hosted_runtime_init_script() -> String {
-    hosted_runtime_init_script_at("/etc/hosts", "/proc/sys")
+    hosted_runtime_init_script_at("/etc/hosts", "/proc/sys", "/etc/ca-certificates.conf")
 }
 
-/// `hosts` and `sysctl_root` are the scratch paths the shell tests substitute
-/// for `/etc/hosts` and `/proc/sys`; production passes those.
-fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
+/// `hosts`, `sysctl_root` and `ca_conf` are the scratch paths the shell tests
+/// substitute; production passes the real ones.
+fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str, ca_conf: &str) -> String {
     format!(
-        "set -e; ( {} ); ( {} )",
+        "set -e; ( {} ); ( {} ); ( {} )",
         guest_hostname_script_at(hosts),
-        guest_sysctl_script_at(sysctl_root)
+        guest_sysctl_script_at(sysctl_root),
+        guest_ca_distrust_script(ca_conf)
     )
+}
+
+/// The third half: published goldens predate the 2026-10-20 eMudhra
+/// intermediate CA compromise and still anchor the revoked chain. Clients
+/// that ignore revocation data keep trusting it, so drop the two roots from
+/// the guest bundle before the runner registers. Idempotent: a bundle whose
+/// package already removed them is left untouched.
+fn guest_ca_distrust_script(ca_conf: &str) -> String {
+    format!(
+        r#"conf={ca_conf}
+if [ -f "$conf" ] && grep -qE '^mozilla/(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.crt$' "$conf"; then
+  sed -i.bak \
+    -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
+    -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' \
+    "$conf"
+  rm -f "$conf.bak"
+  if [ "$(id -u)" -eq 0 ]; then
+    update-ca-certificates
+  else
+    sudo -n update-ca-certificates
+  fi
+  echo "preloop: disabled revoked eMudhra CA roots" >&2
+fi"#
+    )
+}
+
+/// Apply only the Ubuntu security pocket before a golden is packed.
+///
+/// The base is an upstream snapshot that can be days old; this closes the gap
+/// to the bake date without a blanket `apt-get upgrade` (which would also move
+/// packages the image deliberately pins). `unattended-upgrade` handles the
+/// dpkg/grub/conffile mechanics and exits non-zero when an update fails, so a
+/// bake that cannot reach the security state fails instead of shipping.
+pub fn golden_security_update_script() -> &'static str {
+    r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v unattended-upgrade >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends unattended-upgrades
+fi
+cat > /etc/apt/apt.conf.d/99preloop-security-only <<'EOF'
+#clear Unattended-Upgrade::Allowed-Origins;
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Package-Blacklist {};
+EOF
+apt-get update -qq
+unattended-upgrade --verbose
+apt-get clean
+"#
 }
 
 /// The guest bootstrap script, one shell round trip.
@@ -3986,7 +4088,14 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden, true)?,
+        volumes: fork_base_volumes(
+            provider.as_ref(),
+            runner_volumes(
+                config,
+                golden,
+                !provider.capabilities().runner_bundle_carries_externals,
+            )?,
+        ),
         sockets: config
             .control_socket
             .iter()
@@ -4004,6 +4113,9 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
     await_guest_ready(provider.as_ref(), golden).await?;
     prepare_rosetta_multiarch(provider.as_ref(), golden, false).await?;
     apply_golden_contract(provider.as_ref(), config, golden).await?;
+    if provider.capabilities().runner_bundle_carries_externals {
+        link_runner_externals(provider.as_ref(), golden).await?;
+    }
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
             machine = golden.as_str(),
@@ -4062,6 +4174,41 @@ async fn apply_golden_contract<P: VmProvider>(
             warnings = %warnings,
             "golden contract completed with warnings"
         );
+    }
+    Ok(())
+}
+/// AgentENV carries the externals inside the bundle volume. Point the runner
+/// root's conventional externals path at that tree instead of mounting a
+/// second volume under `/home/runner`, which envd cannot create reliably.
+async fn link_runner_externals<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+) -> Result<(), OrchestratorError> {
+    let command = format!(
+        "mkdir -p {root} && rm -rf {root}/externals && \
+         ln -s /opt/preloop/bin/externals {root}/externals",
+        root = RUNNER_ROOT
+    );
+    let output = provider
+        .exec(
+            name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                run_as_root_or_sudo_strict(&command),
+            ],
+        )
+        .await?;
+    if output.exit_code != 0 {
+        return Err(OrchestratorError::Config(format!(
+            "linking runner externals failed on {} (exit {}): {}",
+            name.as_str(),
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown error")
+        )));
     }
     Ok(())
 }
@@ -4165,6 +4312,63 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         let _ = provider.delete(&name).await;
         return Err(error);
     }
+    // Apply the security pocket before packing. The rootfs is an upstream
+    // snapshot; this is the only place a golden picks up Ubuntu security
+    // fixes published after that snapshot, without waiting for the next
+    // upstream image rebuild and without a blanket `apt-get upgrade`.
+    let output = provider
+        .exec(
+            &name,
+            &[
+                "sudo".to_owned(),
+                "-n".to_owned(),
+                "sh".to_owned(),
+                "-c".to_owned(),
+                golden_security_update_script().to_owned(),
+            ],
+        )
+        .await?;
+    if output.exit_code != 0 {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "security update during golden bake failed (exit {}): {}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown")
+        )));
+    }
+    let manifest = provider
+        .exec(
+            &name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\n' | LC_ALL=C sort"
+                    .to_owned(),
+            ],
+        )
+        .await?;
+    if manifest.exit_code != 0 {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "reading the baked package manifest failed (exit {}): {}",
+            manifest.exit_code,
+            String::from_utf8_lossy(&manifest.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown")
+        )));
+    }
+    let manifest_path = PathBuf::from(format!("{}.apt-manifest.txt", payload.display()));
+    if let Err(error) = std::fs::write(&manifest_path, &manifest.stdout) {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "writing baked package manifest {} failed: {error}",
+            manifest_path.display()
+        )));
+    }
     // Bake the externals *pointer*, not the externals: the packed rootfs
     // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
     // the runner-bundle mount instead of being baked into the image or
@@ -4253,6 +4457,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // "no runner can ever match these labels".
             ps.set_labels(self.config.labels.clone());
         }
+        // Maintenance the backend owns starts with the pool rather than with the
+        // first runner: a pool that only resumes machines it already has never
+        // reaches the paths that arm it lazily, and what it collects (AgentENV's
+        // superseded runner volumes) would then never be collected.
+        self.provider.start_maintenance();
         // Any error exit below (host externals, artifact prep, stale-machine
         // cleanup, golden bake) must clear the flag again; the guard is
         // disarmed once the warm completes.
@@ -5052,9 +5261,10 @@ async fn notify_runner_gone(config: &RunnerPoolConfig, name: &MachineName) {
         "{}/api/v1/runners/purge",
         config.server_url.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
-        .build()
+    let client = match preloop_runner_server::shared_http::with_tls_roots(
+        reqwest::Client::builder().timeout(std::time::Duration::from_millis(1500)),
+    )
+    .build()
     {
         Ok(client) => client,
         Err(_) => return,
@@ -6602,9 +6812,31 @@ async fn provision_runner<P: VmProvider + 'static>(
     // contents nor the contract this pool baked, so it would register as a
     // runner that cannot run the job it was created for. A fork that cannot be
     // recovered here is an error, and the slot retries it with backoff.
+    let fork_volumes = match golden {
+        Some(_)
+            if !provider
+                .capabilities()
+                .fork_bases_may_mount_read_only_volumes =>
+        {
+            runner_volumes(
+                config,
+                name,
+                !provider.capabilities().runner_bundle_carries_externals,
+            )?
+        }
+        _ => Vec::new(),
+    };
     let forked_golden = match golden {
-        Some(golden) => match provider.fork(golden, name).await {
-            Ok(()) => Some(golden),
+        Some(golden) => match provider
+            .fork_with_volumes(golden, name, &fork_volumes)
+            .await
+        {
+            Ok(()) => {
+                if provider.capabilities().runner_bundle_carries_externals {
+                    link_runner_externals(provider.as_ref(), name).await?;
+                }
+                Some(golden)
+            }
             Err(error) if managed_golden(config, golden) => {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
@@ -6622,8 +6854,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                     match provider.rearm_fork_base(golden, Some(name)).await {
                         Ok(true) => {
                             info!(golden = golden.as_str(), "golden fork base re-armed");
-                            match provider.fork(golden, name).await {
-                                Ok(()) => Some(golden),
+                            match provider
+                                .fork_with_volumes(golden, name, &fork_volumes)
+                                .await
+                            {
+                                Ok(()) => {
+                                    if provider.capabilities().runner_bundle_carries_externals {
+                                        link_runner_externals(provider.as_ref(), name).await?;
+                                    }
+                                    Some(golden)
+                                }
                                 Err(retry_error) => {
                                     error!(
                                         machine = name.as_str(),
@@ -6683,8 +6923,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                                 }
                             }
                             if rearmed {
-                                match provider.fork(golden, name).await {
-                                    Ok(()) => Some(golden),
+                                match provider
+                                    .fork_with_volumes(golden, name, &fork_volumes)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if provider.capabilities().runner_bundle_carries_externals {
+                                            link_runner_externals(provider.as_ref(), name).await?;
+                                        }
+                                        Some(golden)
+                                    }
                                     Err(retry_error) => {
                                         error!(
                                             machine = name.as_str(),
@@ -6737,8 +6985,14 @@ async fn provision_runner<P: VmProvider + 'static>(
                             error = %last_error,
                             "golden fork failed; retrying the fork"
                         );
-                        match provider.fork(golden, name).await {
+                        match provider
+                            .fork_with_volumes(golden, name, &fork_volumes)
+                            .await
+                        {
                             Ok(()) => {
+                                if provider.capabilities().runner_bundle_carries_externals {
+                                    link_runner_externals(provider.as_ref(), name).await?;
+                                }
                                 retried = Some(golden);
                                 break;
                             }
@@ -6801,7 +7055,11 @@ async fn provision_runner<P: VmProvider + 'static>(
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config, name, !from_packed)?,
+            volumes: runner_volumes(
+                config,
+                name,
+                !from_packed && !provider.capabilities().runner_bundle_carries_externals,
+            )?,
             sockets: config
                 .control_socket
                 .iter()
@@ -6819,6 +7077,9 @@ async fn provision_runner<P: VmProvider + 'static>(
         if !from_packed {
             await_guest_ready(provider.as_ref(), name).await?;
             apply_golden_contract(provider.as_ref(), config, name).await?;
+            if provider.capabilities().runner_bundle_carries_externals {
+                link_runner_externals(provider.as_ref(), name).await?;
+            }
         }
     }
 
@@ -8928,6 +9189,36 @@ done
         assert!(script.contains("root='/proc/sys'"), "{script}");
     }
 
+    /// The init must disable the roots revoked by the 2026-10-20 eMudhra
+    /// intermediate compromise; a golden that still anchors them lets a
+    /// forged leaf validate in every client that ignores revocation.
+    #[test]
+    fn hosted_runtime_init_disables_revoked_emudhra_roots() {
+        let script = guest_hosted_runtime_init_script();
+        for root in [
+            "mozilla/emSign_ECC_Root_CA_-_G3.crt",
+            "mozilla/Comodo_AAA_Services_root.crt",
+        ] {
+            assert!(script.contains(root), "missing {root}: {script}");
+        }
+        assert!(script.contains("update-ca-certificates"), "{script}");
+        assert!(
+            script.contains("sudo -n update-ca-certificates"),
+            "{script}"
+        );
+    }
+
+    /// Bake-time security updates are security-pocket only. A blanket
+    /// `apt-get upgrade` would also move packages the image deliberately
+    /// pins, so the script must stay on `unattended-upgrade`.
+    #[test]
+    fn golden_security_updates_use_unattended_upgrade_not_apt_upgrade() {
+        let script = golden_security_update_script();
+        assert!(script.contains("unattended-upgrade --verbose"), "{script}");
+        assert!(script.contains("-security"), "{script}");
+        assert!(!script.contains("apt-get upgrade"), "{script}");
+    }
+
     /// The expected golden runtime lives in `official-image.toml`, and
     /// `build.rs` compiles every flat key into a constant. This fails if the
     /// code and the config drift apart: a hand-edited literal, a key renamed
@@ -9092,16 +9383,18 @@ done
     }
 
     /// The composed init run end to end against scratch roots: the fork's own
-    /// name resolves and the sysctls reach the hosted values in one exec, and
-    /// a second run changes nothing. Textual order alone would not catch a
-    /// half whose `exit 0` swallows the other — this runs both halves in one
-    /// shell, the way provisioning does.
+    /// name resolves, the sysctls reach the hosted values, and the revoked CA
+    /// roots are disabled in one exec, and a second run changes nothing.
+    /// Textual order alone would not catch a half whose `exit 0` swallows the
+    /// other — this runs all three halves in one shell, the way provisioning
+    /// does.
     #[cfg(unix)]
     #[test]
-    fn hosted_runtime_init_applies_both_halves_in_one_run() {
+    fn hosted_runtime_init_applies_all_halves_in_one_run() {
         let temp = tempfile::tempdir().unwrap();
         let hosts = temp.path().join("hosts");
         let root = temp.path().join("sys");
+        let ca_conf = temp.path().join("ca-certificates.conf");
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(root.join("vm")).unwrap();
         std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
@@ -9110,6 +9403,13 @@ done
         std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_instances"), "128").unwrap();
+        std::fs::write(
+            &ca_conf,
+            "mozilla/emSign_ECC_Root_CA_-_G3.crt\n\
+             mozilla/Comodo_AAA_Services_root.crt\n\
+             mozilla/Other.crt\n",
+        )
+        .unwrap();
         // The sysctl half's procps is absent here, so the apply writes the
         // scratch tree directly — the same branch a guest without procps
         // takes. Every other tool both halves call is linked in, so the test
@@ -9136,8 +9436,13 @@ done
             ),
         );
         hostname_harness_stub(&bin.join("sudo"), SUDO_STUB);
+        hostname_harness_stub(&bin.join("update-ca-certificates"), "#!/bin/sh\nexit 0\n");
 
-        let script = hosted_runtime_init_script_at(hosts.to_str().unwrap(), root.to_str().unwrap());
+        let script = hosted_runtime_init_script_at(
+            hosts.to_str().unwrap(),
+            root.to_str().unwrap(),
+            ca_conf.to_str().unwrap(),
+        );
         let run = || {
             std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
@@ -9164,6 +9469,13 @@ done
         assert_eq!(
             std::fs::read_to_string(root.join("fs/inotify/max_user_instances")).unwrap(),
             "1280"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ca_conf).unwrap(),
+            "!mozilla/emSign_ECC_Root_CA_-_G3.crt\n\
+             !mozilla/Comodo_AAA_Services_root.crt\n\
+             mozilla/Other.crt\n",
+            "the CA half must disable exactly the revoked roots"
         );
         // Idempotent: the second run writes nothing at all.
         let second = run();
@@ -13633,7 +13945,13 @@ mod golden_download_tests {
         .await;
         let api_base = url.trim_end_matches("/golden").to_owned();
 
-        let tag = resolve_latest_golden_tag(&reqwest::Client::new(), &api_base).await;
+        let tag = resolve_latest_golden_tag(
+            &preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+                .build()
+                .unwrap(),
+            &api_base,
+        )
+        .await;
 
         assert_eq!(
             tag.as_deref(),
@@ -13674,7 +13992,12 @@ mod golden_download_tests {
             move |offset| {
                 let url = url.clone();
                 Box::pin(async move {
-                    let mut request = reqwest::Client::new().get(&url);
+                    let mut request = preloop_runner_server::shared_http::with_tls_roots(
+                        reqwest::Client::builder(),
+                    )
+                    .build()
+                    .unwrap()
+                    .get(&url);
                     if offset > 0 {
                         request =
                             request.header(reqwest::header::RANGE, format!("bytes={offset}-"));

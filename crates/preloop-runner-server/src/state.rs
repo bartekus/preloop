@@ -1112,6 +1112,10 @@ pub struct AppState {
     /// to one file for its whole life and cannot be retargeted underneath
     /// itself by a later environment change.
     pub config_path: PathBuf,
+    /// Engine-hosted GitHub App setup: the one live setup session, its
+    /// one-time link, and the browser-route rate limit. Node-local and
+    /// in-memory by design: a setup lasts minutes, and a restart ends it.
+    pub github_setup: Arc<crate::github_app_setup::session::SetupSessions>,
     /// `GITHUB_TOKEN` permissions ceiling loaded from the config file at
     /// startup. `None` (absent table) = no ceiling; today's behavior is
     /// unchanged. A config change takes effect on restart, like the other
@@ -1773,6 +1777,7 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             config_path,
+            github_setup: Arc::new(crate::github_app_setup::session::SetupSessions::new()),
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),
             execution_protection: config.execution_protection.clone(),
@@ -2222,6 +2227,18 @@ pub struct InnerState {
     /// secrets on each log chunk.
     pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
     pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+    /// Runtime-minted mask values (today: the OIDC `id_token`, registered at
+    /// mint by [`crate::timeline_logs::register_runtime_mask_value`]), keyed
+    /// by the same plan/run scope keys as `plan_secret_masker`. Provider
+    /// secrets never change after submit, but these arrive while the job is
+    /// already logging, so they are tracked separately and merged into every
+    /// scope write (`plan_secret_masker`/`plan_secret_masker_pending`) and
+    /// into every cold resolution — a resolution that raced a registration
+    /// must never cache a scope that predates it. Each scope holds at most
+    /// `MAX_RUNTIME_MASKS_PER_SCOPE` values (oldest dropped first: a job may
+    /// mint a token per call), and a run's entries are dropped with the run
+    /// (see `memory_caps::remove_run_everywhere`).
+    pub plan_runtime_masks: BTreeMap<String, Vec<String>>,
     /// Chunk-boundary-safe streaming log maskers for the AzDO append path,
     /// keyed by log key (`{plan_id}/{log_id}`). Each masker holds a
     /// trailing-overlap buffer so a secret split across two appends is
@@ -2232,14 +2249,14 @@ pub struct InnerState {
     /// withheld tail from the lossy in-memory preview.
     ///
     /// The masker is built from the secret list resolved at the log's first
-    /// append and never reseeded: run secrets are immutable, and the only
-    /// alternative first-append resolution (the negative-cache union) is a
-    /// superset of the real list, so the masker can only over-mask, never
-    /// under-mask.
-    pub log_stream_maskers: BTreeMap<
-        String,
-        std::sync::Arc<tokio::sync::Mutex<preloop_gha_protocol::masking::StreamingMasker>>,
-    >,
+    /// append and only widened afterward (`PlanLogMasker::extend`): run
+    /// secrets are immutable, the only alternative first-append resolution
+    /// (the negative-cache union) is a superset of the real list, and a
+    /// runtime-registered value (see `plan_runtime_masks`) rebuilds the
+    /// masker from its own source list — so the masker can only over-mask,
+    /// never under-mask.
+    pub log_stream_maskers:
+        BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<crate::timeline_logs::PlanLogMasker>>>,
     /// Reaper starvation marks (node-local): when this node
     /// first saw each ready job that no registered runner matches. Cleared
     /// once a runner matches, while a pool is preparing, or when the job

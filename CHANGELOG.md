@@ -8,7 +8,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **Webhook ingress bounds and times out body uploads.** The GitHub webhook
+  route buffers at most eight request bodies (each up to the 32 MiB route
+  limit) at once, so an unauthenticated caller can no longer use the ingress
+  as a memory amplifier before the HMAC check. An upload is cut off with 408
+  if it is still arriving after 10 s, or if it stops sending for 3 s — holding
+  a slot now costs an actual transfer instead of just a connection — and a
+  delivery that arrives while every slot is taken waits up to 1 s for one
+  rather than being shed outright. Those budgets cover the upload alone: once
+  the body is in, the handler keeps its own acknowledgement budget, so a slow
+  but valid delivery is still recorded. A shed or timed-out request never
+  reached the store and has no local payload to replay, so recovering one
+  means redelivering it from GitHub's delivery log; `preloop webhooks replay`
+  cannot help. With `--record-flows`, the webhook body is no longer buffered
+  by the flow recorder ahead of the route's own admission.
+### Fixed
+
+- **A stale pinned guest-agent rootfs can no longer make every VM
+  unstoppable.** The engine exports `SMOLVM_AGENT_ROOTFS` to every smolvm
+  child (the child's `HOME`/data directory is isolated), and an inherited
+  variable wins over the rootfs that ships beside the binary — so after a
+  hand-upgraded smolvm prefix the engine kept booting the old agent found in
+  the data directory, and smolvm ≥ 1.16 refused every `machine stop` with
+  `running guest agent does not support safe shutdown; VM left unchanged;
+  update the guest agent before retrying`, which the pool retried for hours.
+  On Linux the rootfs shipped next to the resolved binary is now the first
+  candidate, and on every platform a candidate that agrees with it is
+  preferred; a boot from a provably mismatched agent is refused up front with
+  both rootfs paths, both agent hashes, the host version, and the remedy. Two
+  identical trees are not enough on their own: when the agent they hold
+  advertises no `quiesced-shutdown-v1` while the resolved host requires it,
+  the boot is refused too — that is what a smolvm upgraded without its rootfs
+  looks like. `preloop update --ensure-runtime` refreshes the rootfs the engine
+  exports (`<data dir>/agent-rootfs`, where `<data dir>` is `SMOLVM_DATA_DIR`
+  or the effective Preloop home's `smolvm`), keeps the rootfs beside the
+  resolved binary in step, records the version in `.preloop-agent-version`, and
+  repairs the install whenever either tree stops matching the installed
+  smolvm — not only when the binary is reinstalled. It never installs a sibling
+  it has just proven stale, and it refuses to claim a repair while
+  `SMOLVM_AGENT_ROOTFS` pins a tree that does not hold the host's agent. A
+  refused stop now also names the rootfs Preloop exported and the agent version
+  the guest logged at boot.
+- **Retries preserve nested-action authorization.** Retrying a claimed job now
+  updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
+  Previously it still named the abandoned attempt, so nested action resolution
+  rejected the retried job's otherwise valid runtime token with HTTP 403.
+- **`github.token` and `GITHUB_TOKEN` populate on github.com registrations**
+  (#626): `preloop-runner configure` now records which control plane the
+  runner registered against (`.runner` `controlPlane`, derived from the
+  `--url` host), and a `.runner` written before that field existed is
+  classified from the `gitHubUrl` it already carries, so an upgraded runner
+  recovers the token surface without re-registering. On a github.com
+  registration, `github.token` and the `GITHUB_TOKEN` env var resolve from
+  the job's `system.github.token` variable (or its `github_token` alias) —
+  mirroring the official runner, which builds `githubContext["token"]` from
+  that variable in `ExecutionContext.InitializeJob` — so `gh`,
+  `github-script`, and checkout's `${{ github.token }}` default authenticate
+  instead of seeing an empty value. Engine registrations keep the fence:
+  there the claim owns that slot, holding the GitHub credential it minted
+  (which the runner reads from the `github.token` context) or nothing at all,
+  and it is never exported to a step. The job-scoped runtime JWT is delivered
+  through `SystemVssConnection` and never enters that variable or the step
+  environment. On both planes a workflow's own `env: GITHUB_TOKEN` no longer
+  replaces `${{ github.token }}`, and the
+  `base64("x-access-token:<token>")` header actions/checkout persists is
+  masked for either alias. `secrets.GITHUB_TOKEN` resolution is unchanged in
+  both modes. Missing, unreadable, or malformed `.runner` metadata now fails
+  the job before any workflow, container, or service work instead of silently
+  selecting the engine plane; an unknown `controlPlane` value or an
+  unparseable `gitHubUrl` is an error, and job execution reuses the
+  registration state validated at worker startup rather than re-reading
+  `.runner` per job.
+
+## [0.35.0] - 2026-10-19
+
+### Security
+
+- **Log masking covers base64 alignment shifts.** A secret piped through
+  `base64` with a short prefix in front of it (`printf 'x%s' "$SECRET" |
+  base64`) no longer reaches a masked log. Masked log paths now redact
+  base64 encodings of a registered secret at any byte alignment, including
+  tokens that straddle 76-column wrapped lines and tokens split across write
+  chunks in server-side log persistence. Percent- and hex-encodings of such
+  a shifted payload are still not covered by this pass; register the exact
+  value when a workflow prints it that way.
+
 ### Added
+
+- **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
+  `PRELOOP_PUBLIC_URL`), `preloop setup github --via app` asks the running
+  engine to host the App-creation form. The CLI prints a single-use setup link
+  that expires in ten minutes. The engine serves the form at `/setup/github`,
+  converts GitHub's code at `/setup/github/callback`, and stores the credentials
+  the same way the CLI does, so the browser never needs a route back to a
+  laptop. The routes answer 404 unless a setup is in progress. New endpoints:
+  `POST /api/v1/github/setup-sessions` and
+  `GET /api/v1/github/setup-sessions/{id}`, both with the system token.
+
+- **App setup over SSH.** Without a public URL, an SSH session binds the
+  loopback listener on port 8765 (or `--port`) and prints the `ssh -L` command
+  to run on your laptop, then the address to open. The redirect path is the
+  same as the local flow.
 
 - **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
   the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
@@ -20,14 +122,76 @@ Releases before v0.27.0 predate the changelog.
   ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
   cargo-zigbuild match `release-runner.yml`.
 
+- **The `preloop` crate on crates.io tracks releases.** `publish-crates-io` in
+  the release workflow publishes `packaging/crates-io/preloop` — the crate that
+  holds the name on crates.io and points readers at the channels that do install
+  the CLI — at each release version, authenticating with a crates.io trusted
+  publisher instead of a stored token. The job skips with a workflow warning
+  while the name is unclaimed and no-ops when that version is already published,
+  so re-running a tag stays safe. The first version is still claimed by hand:
+  see `packaging/crates-io/README.md`.
+
+- **Superseded AgentENV volumes are collected automatically.** A runner bundle
+  change publishes a new content-addressed volume and leaves the old one behind;
+  the engine now reclaims the ones nothing needs — unmounted by any sandbox, past
+  the grace period, beyond the newest one kept for a rollback, and not a tree the
+  engine mounts — in a pass after each populate and every six hours (the timer
+  starts with the engine, so an engine that only resumes sandboxes still
+  collects). A pass never deletes a volume a sandbox mounts (AgentENV refuses), a
+  volume whose creation time nothing recorded, or a staging volume a populate is
+  writing, and every deletion is logged with its name, size and reason. A volume
+  AgentENV reports as something other than `ready` is reclaimed once it is past
+  the grace period — including one this engine published and remembers, which it
+  refuses to mount — so a start that would otherwise stay stuck on it populates
+  again. A volume a populate or a start claims between the plan and the deletion
+  is left for the next pass.
+  `PRELOOP_VOLUMES_GC=off` turns the automatic passes off;
+  `PRELOOP_VOLUMES_KEEP_PREVIOUS` (default 1), `PRELOOP_VOLUMES_GC_GRACE_SECS`
+  (default 3600) and `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600) set the
+  retention.
+
+- **`preloop volumes gc [--keep <DIR>]... [--dry-run]`** prints the plan a pass
+  acts on — one row per volume with its size, kind, age and the reason it is kept
+  or deleted — and deletes it unless `--dry-run` is given. A deletion that fails
+  exits nonzero, as `prune` does. `prune` stays as the explicit one-shot for
+  volumes that have no recorded age.
+
 - **`preloop init` workflow readiness checks.** The five-step wizard can ask for
   a stable HTTPS App webhook URL, scan local and configured repositories for
   missing workflow secrets, and report every `runs-on` label against the
   engine's actual pool rules. Use `--no-secrets-scan` to skip secret checks;
   `--json` includes the URL, secret, and runner-label decisions.
+  It accepts the tailnet name it detects on the host when a Funnel publishes
+  only the webhook path there (showing the Tailscale Funnel / named Cloudflare
+  Tunnel setup, and checking `tailscale funnel status`), and carries the URL
+  into the run mode it starts — foreground `serve`, or the installed service's
+  environment — so Check Run links and the webhook health check use it.
 
 ### Changed
 
+- **`preloop serve` (and `preloop init --mode foreground`) is the only way an
+  engine starts.** Every command that talks to an
+  engine — `run` and `rerun` included, plus `status`, `logs`, `cancel`,
+  `shell`, `debug`, `dap`, `push` and `webhooks` — requires one that is
+  already running: it probes the endpoint it would use (`PRELOOP_URL`, else
+  the local default) and, when nothing answers, exits non-zero naming that
+  endpoint and how to start one (`preloop serve` in the foreground, `preloop
+  server install` for a supervised service) instead of booting a background
+  engine. Local and administrative commands (`plan`, `store`, `setup`,
+  `doctor`, `secret`, `update`, `version`, `build-golden`, `golden-path`, and
+  `init` outside `--mode foreground`) never contact one. A set `PRELOOP_URL` no
+  longer implies a live engine, and no command falls back to a local one. The
+  refusal keeps the `PRELOOP_UNREACHABLE` marker the pre-push hook fails open
+  on, so a missing engine stays a soft gate. A `PRELOOP_URL` that crosses a
+  network is probed with a longer budget than loopback, so an engine that
+  answers slowly is not reported absent. The brand-new control-database
+  initialization that the background start performed moved to `preloop serve`,
+  so a fresh `PRELOOP_HOME` still serves with no extra step, out of the store
+  `--store` / `PRELOOP_STORE_URL` selects (the same one the boot opens); an
+  existing store is still never migrated implicitly. Fixes defect 3 of
+  [#658](https://github.com/preloopdev/preloop/issues/658): a `preloop run`
+  from the pre-push hook used to start a control plane and a smolVM on the
+  developer's machine. The hook's other two defects are tracked separately.
 - **SmolVM floor and golden pin move to 1.30.1** (`smolvm_min_version` and
   `smolvm_golden_version` in `versions.toml`). The floor now also covers the
   x86_64 virtio device budget SmolVM 1.23.0 raised to 19 MMIO IRQ lines, which
@@ -60,33 +224,175 @@ Releases before v0.27.0 predate the changelog.
   kept in the keychain are copied into the file store the first time they are
   read; the keychain entry is left in place.
 
+- **AgentENV runners mount the runner bundle as a read-only volume**: the
+  complete bundle (including Node externals) is archived once into a
+  content-addressed volume named `preloop-runner-<digest>`, stamped with a
+  `.preloop-bundle.json` manifest saying which runner and Node versions it
+  holds, and clones mount it at start with `aenv start --volume`. Fork bases stay
+  volume-free because AgentENV 0.2.1 cannot snapshot a sandbox with a read-only
+  volume; a new bundle is therefore a new volume rather than a golden rebuild.
+  Writable host mounts are refused, symlinks that would leave the tree and
+  set-user-ID/set-group-ID/sticky bits are stripped, and volume create/populate
+  failures are reported by name with no tar fallback. `preloop volumes list|prune`
+  manages leftovers; `preloop volumes gc` — the plan the engine also runs by
+  itself — collects the superseded ones.
+- **`$BROWSER` is honored when the CLI opens a page.** It is tried first, as
+  `xdg-open` reads it, so VS Code and Cursor remote terminals open GitHub's
+  setup page on your laptop and forward its port. The platform opener remains
+  the fallback. Entries are parsed with shell-style quoting, so a helper whose
+  path or arguments contain spaces launches, and no entry is waited on — a
+  foreground browser can no longer hold the page it is waiting for.
+
+- **Engine-hosted App setup runs `--repo` checks.** The engine waits (up to
+  five minutes, shared across the list) for the App to be installed on each
+  requested repository, verifies the new credentials there, and reports one
+  `✓`/`✗` line per repository through the session status; the CLI prints them
+  and exits non-zero when a check failed, exactly like the loopback flow's
+  `doctor`. Up to 16 repositories per setup.
+
 ### Fixed
 
-- **A stale pinned guest-agent rootfs can no longer make every VM
-  unstoppable.** The engine exports `SMOLVM_AGENT_ROOTFS` to every smolvm
-  child (the child's `HOME`/data directory is isolated), and an inherited
-  variable wins over the rootfs that ships beside the binary — so after a
-  hand-upgraded smolvm prefix the engine kept booting the old agent found in
-  the data directory, and smolvm ≥ 1.16 refused every `machine stop` with
-  `running guest agent does not support safe shutdown; VM left unchanged;
-  update the guest agent before retrying`, which the pool retried for hours.
-  On Linux the rootfs shipped next to the resolved binary is now the first
-  candidate, and on every platform a candidate that agrees with it is
-  preferred; a boot from a provably mismatched agent is refused up front with
-  both rootfs paths, both agent hashes, the host version, and the remedy. Two
-  identical trees are not enough on their own: when the agent they hold
-  advertises no `quiesced-shutdown-v1` while the resolved host requires it,
-  the boot is refused too — that is what a smolvm upgraded without its rootfs
-  looks like. `preloop update --ensure-runtime` refreshes the rootfs the engine
-  exports (`<data dir>/agent-rootfs`, where `<data dir>` is `SMOLVM_DATA_DIR`
-  or the effective Preloop home's `smolvm`), keeps the rootfs beside the
-  resolved binary in step, records the version in `.preloop-agent-version`, and
-  repairs the install whenever either tree stops matching the installed
-  smolvm — not only when the binary is reinstalled. It never installs a sibling
-  it has just proven stale, and it refuses to claim a repair while
-  `SMOLVM_AGENT_ROOTFS` pins a tree that does not hold the host's agent. A
-  refused stop now also names the rootfs Preloop exported and the agent version
-  the guest logged at boot.
+- **A `tailscale` query that does not answer is abandoned, not waited out.**
+  The wizard's 5 s bound covered only the wait for the `tailscale` child to
+  exit; the answer was then read to the end of its stdout, so a child that had
+  forked — a shim or wrapper script on `PATH`, or a shell — left that pipe open
+  in a grandchild that outlived the kill, and the query ran for as long as
+  whatever the child left behind. The read now shares the deadline, and is
+  capped and abandoned with it, so a descendant that keeps writing can neither
+  hold the wizard nor grow the answer without bound.
+
+- **Local runs resolve a local composite's nested remote action again** (#649
+  regression from #620): the runner resolves such an action with its job's
+  runtime token and names the job by `system.orchestrationId`
+  (`{planId}.{jobId}.__default`), and the Results identity check refused that
+  plan segment. A job token now names its own plan in that form too; the job
+  UUID must still match, so a token reaches only its own job. Every refusal on
+  the action-download path logs a WARN with its run and reason, and a local
+  composite source that cannot be read is treated as incomplete, never
+  remembered as an empty answer.
+
+- **Runner mask hints are now applied in job logs.** The engine already stamped
+  `maskHints` (regex and variable) into every job message, but the runner
+  ignored the list, so pattern-shaped redaction the official runner performs
+  never happened. `run_job` now consumes it: regex hints compile once per job
+  and join the same scan as value masks on every runner egress — durable step
+  logs, check-run annotations, the live-log drain, and the retroactive re-mask —
+  and variable hints mask the named variable's value. The assembled step log
+  (`log_content`, and every slice and upload derived from it) additionally takes
+  the pattern pass over the whole text with line preservation, so a hint whose
+  pattern spans a newline still redacts it while the record count — and every
+  line checkpoint — stays intact. A hint whose pattern does not compile is
+  skipped with a warning. The completion `environment.url` guard applies the
+  hint patterns too, so a URL matching one is dropped rather than published.
+
+- **Credential-shaped container and service `env:` values are masked.** A
+  service declared as `services: db: env: POSTGRES_PASSWORD: …` showed the value
+  verbatim on the `##[command]docker create … -e` line, in the docker debug
+  trace, and in service `docker logs` output. Values whose `env` name matches
+  PASSWORD, PASSWD, SECRET, TOKEN, API_KEY, APIKEY, PRIVATE_KEY, CREDENTIAL, or
+  ACCESS_KEY (case-insensitive) are now registered as job masks before the first
+  recorded docker line, so every sink shows `***`; an empty workflow value is
+  passed as a bare `-e KEY`, which makes Docker inherit the key from the runner
+  process, so the runner's own value for a credential-shaped key is registered
+  too. The match deliberately over-masks (a `TOKEN_BUDGET=5` becomes `***`) —
+  documented at the registration site. The container-create error paths that
+  embed docker output mask it as well.
+
+- **Minted OIDC `id_token`s are redacted from logs.** A step that curls
+  `ACTIONS_ID_TOKEN_REQUEST_URL` and echoes the response leaked the bearer JWT
+  into its log. The token endpoint now registers each minted `id_token` into the
+  job's server-side mask scope before the response is sent, widening the running
+  stream masker in place (the withheld tail is flushed through the rebuilt
+  masker, so no log bytes are dropped), so both the live feed and the persisted
+  log show `***`. Unrelated content is unchanged. Registration is node-local,
+  like the existing claim-time scope merges, and bounded: each scope keeps the
+  64 most recent registrations and drops the oldest first, so a job that mints a
+  token per call cannot grow the scope — or rebuild every live masker from a
+  longer list on each mint — for the run's life. Retention removes the run's own
+  scope entry with its plan scopes. The per-log masker mutex is held across the
+  append of a widened masker's flushed tail, so a concurrent append never
+  interleaves with it.
+- **GitHub Apps created by the manifest flow now subscribe to
+  `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
+  signal joins the creation-time `default_events`, and `actions: read` joins
+  the manifest's `default_permissions` because GitHub does not render the
+  `workflow_job` checkbox without it (the permission is requested only when the
+  event list actually carries `workflow_job`). The startup subscription
+  read-back now reports a missing `workflow_job` with the permission-gating
+  remediation. GitHub cannot change an App's event subscriptions through its
+  API after creation, so **Apps created before this change need a manual
+  edit**: App settings → Permissions & events → grant Actions: read
+  (installation must accept) → Subscribe to events → tick `workflow_job`.
+  Apps created without `--public-url` were shipped with no webhook and no
+  `default_events` at all, so enabling webhooks on one of those needs the same
+  manual step for every event.
+- **Converted App credentials are `SecretString` end to end.** The private key
+  and webhook secret GitHub returns are deserialized into `SecretString`, so
+  formatting or logging either one redacts it; the plaintext is exposed only
+  where it is written through the credential store. A conversion that GitHub
+  rejects no longer puts the upstream response body into the error the CLI
+  prints.
+
+- **GitHub App installation links follow the configured GitHub host.** The
+  slug-based installation URL is built from the same web root the App was
+  created on, so a GitHub Enterprise Server engine no longer sends the operator
+  to `github.com`.
+
+- **Engine-hosted setup no longer races, clobbers, or duplicates.**
+  - A setup session that is converting, or holding a result its CLI has not
+    read yet, is no longer replaced by a second setup: the CLI that was waiting
+    gets its result instead of a 404 while its App exists on GitHub.
+  - App credential writes take the same whole-file config lock as the secrets
+    and execution-protection APIs, so an overlapping write can no longer erase
+    the other's change.
+  - The engine refuses to create a second App when its own config already has
+    one (the CLI's duplicate check cannot see a remote engine's config) and
+    reports the App id instead; `--add` still creates an additional App.
+  - The engine checks that its config loads and its credential store can hold
+    the key before GitHub creates anything, so a key that could not be stored
+    is reported before the App exists rather than after. A store selected with
+    `PRELOOP_CREDENTIAL_STORE=memory` is refused outright: it holds the key for
+    this process only, while the flow's next step is the restart that would
+    lose it.
+  - A setup is refused when `--public-url` names an origin other than the
+    engine's own `PRELOOP_PUBLIC_URL`, and plain `http` is refused outside
+    loopback: the one-time link and GitHub's redirect carry the App's token and
+    code.
+
+- **Refused setup guesses no longer end a live App setup.** The browser-facing
+  `/setup/github` route is unauthenticated, and five wrong tokens used to fail
+  the session outright — which made an onlooker's guesses a way to cancel a
+  setup that was in progress. A mismatch is now refused and logged without
+  touching the session; the one-time token is still burned the moment it is
+  used, and the request budget still caps how fast anyone can guess.
+
+- **A spent setup budget no longer gates the operator's own request.** The
+  browser-facing setup routes billed every request to one shared window before
+  the token or state was checked, so any unauthenticated caller could spend it
+  guessing and the operator's own setup link — or GitHub's redirect with the
+  App's code — was answered 429 while a setup was open. The token and state
+  checks now run first and only a refusal is charged, so the operator's request
+  is never gated; the form and the callback each have their own window, so
+  neither route's guessing can spend the other's. A burst of invalid requests
+  still reads 404 (or 400 for a forged callback) up to the window's limit and
+  429 after it, and an inactive session still reads 404.
+
+- **`PRELOOP_PUBLIC_URL` alone now updates an existing App's webhook.** The
+  effective public URL is resolved before the already-configured-App branch, so
+  setting it in the environment (without `--public-url`) points the configured
+  App's webhook at that address instead of printing only that it is configured.
+- **A hung OS keychain or trust daemon no longer freezes the engine.** On
+  macOS, outbound TLS verified every new connection through
+  `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked
+  behind an unanswered keychain unlock dialog, every engine thread blocked with
+  it, `/healthz` included, until someone dismissed the dialog. Outbound TLS
+  (GitHub, downloads, Postgres) now verifies in-process against a root set read
+  once per process: the bundled Mozilla roots, the OS store's certificates
+  (read with a 5 s deadline), and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`.
+  Every OS credential-store call (Keychain, Secret Service, Credential Manager)
+  gets a 10 s deadline, and after one unanswered call the store is treated as
+  unavailable for the rest of the process. Platform revocation checks no longer
+  apply; a CA added to the OS store is picked up on restart.
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
   libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the
@@ -97,6 +403,14 @@ Releases before v0.27.0 predate the changelog.
   with fewer mounts), with the raw smolvm output appended. Previously this was
   indistinguishable from a held or corrupt disk image, and the pool restarted
   forever without naming the cause.
+- **`preloop setup github --app-id --pem-file` enables the App webhook.** The
+  manual App path saved credentials and stopped there, so an App configured
+  with `--public-url` kept a webhook that delivered nowhere: pushes and pull
+  requests never started runs. It now points the hook at the engine (reusing
+  the stored webhook secret), and a GitHub refusal is fatal and says plainly
+  that the credentials were saved but the hook still delivers nowhere. Setup
+  also says the App's webhook must be **Active** for pushes and pull requests
+  to arrive, and where to tick it: GitHub's API cannot set that flag.
 
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
 - **Job `env:` and reusable-call `secrets:` maps read the claim-minted `GITHUB_TOKEN`.**
@@ -124,8 +438,9 @@ Releases before v0.27.0 predate the changelog.
   failed with `config-secrets key conflict`. Preloop now refuses to mint while
   sealed values exist and names what to unlock. A `secrets.key` that disagrees
   with the store is settled by which key opens the sealed values, and the losing
-  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. A failed
-  background engine start now prints the engine's last log lines (#653).
+  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. (The background
+  engine start that logged its last lines on failure was removed with #658; see
+  the entry under *Changed*.)
 
 - **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
   RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
@@ -196,6 +511,16 @@ Releases before v0.27.0 predate the changelog.
   merged upload, and the logs endpoint falls back to the larger per-step
   representation when one exists. This preserves mutation and other
   heavy-step output after guest temporary-storage pressure.
+
+- **Post hooks of skipped actions no longer run**: a workflow step that did
+  not run, because its `if:` was false or an earlier step failed, no longer
+  runs its action's `post` hook. The official runner registers a post hook
+  while the action's handler runs — for the action's `Pre` step as well as its
+  main step — but the engine ran every post hook under its `always()` default,
+  so cleanup hooks of skipped steps ran for minutes and their failures were
+  recorded beside the real first failure. A post hook whose action never
+  reached its handler is now recorded as `skipped`; hooks of actions that ran,
+  and hooks whose action's `pre:` step ran, are unchanged.
 
 ## [0.34.4] - 2026-10-13
 
@@ -2645,7 +2970,8 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.33.7...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/preloopdev/preloop/compare/v0.34.4...v0.35.0
 [0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7
 [0.33.6]: https://github.com/preloopdev/preloop/compare/v0.33.5...v0.33.6
 [0.33.5]: https://github.com/preloopdev/preloop/compare/v0.33.2...v0.33.5
