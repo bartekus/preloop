@@ -279,14 +279,14 @@ fn setup_workspace_derives_repo_layout_from_claim_repository() {
         let resolved = setup_workspace(&message).unwrap();
         let expected = std::env::current_dir()
             .unwrap()
-            .join("_work")
+            .join("work")
             .join(&repo)
             .join(&repo);
         assert_eq!(resolved, expected.to_string_lossy());
         assert!(resolved.contains(&repo));
-        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("_work").join(&repo));
+        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("work").join(&repo));
     }
-    let work_root = std::env::current_dir().unwrap().join("_work");
+    let work_root = std::env::current_dir().unwrap().join("work");
     for sibling in ["_temp", "_actions", "_tool"] {
         let _ = std::fs::remove_dir(work_root.join(sibling));
     }

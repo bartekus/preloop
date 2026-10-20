@@ -14,6 +14,55 @@ Releases before v0.27.0 predate the changelog.
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
   rejected the retried job's otherwise valid runtime token with HTTP 403.
+- **Container DNS reaches systemd-resolved's stub, so `/etc/hosts` aliases
+  resolve inside a compose network.** A GitHub-hosted runner's container
+  resolves a `postgres.localhost`-style service alias because its host's
+  `/etc/resolv.conf` names `127.0.0.53`; a preloop guest named its own resolver
+  (`75.75.75.75` on AgentENV, `100.96.0.1` on SmolVM), so Docker handed the
+  container that address as its only external server and the name came back
+  NXDOMAIN. The golden now points the resolver file at the stub, and the engine
+  re-applies it per machine and again inside every runner launch, because the
+  SmolVM agent rewrites the file at each start and before each interactive run.
+  The guest's configured upstream nameservers are kept as additional lines, and
+  the runtime step waits (bounded, 30 s) for systemd-resolved to publish the
+  stub on a freshly resumed guest; no `daemon.json` `dns` override is written,
+  since a loopback address there becomes the container's own loopback and every
+  lookup fails. A guest with no resolved stub keeps its resolver and logs why.
+- **Pack-based guests boot systemd as PID 1 and keep container state on ext4.**
+  `machine create --from <pack>` now runs `/sbin/init` as the workload, which
+  gives the guest `systemctl`, `journald`, `systemd-resolved` and Docker's
+  `systemd` cgroup driver, and mounts `/var/lib/docker` and
+  `/var/lib/containerd` on the machine's own storage disk so Docker picks
+  `overlay2` instead of degrading to `fuse-overlayfs`. Both are provider
+  defaults for pack machines only: the OCI-image builder keeps its container
+  state inside the overlay `pack create` captures. `PRELOOP_SMOLVM_WORKLOAD_INIT`
+  and `PRELOOP_SMOLVM_GUEST_VOLUMES` override them (an empty value disables the
+  default).
+- **The runner sees the image's whole environment, not just its PATH.** The
+  guest launcher sourced `/etc/environment` without `set -a`, so entries such
+  as `ImageOS`, `ImageVersion`, `JAVA_HOME*`, `LANG` and `DEBIAN_FRONTEND`
+  stayed shell-local and the `exec env` dropped them (measured: ~60 fewer
+  variables than hosted, and `setup-*` actions could not find the tool cache).
+  It also replaced the image's PATH with the engine fallback, making
+  `/opt/pipx_bin`, `~/.local/bin` and `/usr/local/.ghcup/bin` unreachable while
+  those tools were installed. The launcher now exports the sourced entries and
+  keeps the image's PATH, using the fallback only when the image declares none.
+- **Guest parity residue from the runner image is cleaned at bake time.**
+  `ping` gets `cap_net_raw+ep` back (an OCI layer carries no file
+  capabilities), the bake host's own `/etc/hosts` mapping is dropped, and
+  `/etc/fstab` entries naming Azure disks this guest does not have are
+  commented out with their original text, so `systemd-remount-fs.service` no
+  longer fails on every boot. Systemd guests also get `systemd-resolved`'s
+  upstream pinned in `resolved.conf` (an image's own `DNS=` is never touched)
+  and the Azure/cloud-init/snap/apt units the hosted image never runs masked.
+- **The job workspace uses the hosted `work` folder.** A job's checkout now
+  lands at `<runner-root>/work/<repo>/<repo>` and `RUNNER_WORKSPACE` is
+  exported; `_work` is the official runner's self-hosted default, and workflows
+  that branch on the path or look for a sibling checkout saw the wrong shape.
+- **The per-machine runtime init's reports reach the engine log.** Each half
+  exits 0 whether it applied its change or skipped it, so a silently skipped
+  resolver rewrite was invisible in the journal; every non-empty output line is
+  now logged with the machine name.
 - **`github.token` and `GITHUB_TOKEN` populate on github.com registrations**
   (#626): `preloop-runner configure` now records which control plane the
   runner registered against (`.runner` `controlPlane`, derived from the

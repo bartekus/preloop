@@ -135,6 +135,8 @@ Numeric values in this group are decimal integers. Retention, cache, and job-lim
 | `PRELOOP_RUNNER_BUNDLE` | Auto-discovered Linux `preloop-runner` bundle | Directory containing the Linux guest runner. Invalid paths fall through discovery and then fail startup if no bundle is found. On the AgentENV backend the host tree is archived into a content-addressed read-only volume, so a bundle change publishes a new volume. |
 | `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` for `serve` | Shared read-only Node runtime externals. |
 | `PRELOOP_SMOLVM_NET_BACKEND` | `virtio-net` | SmolVM public-only network backend. Exact lowercase `tsi` selects TSI; any other value selects `virtio-net`. |
+| `PRELOOP_SMOLVM_WORKLOAD_INIT` | `/sbin/init` | Command a packed golden machine runs as its workload, overriding the pack's recorded entrypoint/cmd. The default gives the guest systemd as PID 1 (`systemctl`, `journald`, `systemd-resolved`, and Docker's `systemd` cgroup driver). An empty value boots the pack's own entrypoint instead. OCI-image machines, including the golden builder, are unaffected. |
+| `PRELOOP_SMOLVM_GUEST_VOLUMES` | `/var/lib/docker,/var/lib/containerd` | Comma-separated guest paths a packed golden machine keeps on its own storage disk instead of its overlay root, which lets Docker use `overlay2` rather than `fuse-overlayfs`. An empty value disables them. They persist across stop/start and are inherited by forks; OCI-image machines get none by default. |
 | `PRELOOP_RUNNER_URL` | `http://127.0.0.1:<listen-port>` | Runner-facing engine URL. Set a host-reachable URL for runners on another machine. |
 
 The official packed golden defaults are digest-pinned per architecture. The current references are:

@@ -57,7 +57,7 @@ preloop build-golden \
 
 ## What the bake and guest setup provide
 
-The served pool defaults to the `runner` account (UID 1001), writable `_work`, `/opt/hostedtoolcache`, and the `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` environment entries. A bake attempts to write `/etc/preloop-bake.json`, checks for a glibc loader, and refreshes apt indexes when apt exists. The contract does not choose language toolchains; use setup actions or a job container.
+The served pool defaults to the `runner` account (UID 1001), writable `work`, `/opt/hostedtoolcache`, and the `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` environment entries. The launcher sources `/etc/environment` with exports and keeps the image's PATH (the pool's list is only the fallback when the image declares none). A bake attempts to write `/etc/preloop-bake.json`, checks for a glibc loader, refreshes apt indexes when apt exists, restores `ping`'s file capability, drops the bake host's own `/etc/hosts` mapping, comments out `/etc/fstab` entries naming disks this guest does not have, and prepares systemd (resolved upstream, resolver stub, Azure/cloud/snap unit masks). The contract does not choose language toolchains; use setup actions or a job container.
 
 At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stack limit with unlimited hard limit and 65536 soft/hard file descriptors. Per-machine initialization applies:
 
@@ -67,7 +67,9 @@ At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stac
 | `fs.inotify.max_user_watches` | `655360` |
 | `fs.inotify.max_user_instances` | `1280` |
 
-The engine also verifies that the guest hostname resolves to a local address and removes stale foreign mappings. The guest does not expose `/dev/kvm`: workloads that need nested virtualization must run on a runner outside the microVM pool.
+The engine also verifies that the guest hostname resolves to a local address and removes stale foreign mappings. It points `/etc/resolv.conf` at systemd-resolved's `127.0.0.53` stub while keeping the guest's configured upstream nameservers, and re-applies it inside every runner launch — the SmolVM agent rewrites the file before each start and interactive run. That is what lets a container resolve a compose `/etc/hosts` alias such as `postgres.localhost`; no `daemon.json` `dns` entry is written, because a loopback address there becomes the container's own loopback. A guest that cannot publish a resolved stub keeps its resolver and logs why.
+
+A machine booted from a packed golden runs `/sbin/init` as its workload, so the guest has systemd as PID 1 and Docker's `systemd` cgroup driver, and keeps `/var/lib/docker` and `/var/lib/containerd` on its own storage disk so Docker uses `overlay2` rather than `fuse-overlayfs`. See `PRELOOP_SMOLVM_WORKLOAD_INIT` and `PRELOOP_SMOLVM_GUEST_VOLUMES` for the overrides; OCI-image machines, including the golden builder, are unaffected. The guest does not expose `/dev/kvm`: workloads that need nested virtualization must run on a runner outside the microVM pool.
 
 ## Runner bundle discovery
 

@@ -2160,8 +2160,8 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
          fi; \
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
            && chmod 0440 /etc/sudoers.d/preloop-{user}; \
-         mkdir -p /run/user/{uid} /opt/hostedtoolcache {root}/_work; \
-         chown {uid}:{uid} /run/user/{uid} {root} {root}/_work 2>/dev/null; \
+         mkdir -p /run/user/{uid} /opt/hostedtoolcache {root}/work; \
+         chown {uid}:{uid} /run/user/{uid} {root} {root}/work 2>/dev/null; \
          [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
            chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
@@ -2236,6 +2236,348 @@ pub fn golden_ownership_script(uid: u32) -> String {
         "find {root} -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} + 2>/dev/null; \
          chown {uid}:{uid} /run/user/{uid} 2>/dev/null || true",
         root = RUNNER_ROOT,
+    )
+}
+
+/// Restore the file capability a container-image dump loses: `ping`.
+///
+/// A hosted runner's `/usr/bin/ping` is capability-based (`cap_net_raw+ep`),
+/// not setuid, and the OCI layer the golden is built from carries no extended
+/// attributes, so every preloop guest answers `ping: socket: Operation not
+/// permitted` as `runner` while the same command works on GitHub. The other way
+/// to allow it is the `net.ipv4.ping_group_range` sysctl, but the image
+/// deliberately leaves that at `1 0` (no group) exactly as hosted does, so the
+/// capability is the hosted-parity fix.
+///
+/// `setcap` is preferred and `getcap` re-reads what landed; a guest without
+/// `setcap` (a custom base) falls back to the setuid bit the `iputils-ping`
+/// package itself installs. Best-effort throughout: a bake is not worth
+/// failing over a diagnostic tool, and a step that cannot land says so on
+/// stderr, which the engine logs. Idempotent — `setcap`/`chmod` set the same
+/// state on every run. No `#` comments in the text: the contract's statements
+/// are joined into one physical line.
+pub fn golden_ping_capability_script(ping: &str) -> String {
+    let ping = shell_quote(ping);
+    format!(
+        "if [ -e {ping} ]; then \
+           ok=0; \
+           if command -v setcap >/dev/null 2>&1; then \
+             setcap cap_net_raw+ep {ping} 2>/dev/null; \
+             if command -v getcap >/dev/null 2>&1; then \
+               [ -n \"$(getcap {ping} 2>/dev/null)\" ] && ok=1; \
+             else ok=1; fi; \
+           fi; \
+           if [ \"$ok\" != 1 ]; then chmod u+s {ping} 2>/dev/null && ok=1; fi; \
+           if [ \"$ok\" = 1 ]; then echo 'preloop: restored cap_net_raw+ep on {ping}'; \
+           else echo 'preloop: warning: could not make {ping} usable by the runner account' >&2; fi; \
+         fi"
+    )
+}
+
+/// Strip the bake host's own mapping out of `/etc/hosts`.
+///
+/// The runner image is dumped from a machine that was itself a runner, so its
+/// `/etc/hosts` carries that host's mapping — measured on both bakes as
+/// `10.1.0.59 runnervm…internal.cloudapp.net` — and every fork inherits it: a
+/// name that resolves to an address which is not this machine's, the same
+/// stale-mapping class [`guest_hostname_script`] repairs at run time. Cleaning
+/// it in the bake means no fork ever carries it.
+///
+/// The rule is conservative, and deliberately so: a line survives when its
+/// address is loopback, link-local, multicast or unspecified — the standard
+/// `localhost`/`ip6-localhost`/`ip6-allnodes` block must never be touched — and
+/// when any of its names is this machine's own hostname. Only a routable
+/// address naming something else (the bake host's own mapping) is dropped.
+/// Idempotent: a cleaned file has nothing left to drop, and best-effort — a
+/// bake is not worth failing over it, and a guest whose `/etc/hosts` cannot be
+/// written fails provisioning later, loudly, in [`guest_hostname_script`].
+/// `hosts` is the file the shell test substitutes for `/etc/hosts`.
+fn golden_hosts_cleanup_script_at(hosts: &str) -> String {
+    let hosts = shell_quote(hosts);
+    format!(
+        "host=$(hostname 2>/dev/null || uname -n); \
+         tmp=$(mktemp 2>/dev/null) || tmp=/tmp/.preloop-hosts-clean.$$; \
+         if awk -v host=\"$host\" ' \
+           /^[[:space:]]*$/ {{ print; next }} \
+           /^[[:space:]]*#/ {{ print; next }} \
+           {{ \
+             addr = $1; keep = 0; \
+             if (addr ~ /^127\\./) keep = 1; \
+             else if (addr == \"::1\" || addr == \"::\" || addr == \"0.0.0.0\") keep = 1; \
+             else if (addr ~ /^169\\.254\\./) keep = 1; \
+             else if (addr ~ /^22[4-9]\\./ || addr ~ /^23[0-9]\\./) keep = 1; \
+             else if (addr ~ /^[fF][eE]/ || addr ~ /^[fF][fF]/) keep = 1; \
+             if (!keep) for (i = 2; i <= NF; i++) if ($i == host) {{ keep = 1; break }}; \
+             if (keep) print; \
+           }}' {hosts} > \"$tmp\" 2>/dev/null; then \
+           if [ -s \"$tmp\" ]; then \
+             cat \"$tmp\" > {hosts} || \
+               echo 'preloop: warning: could not drop the bake host mapping from {hosts}' >&2; \
+           fi; \
+         else echo 'preloop: warning: could not read {hosts} for cleaning' >&2; fi; \
+         rm -f \"$tmp\""
+    )
+}
+
+/// [`golden_hosts_cleanup_script_at`] against the guest's real `/etc/hosts`.
+fn golden_hosts_cleanup_script() -> String {
+    golden_hosts_cleanup_script_at("/etc/hosts")
+}
+
+/// Drop `/etc/fstab` entries whose device this guest does not have.
+///
+/// The runner image is a dump of an Azure VM, so its `/etc/fstab` still names
+/// that VM's disks: the root filesystem by UUID (`UUID=4fb3…`), the EFI system
+/// partition, and the cloud resource disk
+/// (`/dev/disk/cloud/azure_resource-part1`, often carrying swap). None of them
+/// exists on a SmolVM guest, whose root is the storage disk the agent mounts
+/// before systemd starts, so `systemd-remount-fs.service` fails with
+/// `can't find UUID=…` on every boot and leaves `systemctl --failed`
+/// permanently non-empty.
+///
+/// The rule is deliberately narrow: an entry is commented out only when its
+/// device spec cannot resolve on this guest — a `UUID=`/`LABEL=`/`PARTUUID=`/
+/// `PARTLABEL=` with no `/dev/disk/by-*` entry, a `/dev/…` path with no node,
+/// any `/dev/disk/cloud/…` path (cloud udev, never this guest's), or an
+/// absolute path with no file. Everything else survives untouched:
+/// pseudo-filesystems (`tmpfs`, `proc`, `none`, …), a valid UUID, and any mount
+/// the image really has. Commented lines keep their original text behind
+/// `# preloop: dropped stale fstab entry: ` so nothing is lost, and a second
+/// bake finds nothing left to drop.
+///
+/// Best-effort like the other image-residue steps: a read-only, absent or
+/// unreadable `/etc/fstab` warns on stderr and leaves the bake alone. `fstab`
+/// and `disk` are the file and the `/dev` tree the shell test substitutes.
+fn golden_fstab_cleanup_script_at(fstab: &str, disk: &str) -> String {
+    format!(
+        "prfs_fstab={fstab}; prfs_disk={disk}; \
+         if [ -f \"$prfs_fstab\" ] && [ -r \"$prfs_fstab\" ] && [ -w \"$prfs_fstab\" ]; then \
+           prfs_tmp=$prfs_fstab.preloop.$$; prfs_dropped=0; prfs_ok=1; \
+           if : > \"$prfs_tmp\" 2>/dev/null; then \
+             while IFS= read -r prfs_line || [ -n \"$prfs_line\" ]; do \
+               prfs_dev=$(printf '%s\\n' \"$prfs_line\" | awk '{{ print $1 }}' 2>/dev/null); \
+               prfs_drop=0; \
+               case \"$prfs_dev\" in \
+                 /dev/disk/cloud/*) prfs_drop=1 ;; \
+                 /dev/*) [ -e \"$prfs_disk/${{prfs_dev#/dev/}}\" ] || prfs_drop=1 ;; \
+                 UUID=*) [ -e \"$prfs_disk/disk/by-uuid/${{prfs_dev#UUID=}}\" ] || prfs_drop=1 ;; \
+                 LABEL=*) [ -e \"$prfs_disk/disk/by-label/${{prfs_dev#LABEL=}}\" ] || prfs_drop=1 ;; \
+                 PARTUUID=*) [ -e \"$prfs_disk/disk/by-partuuid/${{prfs_dev#PARTUUID=}}\" ] || prfs_drop=1 ;; \
+                 PARTLABEL=*) [ -e \"$prfs_disk/disk/by-partlabel/${{prfs_dev#PARTLABEL=}}\" ] || prfs_drop=1 ;; \
+                 /*) [ -e \"$prfs_dev\" ] || prfs_drop=1 ;; \
+               esac; \
+               if [ \"$prfs_drop\" = 1 ]; then \
+                 prfs_dropped=$((prfs_dropped+1)); \
+                 printf '# preloop: dropped stale fstab entry: %s\\n' \"$prfs_line\" >> \"$prfs_tmp\" 2>/dev/null || prfs_ok=0; \
+               else \
+                 printf '%s\\n' \"$prfs_line\" >> \"$prfs_tmp\" 2>/dev/null || prfs_ok=0; \
+               fi; \
+             done < \"$prfs_fstab\"; \
+             if [ \"$prfs_ok\" = 1 ] && [ \"$prfs_dropped\" -gt 0 ]; then \
+               if cat \"$prfs_tmp\" > \"$prfs_fstab\" 2>/dev/null; then \
+                 echo \"preloop: commented out $prfs_dropped stale $prfs_fstab entries\"; \
+               else \
+                 echo \"preloop: warning: could not write $prfs_fstab; stale entries may fail at boot\" >&2; \
+               fi; \
+             elif [ \"$prfs_ok\" = 1 ]; then \
+               echo \"preloop: $prfs_fstab has no stale entries\"; \
+             else \
+               echo \"preloop: warning: could not stage $prfs_fstab; stale entries may fail at boot\" >&2; \
+             fi; \
+             rm -f \"$prfs_tmp\" 2>/dev/null; \
+           else \
+             echo \"preloop: warning: could not stage $prfs_fstab for cleaning\" >&2; \
+           fi; \
+         else \
+           echo \"preloop: no writable $prfs_fstab on this guest; nothing to clean\" >&2; \
+         fi"
+    )
+}
+
+/// [`golden_fstab_cleanup_script_at`] against the guest's real `/etc/fstab`.
+fn golden_fstab_cleanup_script() -> String {
+    golden_fstab_cleanup_script_at("/etc/fstab", "/dev")
+}
+
+/// The units a hosted runner never runs, and a preloop guest should not either.
+///
+/// Provenance: every Azure/Hyper-V/cloud-init/snap/apt-timer unit in the current
+/// golden's enabled set (`smolvm-probe.txt`, §systemd), plus
+/// `systemd-sysctl.service`, which fails on the SmolVM kernel
+/// (`kernel/pid_max: Invalid argument`, `yama/ptrace_scope` ENOENT). Masking
+/// them leaves `systemctl --failed` empty and `is-system-running` `running` on a
+/// guest that boots systemd; units an image does not ship are skipped, so the
+/// list is safe on a custom base.
+const SYSTEMD_MASKED_UNITS: &[&str] = &[
+    "walinuxagent.service",
+    "cloud-init.service",
+    "cloud-init-local.service",
+    "cloud-config.service",
+    "cloud-final.service",
+    "snapd.service",
+    "snapd.socket",
+    "snapd.seeded.service",
+    "snapd.apparmor.service",
+    "snapd.autoimport.service",
+    "snapd.core-fixup.service",
+    "snapd.recovery-chooser-trigger.service",
+    "snapd.system-shutdown.service",
+    "unattended-upgrades.service",
+    "apt-daily.service",
+    "apt-daily-upgrade.service",
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+    "systemd-sysctl.service",
+    "hv-kvp-daemon.service",
+    "hv-vss-daemon.service",
+    "hv-fcopy-daemon.service",
+    "ModemManager.service",
+    "multipathd.service",
+    "multipathd.socket",
+    "apport-autoreport.path",
+    "ubuntu-advantage.service",
+    "ua-reboot-cmds.service",
+    "systemd-networkd-wait-online.service",
+    "systemd-networkd.service",
+    "networkd-dispatcher.service",
+    "getty@.service",
+    "e2scrub_reap.service",
+];
+
+/// The bake-time systemd preparation a guest that boots systemd needs, and that
+/// the per-machine init cannot do.
+///
+/// Three things the hosted image has and a guest that boots systemd does not:
+///
+/// * **resolved's upstream.** Nothing feeds systemd-resolved its DNS on a
+///   preloop guest — the interface has no DHCP or networkd provider and
+///   `resolved` runs in `foreign` mode — so it takes the upstream from
+///   `/etc/resolv.conf` alone. Naming the stub there without also giving
+///   resolved an upstream leaves it with none, which breaks external DNS for the
+///   whole guest while `/etc/hosts` names keep working (measured: `curl
+///   https://github.com` → `Could not resolve host`). `DNS=` in
+///   `resolved.conf` makes the upstream explicit and survives a rewrite of
+///   `/etc/resolv.conf`; the value is the first nameserver the image carries,
+///   and `1.1.1.1` when there is none or it is loopback (an image whose
+///   resolver is itself the stub cannot supply one). A `DNS=` the image or the
+///   operator already set is never touched.
+/// * **`/etc/resolv.conf` naming the stub**, as a regular file. This is the
+///   golden half of [`guest_resolver_stub_script`]: it runs whether or not
+///   systemd is *running* (the SmolVM builder has no systemd PID 1, and a
+///   "resolved is active" gate would skip exactly there), so the gate is the
+///   binaries existing. The runtime half re-applies after the SmolVM agent
+///   rewrites the file at every start, and keeps the upstream line.
+/// * **the unit masks** ([`SYSTEMD_MASKED_UNITS`]): Azure/Hyper-V/cloud-init/
+///   snapd/apt-timer units the hosted image does not run, plus the one that
+///   fails on the SmolVM kernel. `systemctl mask` when a running systemd answers
+///   (which also covers a guest whose `systemctl` writes the same
+///   `/dev/null` symlink), the symlink directly otherwise — the builder case,
+///   verified identical to what `systemctl mask` creates.
+///
+/// Best-effort and idempotent throughout: every failure warns on stderr (the
+/// engine logs it) instead of failing the bake, a second run appends nothing,
+/// rewrites nothing and re-masks nothing, and an image without systemd is left
+/// exactly as it is.
+pub fn golden_systemd_parity_script() -> String {
+    golden_systemd_parity_script_at(
+        &["/lib/systemd/systemd", "/usr/lib/systemd/systemd"],
+        "/etc",
+        &["/lib/systemd/system", "/usr/lib/systemd/system"],
+        SYSTEMD_MASKED_UNITS,
+    )
+}
+
+/// The scratch paths and unit list the shell test substitutes; production passes
+/// the paths above and [`SYSTEMD_MASKED_UNITS`].
+fn golden_systemd_parity_script_at(
+    systemd_bins: &[&str],
+    etc: &str,
+    unit_dirs: &[&str],
+    units: &[&str],
+) -> String {
+    let gate = systemd_bins
+        .iter()
+        .map(|path| format!("[ -x {} ]", shell_quote(path)))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    let unit_dirs = unit_dirs
+        .iter()
+        .map(|dir| shell_quote(dir))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let units = units
+        .iter()
+        .map(|unit| shell_quote(unit))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let etc = shell_quote(etc);
+    format!(
+        "prsys_etc={etc}; \
+         if {gate}; then \
+           prsys_ns=$(awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2; exit }}' \"$prsys_etc/resolv.conf\" 2>/dev/null); \
+           case \"$prsys_ns\" in ''|127.*|::1|0.0.0.0|::) prsys_ns=1.1.1.1 ;; esac; \
+           if [ -e \"$prsys_etc/systemd/resolved.conf\" ] || [ -d \"$prsys_etc/systemd\" ]; then \
+             if grep -q '^[[:space:]]*DNS=' \"$prsys_etc/systemd/resolved.conf\" 2>/dev/null; then \
+               echo \"preloop: $prsys_etc/systemd/resolved.conf already sets DNS=; leaving it alone\" >&2; \
+             else \
+               mkdir -p \"$prsys_etc/systemd\" 2>/dev/null || true; \
+               if printf 'DNS=%s\\n' \"$prsys_ns\" >> \"$prsys_etc/systemd/resolved.conf\" 2>/dev/null; then \
+                 echo \"preloop: set the systemd-resolved upstream to $prsys_ns\"; \
+               else \
+                 echo \"preloop: warning: could not set DNS= in $prsys_etc/systemd/resolved.conf\" >&2; \
+               fi; \
+             fi; \
+           fi; \
+           prsys_upstream_ns=$prsys_ns; \
+           if [ -e \"$prsys_etc/systemd/resolved.conf\" ]; then \
+             prsys_dns=$(awk -F= '/^[[:space:]]*DNS=/{{print $2; exit}}' \"$prsys_etc/systemd/resolved.conf\" 2>/dev/null); \
+             prsys_dns_first=$(printf '%s' \"$prsys_dns\" | awk '{{print $1}}'); \
+             if [ -n \"$prsys_dns_first\" ]; then prsys_upstream_ns=$prsys_dns_first; fi; \
+           fi; \
+           prsys_has_stub=0; prsys_has_upstream=0; \
+           if [ ! -L \"$prsys_etc/resolv.conf\" ]; then \
+             if grep -Fqx 'nameserver 127.0.0.53' \"$prsys_etc/resolv.conf\" 2>/dev/null; then prsys_has_stub=1; fi; \
+             if grep -Fqx \"nameserver $prsys_upstream_ns\" \"$prsys_etc/resolv.conf\" 2>/dev/null; then prsys_has_upstream=1; fi; \
+           fi; \
+           if [ \"$prsys_has_stub\" = 1 ] && [ \"$prsys_has_upstream\" = 1 ]; then \
+             echo \"preloop: $prsys_etc/resolv.conf already names the 127.0.0.53 stub resolver and its upstream\"; \
+           else \
+             prsys_tmp=$prsys_etc/resolv.conf.preloop.$$; \
+             if printf 'nameserver 127.0.0.53\\nnameserver %s\\noptions edns0 trust-ad\\n' \"$prsys_upstream_ns\" > \"$prsys_tmp\" 2>/dev/null; then \
+               chmod 0644 \"$prsys_tmp\" 2>/dev/null; \
+               if mv -f \"$prsys_tmp\" \"$prsys_etc/resolv.conf\" 2>/dev/null; then \
+                 echo \"preloop: pointed $prsys_etc/resolv.conf at the 127.0.0.53 stub resolver with $prsys_upstream_ns as its upstream\"; \
+               else \
+                 rm -f \"$prsys_tmp\" 2>/dev/null; \
+                 echo \"preloop: warning: could not write $prsys_etc/resolv.conf\" >&2; \
+               fi; \
+             else \
+               rm -f \"$prsys_tmp\" 2>/dev/null; \
+               echo \"preloop: warning: could not stage $prsys_etc/resolv.conf\" >&2; \
+             fi; \
+           fi; \
+           prsys_masked=0; prsys_absent=0; \
+           for prsys_unit in {units}; do \
+             prsys_shipped=0; \
+             for prsys_dir in {unit_dirs}; do \
+               if [ -e \"$prsys_dir/$prsys_unit\" ]; then prsys_shipped=1; fi; \
+             done; \
+             if [ \"$prsys_shipped\" != 1 ]; then prsys_absent=$((prsys_absent + 1)); continue; fi; \
+             if command -v systemctl >/dev/null 2>&1 && systemctl mask \"$prsys_unit\" >/dev/null 2>&1; then \
+               prsys_masked=$((prsys_masked + 1)); \
+             else \
+               mkdir -p \"$prsys_etc/systemd/system\" 2>/dev/null || true; \
+               if ln -sf /dev/null \"$prsys_etc/systemd/system/$prsys_unit\" 2>/dev/null; then \
+                 prsys_masked=$((prsys_masked + 1)); \
+               else \
+                 echo \"preloop: warning: could not mask $prsys_unit\" >&2; \
+               fi; \
+             fi; \
+           done; \
+           echo \"preloop: masked $prsys_masked systemd units ($prsys_absent not shipped by this image)\"; \
+         else \
+           echo 'preloop: this image has no systemd; skipping the systemd parity preparation' >&2; \
+         fi"
     )
 }
 
@@ -2470,6 +2812,149 @@ fn guest_hostname_script_at(hosts: &str) -> String {
     )
 }
 
+/// Point the guest's `/etc/resolv.conf` at the systemd-resolved stub.
+///
+/// A GitHub-hosted runner's container resolves a `/etc/hosts`-only name — a
+/// compose service alias such as `postgres.localhost` — because Docker reads
+/// the *host file* and gives its embedded DNS server `ExtServers:
+/// [host(127.0.0.53)]`: measured on hosted `ubuntu-24.04`, whose
+/// `/etc/resolv.conf` is the stub. A preloop guest that names its own resolver
+/// instead (`75.75.75.75` on AgentENV, `100.96.0.1` on SmolVM) hands its
+/// containers `ExtServers: [host(75.75.75.75)]` and the name comes back
+/// NXDOMAIN, while every external name still resolves.
+///
+/// The *file* is what has to name the stub, never a `daemon.json` `dns` entry:
+/// a `dns` pin reaches the container as `ExtServers: [127.0.0.53]` with
+/// `Overrides: [nameservers]`, and the address is then the container's own
+/// loopback, so every lookup inside it fails. Through the host file Docker
+/// keeps the `host(...)` wrapper and queries the stub from the host namespace,
+/// which is why the hosted shape works.
+///
+/// A regular file, not a symlink: the SmolVM agent's per-start overlay refresh
+/// rejects a symlinked `/etc/resolv.conf` and the machine then refuses to start
+/// (measured), and a symlink to the stub is the upstream-less shape above on
+/// AgentENV. Replaced by rename in the same directory — `mv` swaps the link
+/// itself, so a symlinked file never clobbers the file it points at — and no
+/// reader ever sees a half-written resolver file.
+///
+/// The guest's own resolver is *kept*, as a second `nameserver` line. On
+/// AgentENV nothing feeds systemd-resolved its upstreams — the interface has no
+/// DHCP or networkd provider and `resolved` runs in `foreign` mode — so it
+/// takes them from `/etc/resolv.conf` alone: a file naming only the stub makes
+/// resolved drop that address as itself and leaves it with no upstream at all,
+/// which breaks external DNS for the whole guest (`curl https://github.com` →
+/// `Could not resolve host`) while `/etc/hosts` names keep working, so a
+/// hosts-only probe looks healthy. Measured shape that works end to end:
+/// `nameserver 127.0.0.53`, the original nameserver, `options edns0 trust-ad`
+/// — the container then reads `ExtServers: [host(127.0.0.53) host(75.75.75.75)]`
+/// and resolves both kinds of name. The upstreams are read from the file and
+/// from resolved's own `/run/systemd/resolve/resolv.conf` *before* the file is
+/// replaced, so an image that keeps them there (or in `resolved.conf.d`) is
+/// covered too.
+///
+/// Applied in the golden — an AgentENV restore keeps the baked file, so the
+/// daemon the guest's systemd starts at boot reads it — and per machine. The
+/// per-machine application runs twice: in the runtime init, and in every runner
+/// launch ([`as_runner_user`]). The SmolVM agent re-points a persistent
+/// container's file at the gateway before each *interactive* run's command
+/// starts, and the runner launch is one (`machine exec --stream`), so a stub
+/// the init wrote is already gone when the job's first command runs.
+///
+/// The runtime half waits, bounded, for the stub to exist ([`RESOLVER_STUB_WAIT_ATTEMPTS`]):
+/// the SmolVM agent writes the gateway resolver during its own network setup
+/// and only then execs the golden's `/sbin/init`, so provisioning's exec can
+/// arrive while systemd is still starting and `/run/systemd/resolve/stub-resolv.conf`
+/// does not exist yet. A one-shot check took the "no stub" branch there and
+/// never ran again, which left Docker reading the gateway as its `ExtServers`
+/// and made a compose `/etc/hosts` alias such as `postgres.localhost` NXDOMAIN
+/// for every job on the machine (`db_migrate` on the 1.30.1 template run).
+/// A guest that genuinely has no resolved stub — no systemd and no
+/// `resolvectl` — is checked once and left alone, with the reason on stderr;
+/// the wait never runs on it.
+pub fn guest_resolver_stub_script() -> String {
+    guest_resolver_stub_script_at(
+        "/etc/resolv.conf",
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/run/systemd/resolve/resolv.conf",
+        RESOLVER_STUB_WAIT_ATTEMPTS,
+        RESOLVER_STUB_WAIT_INTERVAL,
+    )
+}
+
+/// How many checks the runtime resolver step makes while systemd-resolved
+/// comes up, and how long each one waits.
+///
+/// Thirty seconds covers a fork that resumes with systemd just starting on a
+/// loaded host — the stub had not appeared after six seconds on a measured
+/// 1.30.1 run, and the machine then kept the gateway resolver. Only paid when
+/// the stub is missing at the first check and the guest ships `resolvectl` —
+/// the same package as `systemd-resolved`, so a guest with no resolved is not
+/// waited on. The bake's builder (the smolvm agent as PID 1, no systemd) pays
+/// it once per bake, and the golden's own [`golden_systemd_parity_script`] has
+/// already named the stub there.
+const RESOLVER_STUB_WAIT_ATTEMPTS: u32 = 60;
+const RESOLVER_STUB_WAIT_INTERVAL: &str = "0.5";
+
+/// `resolv_conf`, `stub` and `upstream_file` are the scratch paths the shell
+/// tests substitute for `/etc/resolv.conf`, the stub's own file and resolved's
+/// upstream list; `wait_attempts` and `wait_interval` are the runtime wait
+/// ([`RESOLVER_STUB_WAIT_ATTEMPTS`], [`RESOLVER_STUB_WAIT_INTERVAL`], shortened
+/// by the tests). No `#` comments in the text: the golden contract's statements
+/// are joined into one physical line.
+fn guest_resolver_stub_script_at(
+    resolv_conf: &str,
+    stub: &str,
+    upstream_file: &str,
+    wait_attempts: u32,
+    wait_interval: &str,
+) -> String {
+    format!(
+        "prs_conf={conf}; prs_stub={stub}; prs_upstream_file={upstream_file}; \
+         prs_tries=0; \
+         while [ ! -e \"$prs_stub\" ] && [ \"$prs_tries\" -lt {attempts} ] \
+           && command -v resolvectl >/dev/null 2>&1; do \
+           sleep {interval} 2>/dev/null || true; \
+           prs_tries=$((prs_tries+1)); \
+         done; \
+         if [ -e \"$prs_stub\" ] || {{ command -v resolvectl >/dev/null 2>&1 && resolvectl status >/dev/null 2>&1; }}; then \
+           prs_upstreams=$(cat \"$prs_conf\" \"$prs_upstream_file\" 2>/dev/null \
+             | awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2 }}' \
+             | grep -v '^127\\.0\\.0\\.53$' | grep -v '^::1$' | grep -v '^0\\.0\\.0\\.0$' | grep -v '^::$' \
+             | awk '!seen[$0]++'); \
+           prs_first=$(awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2; exit }}' \"$prs_conf\" 2>/dev/null); \
+           prs_missing=0; \
+           for prs_ns in $prs_upstreams; do grep -qx \"nameserver $prs_ns\" \"$prs_conf\" 2>/dev/null || prs_missing=1; done; \
+           if [ \"$prs_first\" = 127.0.0.53 ] && [ \"$prs_missing\" = 0 ]; then \
+             echo \"preloop: $prs_conf already names the 127.0.0.53 stub resolver first\"; \
+           else \
+             prs_tmp=$prs_conf.preloop.$$; \
+             prs_ok=0; \
+             if printf 'nameserver 127.0.0.53\\n' > \"$prs_tmp\" 2>/dev/null; then \
+               prs_ok=1; \
+               for prs_ns in $prs_upstreams; do printf 'nameserver %s\\n' \"$prs_ns\" >> \"$prs_tmp\" 2>/dev/null || prs_ok=0; done; \
+               printf 'options edns0 trust-ad\\n' >> \"$prs_tmp\" 2>/dev/null || prs_ok=0; \
+               chmod 0644 \"$prs_tmp\" 2>/dev/null; \
+             fi; \
+             if [ \"$prs_ok\" = 1 ] && mv -f \"$prs_tmp\" \"$prs_conf\" 2>/dev/null; then \
+               echo \"preloop: pointed $prs_conf at the 127.0.0.53 stub resolver\"; \
+             else \
+               rm -f \"$prs_tmp\" 2>/dev/null; \
+               echo \"preloop: warning: could not write $prs_conf; containers follow the guest resolver\" >&2; \
+             fi; \
+           fi; \
+         else \
+           prs_systemd=no; if [ -e /run/systemd/system ]; then prs_systemd=yes; fi; \
+           prs_resolvectl=no; if command -v resolvectl >/dev/null 2>&1; then prs_resolvectl=yes; fi; \
+           echo \"preloop: no resolved stub resolver on this guest; leaving $prs_conf alone (waited $prs_tries of {attempts} checks; systemd=$prs_systemd resolvectl=$prs_resolvectl)\" >&2; \
+         fi",
+        conf = shell_quote(resolv_conf),
+        stub = shell_quote(stub),
+        upstream_file = shell_quote(upstream_file),
+        attempts = wait_attempts,
+        interval = shell_quote(wait_interval),
+    )
+}
+
 /// The per-guest **hosted runtime init**: what the hosted image's own init
 /// applies to a job's environment, applied by preloop instead.
 ///
@@ -2480,8 +2965,8 @@ fn guest_hostname_script_at(hosts: &str) -> String {
 /// `/run/smolvm/init`, with no systemd at all, and an AgentENV job arrives via
 /// `aenv exec` off `envd`, outside systemd and PAM. The golden carries
 /// GitHub's files, but nothing ever applies them. This is the per-guest half
-/// of that gap — the kernel values and the machine's own name, applied once on
-/// the post-boot exec path, before the runner registers.
+/// of that gap — the kernel values, the machine's own name and the resolver
+/// file, applied once on the post-boot exec path, before the runner registers.
 ///
 /// The other half cannot live here: process limits are per process, so the
 /// pair a step and a container inherit is applied where the workload is
@@ -2489,24 +2974,49 @@ fn guest_hostname_script_at(hosts: &str) -> String {
 /// re-raise of an engine chain inherited from a golden).
 ///
 /// Each half runs in its own subshell so its early `exit 0` ("already at the
-/// hosted values") cannot skip the other, and `set -e` turns either half's
+/// hosted values") cannot skip the others, and `set -e` turns either half's
 /// failure into a provisioning failure rather than leaving the machine half
 /// converted. Hostname resolution runs first because the sysctl half escalates
 /// through passwordless sudo, and sudo resolves its hostname on every
 /// invocation: with a stale mapping it would print
 /// `sudo: unable to resolve host` into the apply's stderr before the name is
-/// fixed.
+/// fixed. The resolver half runs last: it is the only one that has to run
+/// *after* the guest agent settled the network, and it waits (bounded) for the
+/// booted systemd to publish `/run/systemd/resolve/stub-resolv.conf` — the
+/// agent execs `/sbin/init` and this exec can reach the guest before resolved
+/// starts, which is the race that left the gateway resolver in place.
 pub fn guest_hosted_runtime_init_script() -> String {
-    hosted_runtime_init_script_at("/etc/hosts", "/proc/sys")
+    hosted_runtime_init_script_at(
+        "/etc/hosts",
+        "/proc/sys",
+        "/etc/resolv.conf",
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/run/systemd/resolve/resolv.conf",
+    )
 }
 
-/// `hosts` and `sysctl_root` are the scratch paths the shell tests substitute
-/// for `/etc/hosts` and `/proc/sys`; production passes those.
-fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
+/// `hosts`, `sysctl_root`, `resolv_conf`, `stub` and `upstream_file` are the
+/// scratch paths the shell tests substitute for `/etc/hosts`, `/proc/sys`,
+/// `/etc/resolv.conf`, the stub's own file and resolved's upstream list;
+/// production passes those.
+fn hosted_runtime_init_script_at(
+    hosts: &str,
+    sysctl_root: &str,
+    resolv_conf: &str,
+    stub: &str,
+    upstream_file: &str,
+) -> String {
     format!(
-        "set -e; ( {} ); ( {} )",
+        "set -e; ( {} ); ( {} ); ( {} )",
         guest_hostname_script_at(hosts),
-        guest_sysctl_script_at(sysctl_root)
+        guest_sysctl_script_at(sysctl_root),
+        guest_resolver_stub_script_at(
+            resolv_conf,
+            stub,
+            upstream_file,
+            RESOLVER_STUB_WAIT_ATTEMPTS,
+            RESOLVER_STUB_WAIT_INTERVAL,
+        )
     )
 }
 
@@ -2534,13 +3044,19 @@ pub fn golden_glibc_check_script() -> &'static str {
 /// exactly as it is, and this is everything Preloop adds.
 ///
 /// GitHub-runner machinery only — the account jobs run as (with its home,
-/// `_work` and passwordless sudo), the ownership of the paths they write, the
+/// `work` and passwordless sudo), the ownership of the paths they write, the
 /// writable tool cache with `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in
-/// `/etc/environment`, the glibc requirement above, and the image's apt package
-/// indices ([`golden_apt_lists_script`]). No packages, no
-/// toolchains, no PATH or environment overrides: on a hosted runner a missing
-/// `bash`, `git` or `docker` fails the step that needs it, and the same is true
-/// here.
+/// `/etc/environment`, the glibc requirement above, the image's apt package
+/// indices ([`golden_apt_lists_script`]), and the pieces of bake-host residue a
+/// container-image dump carries — `ping`'s file capability
+/// ([`golden_ping_capability_script`]), the bake host's own `/etc/hosts`
+/// mapping ([`golden_hosts_cleanup_script`]) and the Azure disks its
+/// `/etc/fstab` still names ([`golden_fstab_cleanup_script`]). It also
+/// prepares a systemd guest ([`golden_systemd_parity_script`]) and points the
+/// resolver file at the resolved stub ([`guest_resolver_stub_script`]). No
+/// packages, no toolchains, no PATH or environment overrides: on a hosted
+/// runner a missing `bash`, `git` or `docker` fails the step that needs it, and
+/// the same is true here.
 ///
 /// The text is also the fingerprint input for configured images (see
 /// `EnvironmentSpec::from_base`), so editing a step rebuilds every golden baked
@@ -2563,6 +3079,26 @@ pub fn golden_contract_steps(user: &str, uid: u32) -> Vec<String> {
         steps.push(golden_ownership_script(uid));
     }
     steps.push(golden_apt_lists_script());
+    // The bake host's own `/etc/hosts` mapping is dropped here, the image's
+    // Azure `/etc/fstab` entries are commented out, and `ping`'s capability
+    // restored: all three are image residue that every fork would otherwise
+    // inherit, and all three are cheaper to fix once per golden than per
+    // machine. None touches the runner's groups, so they stay ahead of the
+    // membership step below.
+    steps.push(golden_hosts_cleanup_script());
+    steps.push(golden_fstab_cleanup_script());
+    steps.push(golden_ping_capability_script("/usr/bin/ping"));
+    // The systemd preparation is bake-time only: it is gated on the systemd
+    // binaries rather than on a running systemd, because the SmolVM builder has
+    // no systemd PID 1 and would skip a "resolved is active" gate.
+    steps.push(golden_systemd_parity_script());
+    // The resolver file has to name the resolved stub before the container
+    // engine reads it: Docker hands a container the *host file's* nameservers,
+    // so a guest naming its own resolver gives a compose network NXDOMAIN for
+    // `/etc/hosts`-only aliases. Baked here as well as per machine — an AgentENV
+    // restore keeps the baked file, and the daemon the guest's systemd starts
+    // reads it.
+    steps.push(guest_resolver_stub_script());
     if user != "root" {
         // The runner's groups are written last: nothing after this step may
         // change them, so the membership it grants is the one the bake keeps.
@@ -2905,14 +3441,16 @@ pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
 /// sets, with no launcher shell. [`guest_env_prefix`] adds the shell that
 /// sources the image's `/etc/environment` on top of these.
 ///
+/// No `PATH` here: the image's own PATH is the one a hosted step shell gets,
+/// and only the launcher — which has sourced `/etc/environment` by then — can
+/// tell whether the image declared one. [`guest_runner_path`] is the launcher's
+/// fallback, not an entry `env` re-asserts over the image's value.
+///
 /// Control-socket routing and failure-marker debugging are independent
 /// features: a pool can debug failed jobs without a mounted control socket and
 /// vice versa, so neither may gate the other.
 fn guest_env_entries(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
-    let mut env = vec![
-        format!("PATH={}", guest_runner_path(config)),
-        format!("PRELOOP_MACHINE_NAME={}", name.as_str()),
-    ];
+    let mut env = vec![format!("PRELOOP_MACHINE_NAME={}", name.as_str())];
     if config.control_socket.is_some() {
         env.push(format!(
             "PRELOOP_CONTROL_ORIGIN={}",
@@ -2945,26 +3483,54 @@ fn guest_env_entries(config: &RunnerPoolConfig, name: &MachineName) -> Vec<Strin
 /// `sh -c` so the image's `/etc/environment` is sourced first.
 ///
 /// `/etc/environment` is where a Linux image declares the PATH its toolchains
-/// live on, and `smolvm machine exec` starts the process without a login shell
-/// that would read it; a step calling a preinstalled tool would fail command
-/// lookup. Sourcing it *is* the hosted-runner parity fix, and an image without
-/// the file keeps [`guest_runner_path`]'s system default. The pool's own
-/// variables are re-asserted by `env` after the source, so a malformed
-/// `/etc/environment` cannot unset `HOME` or the control routing.
+/// live on *and* the environment its steps expect (`ImageOS`/`ImageVersion`,
+/// `JAVA_HOME*`, `LANG`, `DEBIAN_FRONTEND`, …), and `smolvm machine exec`
+/// starts the process without a login shell that would read it. Sourcing it
+/// with `set -a` is what exports those entries to the child: sourced without
+/// `-a` they stay shell variables and the `exec env` that follows drops them,
+/// which is how a guest job saw ~60 fewer variables than the same job on
+/// GitHub-hosted and every `setup-*` action failed to find its tool cache.
+///
+/// PATH is the launcher's, not an entry `env` re-asserts: the image's PATH is
+/// the one a hosted step shell gets, and a step that cannot find
+/// `/opt/pipx_bin`/`~/.local/bin`/`/usr/local/.ghcup/bin` fails while the tool
+/// is installed. [`guest_runner_path`] therefore applies only when the image
+/// declares no PATH at all. The pool's own variables are still re-asserted by
+/// `env` *after* the source, so a malformed `/etc/environment` cannot unset
+/// the control routing or the machine name.
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
+    guest_env_prefix_at(config, name, "/etc/environment")
+}
+
+/// [`guest_env_prefix`] against a chosen environment file.
+///
+/// Production passes `/etc/environment`; the shell test below passes a scratch
+/// file, so the generated launcher runs end to end without touching the host's
+/// environment, the way [`guest_hostname_script_at`] stands in for `/etc/hosts`.
+fn guest_env_prefix_at(
+    config: &RunnerPoolConfig,
+    name: &MachineName,
+    environment_file: &str,
+) -> Vec<String> {
     let env = guest_env_entries(config, name);
-    // `env` re-asserts every variable above *after* the image's environment is
-    // sourced, so a malformed `/etc/environment` cannot unset `HOME` or the
-    // control routing. It also resolves the program through the PATH the
-    // source may have replaced (a running process keeps the PATH it started
-    // with), which is exactly the heap the image declares.
+    // `env` re-asserts every pool variable *after* the image's environment is
+    // sourced, so a malformed `/etc/environment` cannot unset the control
+    // routing or the machine name. PATH is exported by the launcher instead:
+    // the image's value survives, and the pool's list is only the fallback for
+    // an image that declares none. `PATH=` first, so an environment file
+    // without a PATH falls back instead of inheriting whatever the exec
+    // channel happened to hand the shell.
     let pairs = env
         .iter()
         .map(|entry| shell_quote(entry))
         .collect::<Vec<_>>()
         .join(" ");
+    let environment_file = shell_quote(environment_file);
+    let fallback = shell_quote(&guest_runner_path(config));
     let launcher = format!(
-        "if [ -r /etc/environment ]; then . /etc/environment; fi; \
+        "PATH=; if [ -r {environment_file} ]; then set -a; . {environment_file}; set +a; fi; \
+         [ -n \"$PATH\" ] || PATH={fallback}; \
+         export PATH; \
          exec /usr/bin/env {pairs} \"$0\" \"$@\""
     );
     let mut argv = vec!["sh".to_owned(), "-c".to_owned(), launcher];
@@ -3885,6 +4451,8 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
             .collect(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        guest_volumes: Vec::new(),
+        workload_init: None,
     };
     let unpacked: Result<(), OrchestratorError> = async {
         // Serialize the headroom check against the write that consumes it:
@@ -4054,6 +4622,8 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
             .collect(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        guest_volumes: Vec::new(),
+        workload_init: None,
     };
     provider.create(&spec).await?;
     provider.start(golden).await?;
@@ -4245,6 +4815,8 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         sockets: Vec::new(),
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        guest_volumes: Vec::new(),
+        workload_init: None,
     };
     provider.create(&spec).await?;
     provider.start(&name).await?;
@@ -6961,6 +7533,8 @@ async fn provision_runner<P: VmProvider + 'static>(
                 .collect(),
             dns: config.dns.clone(),
             rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
@@ -7011,6 +7585,15 @@ async fn provision_runner<P: VmProvider + 'static>(
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
+        }
+        // Each half reports what it did (or why it skipped) on stderr and exits
+        // 0 either way, so a no-op is only observable if it is logged.
+        for line in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .chain(String::from_utf8_lossy(&output.stderr).lines())
+            .filter(|line| !line.trim().is_empty())
+        {
+            info!(machine = name.as_str(), "hosted runtime init: {line}");
         }
     }
 
@@ -7170,13 +7753,15 @@ async fn provision_runner<P: VmProvider + 'static>(
     Ok(as_runner_user(config, &run))
 }
 
-/// Wrap a guest argv so it launches on the hosted process limits without
-/// switching accounts.
+/// Wrap a guest argv with the launch prelude for a launch that keeps its
+/// identity: the resolver step ([`guest_resolver_stub_script`]), then the hosted
+/// limits. The account branch of [`as_runner_user`] runs the same resolver step
+/// inside its root-only provisioning; this is its root branch.
 ///
 /// The `runner_user`-less and `runner_user: root` launches keep their identity
 /// (the exec channel's user — root, or the image's own `USER`); only the
-/// limits are added. The wrapped argv travels as the shell's positional
-/// parameters (`sh -c '<raise>; exec "$@"' sh <argv…>`), so nothing is
+/// prelude is added. The wrapped argv travels as the shell's positional
+/// parameters (`sh -c '<prelude>; exec "$@"' sh <argv…>`), so nothing is
 /// re-quoted and the launch stays byte-identical after the wrapper: a
 /// mis-quoted argument cannot corrupt a step command, and the exec records
 /// the pool's tests read still carry the original argv.
@@ -7184,12 +7769,17 @@ async fn provision_runner<P: VmProvider + 'static>(
 /// Neither half can assume root here: raising a hard limit needs it, so the
 /// launch keeps whatever it inherited — with a line on stderr saying which
 /// limit stayed — rather than failing ([`GUEST_STACK_ULIMIT_BEST_EFFORT`],
-/// [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`]). A root exec reaches the hosted pairs.
-fn with_guest_hosted_limits(argv: &[String]) -> Vec<String> {
+/// [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`]). The resolver step has the same shape:
+/// a non-root exec cannot write `/etc/resolv.conf` and says so on stderr. A root
+/// exec reaches the hosted pairs and the stub.
+fn with_guest_launch_prelude(argv: &[String]) -> Vec<String> {
     let mut wrapped = vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!("{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""),
+        format!(
+            "{resolver}; {GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\"",
+            resolver = guest_resolver_stub_script(),
+        ),
         "sh".to_owned(),
     ];
     wrapped.extend_from_slice(argv);
@@ -7210,10 +7800,10 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // launch is wrapped instead of replaced — the exec channel's identity
     // (root, or the image user) stays exactly as it was.
     let Some(user) = &config.runner_user else {
-        return with_guest_hosted_limits(argv);
+        return with_guest_launch_prelude(argv);
     };
     if user == "root" {
-        return with_guest_hosted_limits(argv);
+        return with_guest_launch_prelude(argv);
     }
     let uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
     let home = format!("/home/{user}");
@@ -7247,9 +7837,18 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // Per launch: re-add the runner to kvm after docker, and re-assert the device
     // grant, so a golden that lost either still gives every job's steps the group
     // and the node.
+    //
+    // Per launch too: the resolver stub. The agent re-points a persistent
+    // container's `/etc/resolv.conf` at the gateway before every interactive run
+    // starts (`storage::prepare_for_run_persistent` → `refresh_overlay_resolver`),
+    // and this launch and the configure exec are both interactive, so a stub the
+    // runtime init wrote is gone before any job step runs. The write has to come
+    // after that refresh, so it lives here, at the head of the root-only
+    // provisioning every launch runs before it drops privileges.
     let kvm_access = runner_kvm_access_script(user, "/dev/kvm");
+    let resolver = guest_resolver_stub_script();
     let provisioning = format!(
-        "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; \
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; {resolver}; \
          getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null || true; \
          mkdir -p /etc/sudoers.d; \
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} 2>/dev/null \
@@ -8284,7 +8883,7 @@ chmod +x "$dest/bin/node"
     /// launcher sources `/etc/environment` before handing over, so the PATH a
     /// hosted step shell would get is the PATH a step here gets. The curated
     /// Rust/Go bakes that used to justify host-side toolchain entries are
-    /// gone, so the pool's own list stays a system default and nothing
+    /// gone, so the pool's own list stays a fallback and nothing
     /// exports a Rust home.
     #[test]
     fn runner_env_comes_from_the_image_environment_file() {
@@ -8296,30 +8895,40 @@ chmod +x "$dest/bin/node"
         assert_eq!(argv[1], "-c");
         let launcher = &argv[2];
         assert!(
-            launcher.contains(". /etc/environment"),
+            launcher.contains(". '/etc/environment'"),
             "the image's environment must be sourced: {launcher}"
+        );
+        assert!(
+            launcher.contains("set -a; . '/etc/environment'; set +a"),
+            "the image's entries must be *exported*, not left shell-local: {launcher}"
         );
         assert!(
             launcher.contains("exec /usr/bin/env"),
             "the pool's variables must survive the source: {launcher}"
         );
+        // PATH is not an entry `env` re-asserts over the image's value: the
+        // launcher decides it after the source, so an image PATH survives and
+        // the pool's list is only the fallback for an image without one.
+        assert!(
+            !launcher.contains(&format!("PATH={}", guest_runner_path(&config))),
+            "the fallback PATH must not be handed to `env` as an assignment: {launcher}"
+        );
+        assert!(
+            launcher.contains(&format!(
+                "[ -n \"$PATH\" ] || PATH='{}'",
+                guest_runner_path(&config)
+            )),
+            "the fallback PATH must be the empty-PATH branch: {launcher}"
+        );
         // The `KEY=value` words after the launcher are the runner's
         // environment, so the entries the assertions below read are exactly
         // what `env` applies.
-        assert_eq!(
-            &argv[3],
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        );
-        assert_eq!(argv[4], format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
+        assert_eq!(argv[3], format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
 
         let env = guest_env_entries(&config, &name);
-        let path = env
-            .iter()
-            .find_map(|entry| entry.strip_prefix("PATH="))
-            .expect("the runner is launched with a PATH");
-        assert_eq!(
-            path,
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        assert!(
+            !env.iter().any(|entry| entry.starts_with("PATH=")),
+            "PATH belongs to the launcher, not to the pool's entries: {env:?}"
         );
         for absent in [
             "/usr/local/cargo/bin",
@@ -8328,10 +8937,81 @@ chmod +x "$dest/bin/node"
             "CARGO_HOME=",
         ] {
             assert!(
-                !path.contains(absent) && !env.iter().any(|entry| entry.starts_with(absent)),
+                !env.iter().any(|entry| entry.starts_with(absent)),
                 "the curated toolchain contract is deleted; {absent} must not be exported: {env:?}"
             );
         }
+    }
+
+    /// Run the generated launcher for real, against a scratch environment file
+    /// standing in for `/etc/environment`, with an empty inherited environment
+    /// (`env -i`): the child is `/usr/bin/env`, so its stdout *is* the
+    /// environment a guest runner would start with.
+    ///
+    /// This is the measured parity gap, not a text assertion: sourcing without
+    /// `set -a` left the image's `ImageOS`/`LANG`/… unexported, and
+    /// `exec /usr/bin/env PATH=<fallback>` replaced the image PATH, making
+    /// installed tools unreachable.
+    #[cfg(unix)]
+    #[test]
+    fn runner_launcher_exports_the_image_environment_and_keeps_its_path() {
+        let config = test_config(false);
+        let name = MachineName::new("runner").unwrap();
+
+        let child_env = |contents: &str| -> std::collections::HashMap<String, String> {
+            let temp = tempfile::tempdir().unwrap();
+            let environment_file = temp.path().join("environment");
+            std::fs::write(&environment_file, contents).unwrap();
+
+            let mut argv = guest_env_prefix_at(&config, &name, environment_file.to_str().unwrap());
+            // The program `env` execs: it prints the environment it received.
+            argv.push("/usr/bin/env".to_owned());
+            let output = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .env_clear()
+                .output()
+                .expect("the launcher shell must run");
+            assert!(
+                output.status.success(),
+                "the launcher failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect()
+        };
+
+        // (a) The image's PATH survives, pipx-bin-like entry and all.
+        let image_path = "/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/usr/bin";
+        let env = child_env(&format!("PATH={image_path}\n"));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(image_path),
+            "the image's PATH must reach the runner: {env:?}"
+        );
+
+        // (b) An image with no PATH falls back to the pool's system default.
+        let env = child_env("LANG=C.UTF-8\n");
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(guest_runner_path(&config).as_str()),
+            "an image without a PATH keeps the fallback: {env:?}"
+        );
+
+        // (c) Every entry the image declares is exported, and the pool's own
+        // variables still win over the image's.
+        let env = child_env(
+            "foo=bar\nImageOS=ubuntu24\nPATH=/opt/pipx_bin:/usr/bin\nPRELOOP_MACHINE_NAME=clobbered\n",
+        );
+        assert_eq!(env.get("foo").map(String::as_str), Some("bar"));
+        assert_eq!(env.get("ImageOS").map(String::as_str), Some("ubuntu24"));
+        assert_eq!(
+            env.get("PRELOOP_MACHINE_NAME").map(String::as_str),
+            Some(name.as_str()),
+            "a malformed environment file must not unset the pool's variables: {env:?}"
+        );
     }
 
     #[test]
@@ -8365,7 +9045,7 @@ chmod +x "$dest/bin/node"
         );
         assert!(contract.contains("NOPASSWD"), "{contract}");
         assert!(
-            contract.contains("/home/runner/_work") && contract.contains("mkdir -p"),
+            contract.contains("/home/runner/work") && contract.contains("mkdir -p"),
             "{contract}"
         );
         assert!(
@@ -9041,9 +9721,10 @@ done
     /// the contract: the hostname half first (the sysctl half escalates
     /// through passwordless sudo, which resolves the hostname on every
     /// invocation — with a stale mapping it would print
-    /// `sudo: unable to resolve host` into the apply's stderr), each half in
-    /// its own subshell (either half's early `exit 0` must not skip the
-    /// other), and `set -e` so a half that fails fails provisioning.
+    /// `sudo: unable to resolve host` into the apply's stderr), the resolver
+    /// half last (it must run after the guest agent settled the network), each
+    /// half in its own subshell (either half's early `exit 0` must not skip the
+    /// others), and `set -e` so a half that fails fails provisioning.
     #[test]
     fn hosted_runtime_init_orders_the_hostname_before_the_sysctls() {
         let script = guest_hosted_runtime_init_script();
@@ -9053,17 +9734,20 @@ done
         let sysctl = script
             .find("guest sysctls already match the hosted image")
             .unwrap_or_else(|| panic!("the init must apply the hosted sysctls: {script}"));
+        let resolver = script
+            .find("prs_conf=")
+            .unwrap_or_else(|| panic!("the init must point the resolver at the stub: {script}"));
         assert!(
-            hostname < sysctl,
-            "the hostname half must run first: {script}"
+            hostname < sysctl && sysctl < resolver,
+            "the hostname half first and the resolver half last: {script}"
         );
         assert!(
             script.starts_with("set -e; ("),
             "each half must be its own subshell under set -e: {script}"
         );
         assert!(
-            script.contains("); ( "),
-            "the two halves must be separate subshells: {script}"
+            script.matches("); ( ").count() == 2,
+            "the three halves must be separate subshells: {script}"
         );
         // Each half's early exit lives inside its own subshell, so neither
         // can end the other's half.
@@ -9075,9 +9759,14 @@ done
             script.contains("guest sysctls already match the hosted image"),
             "the sysctl half's already-correct exit must stay in its subshell: {script}"
         );
+        assert!(
+            script.contains("already names the 127.0.0.53 stub resolver first"),
+            "the resolver half's already-correct exit must stay in its subshell: {script}"
+        );
         // The production roots, not a scratch path.
         assert!(script.contains("'/etc/hosts'"), "{script}");
         assert!(script.contains("root='/proc/sys'"), "{script}");
+        assert!(script.contains("prs_conf='/etc/resolv.conf'"), "{script}");
     }
 
     /// The expected golden runtime lives in `official-image.toml`, and
@@ -9243,32 +9932,849 @@ done
         );
     }
 
-    /// The composed init run end to end against scratch roots: the fork's own
-    /// name resolves and the sysctls reach the hosted values in one exec, and
-    /// a second run changes nothing. Textual order alone would not catch a
-    /// half whose `exit 0` swallows the other — this runs both halves in one
-    /// shell, the way provisioning does.
+    /// The bake host's own `/etc/hosts` mapping is the measured residue
+    /// (`10.1.0.59 runnervm…internal.cloudapp.net`), and it must not survive
+    /// into a golden: a name that resolves to an address which is not this
+    /// machine's is what every later `sudo` prints `unable to resolve host`
+    /// over. The standard local block — and a routable address that *does* name
+    /// this machine — has to survive untouched, and a second run must change
+    /// nothing.
     #[cfg(unix)]
     #[test]
-    fn hosted_runtime_init_applies_both_halves_in_one_run() {
+    fn golden_hosts_cleanup_drops_the_bake_host_and_keeps_local_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let host = String::from_utf8_lossy(
+            &std::process::Command::new("hostname")
+                .output()
+                .expect("hostname must run")
+                .stdout,
+        )
+        .trim()
+        .to_owned();
+        assert!(!host.is_empty(), "the fixture needs this machine's name");
+        let fixture = format!(
+            "127.0.0.1 localhost\n\
+             # The following lines are desirable for IPv6 capable hosts\n\
+             ::1     localhost ip6-localhost ip6-loopback\n\
+             fe00::0 ip6-localnet\n\
+             ff00::0 ip6-mcastprefix\n\
+             ff02::1 ip6-allnodes\n\
+             ff02::2 ip6-allrouters\n\
+             ff02::3 ip6-allhosts\n\
+             10.1.0.59 runnervmvrwv9.oibkqik1sgtutjdscjavv13dxh.gx.internal.cloudapp.net runnervmvrwv9\n\
+             127.0.1.1\tcpane-runner-golden\n\
+             10.9.9.9\t{host}\n"
+        );
+        std::fs::write(&hosts, &fixture).unwrap();
+        let script = golden_hosts_cleanup_script_at(hosts.to_str().unwrap());
+
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .expect("the cleanup shell must run")
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "the cleanup must not fail: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cleaned = std::fs::read_to_string(&hosts).unwrap();
+        assert!(
+            !cleaned.contains("runnervmvrwv9"),
+            "the bake host's mapping must be dropped: {cleaned}"
+        );
+        for kept in [
+            "127.0.0.1 localhost",
+            "::1     localhost ip6-localhost ip6-loopback",
+            "fe00::0 ip6-localnet",
+            "ff00::0 ip6-mcastprefix",
+            "ff02::1 ip6-allnodes",
+            "127.0.1.1\tcpane-runner-golden",
+        ] {
+            assert!(cleaned.contains(kept), "{kept} must survive: {cleaned}");
+        }
+        assert!(
+            cleaned.contains(&format!("10.9.9.9\t{host}")),
+            "a routable address naming this machine must survive: {cleaned}"
+        );
+
+        // Idempotent: the second run rewrites the same bytes.
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            cleaned,
+            "a re-run must not change the file"
+        );
+    }
+
+    /// The runner image is an Azure VM dump, so its `/etc/fstab` names disks a
+    /// SmolVM guest does not have — measured on the live fork: the root
+    /// `UUID=4fb3…`, a BOOT/EFI entry and `/dev/disk/cloud/azure_resource-part1`
+    /// (with swap) — and `systemd-remount-fs.service` fails `can't find
+    /// UUID=…` on every boot. The rule has to bite exactly on the devices this
+    /// guest cannot resolve and leave the image's real mounts alone, so the
+    /// fixture pins both sides: pseudo-filesystems, a resolvable UUID, a present
+    /// node and a present loop file survive; the stale UUIDs, the cloud
+    /// resource path, an absent node and an absent swap file are commented out
+    /// with their original text kept.
+    #[cfg(unix)]
+    #[test]
+    fn golden_fstab_cleanup_comments_only_unresolvable_devices() {
+        let temp = tempfile::tempdir().unwrap();
+        let fstab = temp.path().join("fstab");
+        let disk = temp.path().join("dev");
+        std::fs::create_dir_all(disk.join("disk/by-uuid")).unwrap();
+        // The one UUID, node and file this guest really has.
+        std::fs::write(disk.join("disk/by-uuid/1111-2222"), "").unwrap();
+        std::fs::write(disk.join("vdb"), "").unwrap();
+        std::fs::create_dir_all(temp.path().join("mnt")).unwrap();
+        std::fs::write(temp.path().join("mnt/data.img"), "").unwrap();
+        let present_file = temp.path().join("mnt/data.img");
+        let absent_swap = temp.path().join("mnt/swapfile");
+
+        let stale_uuid = "UUID=4fb3aaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let resource = "/dev/disk/cloud/azure_resource-part1";
+        let fixture = format!(
+            "# /etc/fstab: static file system information.\n\
+             #\n\
+             {stale_uuid} /        ext4 discard,errors=remount-ro 0 1\n\
+             {stale_uuid} /boot/efi vfat umask=0077               0 1\n\
+             UUID=1111-2222        /data     ext4 defaults        0 2\n\
+             {resource} /mnt     ext4 defaults,nofail     0 2\n\
+             /dev/vdb              /scratch  ext4 defaults        0 2\n\
+             /dev/vdc              /missing  ext4 defaults        0 2\n\
+             {absent_swap} none      swap sw                    0 0\n\
+             {present_file} /loop  ext4 loop                  0 0\n\
+             tmpfs                 /tmp      tmpfs defaults       0 0\n\
+             none                  /proc     proc defaults       0 0\n",
+            present_file = present_file.display(),
+            absent_swap = absent_swap.display(),
+        );
+        std::fs::write(&fstab, &fixture).unwrap();
+
+        let script = format!(
+            "set -e; {}",
+            golden_fstab_cleanup_script_at(fstab.to_str().unwrap(), disk.to_str().unwrap())
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .expect("the fstab cleanup shell must run")
+        };
+
+        let output = run();
+        assert!(
+            output.status.success(),
+            "the cleanup must not fail the bake: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cleaned = std::fs::read_to_string(&fstab).unwrap();
+        let absent_swap = absent_swap.display().to_string();
+        let present_file = present_file.display().to_string();
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("commented out 5 stale"),
+            "the report must name how many entries went: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // Every unresolvable device is commented out, its original text kept.
+        for dropped in [
+            format!("# preloop: dropped stale fstab entry: {stale_uuid}"),
+            format!("# preloop: dropped stale fstab entry: {resource}"),
+            "# preloop: dropped stale fstab entry: /dev/vdc".to_owned(),
+            format!("# preloop: dropped stale fstab entry: {absent_swap}"),
+        ] {
+            assert!(
+                cleaned.contains(&dropped),
+                "{dropped} must be commented out: {cleaned}"
+            );
+        }
+        assert_eq!(
+            cleaned
+                .matches(&format!(
+                    "# preloop: dropped stale fstab entry: {stale_uuid}"
+                ))
+                .count(),
+            2,
+            "both the root and the BOOT/EFI entry name the same stale UUID: {cleaned}"
+        );
+        for kept_text in ["/boot/efi", "discard,errors=remount-ro", "defaults,nofail"] {
+            assert!(
+                cleaned
+                    .lines()
+                    .any(|line| line.starts_with("# preloop: dropped") && line.contains(kept_text)),
+                "a dropped entry keeps its own text ({kept_text}): {cleaned}"
+            );
+        }
+        assert_eq!(
+            cleaned
+                .matches("# preloop: dropped stale fstab entry:")
+                .count(),
+            5,
+            "exactly the unresolvable entries must go: {cleaned}"
+        );
+        // The image's real mounts and pseudo-filesystems stay real entries.
+        for kept in [
+            "# /etc/fstab: static file system information.",
+            "UUID=1111-2222",
+            "/dev/vdb",
+            present_file.as_str(),
+            "tmpfs",
+            "none",
+        ] {
+            assert!(
+                cleaned.lines().any(|line| line.starts_with(kept)),
+                "{kept} must survive as an entry: {cleaned}"
+            );
+        }
+        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // Idempotent: the commented entries are no longer entries, so a second
+        // bake rewrites nothing.
+        let output = run();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("has no stale entries"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(std::fs::read_to_string(&fstab).unwrap(), cleaned);
+        // An absent file warns without failing the bake.
+        std::fs::remove_file(&fstab).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no writable"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // And the golden contract carries the step.
+        assert!(
+            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
+                .contains(&golden_fstab_cleanup_script()),
+            "the golden contract must carry the fstab cleanup"
+        );
+    }
+
+    /// `ping` reaches the runner account with `cap_net_raw` (or, where
+    /// `setcap` is missing, the setuid bit): without it every guest answers
+    /// `ping: socket: Operation not permitted` while the same step works on a
+    /// hosted runner.
+    #[cfg(unix)]
+    #[test]
+    fn golden_ping_capability_makes_ping_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let ping = temp.path().join("ping");
+        std::fs::write(&ping, "#!/bin/sh\nexit 0\n").unwrap();
+        let script = golden_ping_capability_script(ping.to_str().unwrap());
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .expect("the capability shell must run");
+        assert!(
+            output.status.success(),
+            "restoring the capability must not fail the bake: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let setuid = std::fs::metadata(&ping).unwrap().permissions().mode() & 0o4000 != 0;
+        let has_capability = std::process::Command::new("getcap")
+            .arg(&ping)
+            .output()
+            .map(|output| !output.stdout.is_empty())
+            .unwrap_or(false);
+        assert!(
+            setuid || has_capability,
+            "ping must end up either capability- or setuid-based: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A binary the image does not carry is a no-op, not a failure.
+        let missing = golden_ping_capability_script("/nonexistent/preloop-ping");
+        assert!(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &missing])
+                .status()
+                .expect("the capability shell must run")
+                .success()
+        );
+    }
+
+    /// The resolver file is what gives a container the stub: Docker hands a
+    /// container the *host file's* nameservers, so a guest naming its own
+    /// resolver makes a compose network's `/etc/hosts`-only alias NXDOMAIN.
+    /// A `daemon.json` `dns` pin is the opposite — the address becomes the
+    /// container's own loopback and every lookup fails — which is why this
+    /// step writes the file. The guest's own upstream is *kept*: on AgentENV
+    /// resolved takes its upstreams from this very file, so a stub-only file
+    /// leaves it with none and breaks external DNS for the whole guest.
+    #[cfg(unix)]
+    #[test]
+    fn guest_resolver_stub_points_the_guest_at_the_stub() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A PATH without `resolvectl`: on a host that runs systemd-resolved the
+        // stub would answer and the "no stub" case would write the file, so the
+        // harness pins which branch the step takes instead of trusting the
+        // machine running the test. `/bin/sh` is absolute for the same reason —
+        // a bare `sh` is looked up through the harness PATH.
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk"] {
+            symlink_tool(&bin, tool);
+        }
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+            // The runtime wait is irrelevant to this test's branches: PATH has
+            // no `resolvectl`, so the step never waits, and a present stub
+            // satisfies the gate on the first check.
+            2,
+            "0.1",
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the resolver shell must run")
+        };
+
+        // No stub resolver on this guest: the file keeps the guest's resolver.
+        std::fs::write(&resolv, "nameserver 75.75.75.75\n").unwrap();
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 75.75.75.75\n",
+            "a guest without the stub must keep its own resolver"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no resolved stub resolver"),
+            "the skip must say why: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // With the stub present the file names it first and keeps the guest's
+        // own upstream: the measured shape that resolves `/etc/hosts` names
+        // *and* external names, host-wide.
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n"
+        );
+
+        // An upstream resolved keeps in its own file is preserved too, and the
+        // stub's own address is never duplicated.
+        std::fs::write(
+            &resolv,
+            "nameserver 100.96.0.1\noptions rotate\nsearch internal.example\n",
+        )
+        .unwrap();
+        std::fs::write(&upstream, "nameserver 127.0.0.53\nnameserver 8.8.8.8\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 100.96.0.1\nnameserver 8.8.8.8\noptions edns0 trust-ad\n"
+        );
+
+        // Idempotent: the second run rewrites nothing.
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 100.96.0.1\nnameserver 8.8.8.8\noptions edns0 trust-ad\n"
+        );
+
+        // A symlinked `/etc/resolv.conf` becomes a regular file — SmolVM's agent
+        // refuses to start the machine over a symlink — and the file the link
+        // pointed at is never written through.
+        let managed = temp.path().join("managed-resolv.conf");
+        std::fs::write(&managed, "nameserver 75.75.75.75\n").unwrap();
+        std::fs::remove_file(&resolv).unwrap();
+        std::os::unix::fs::symlink(&managed, &resolv).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert!(
+            !std::fs::symlink_metadata(&resolv)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must be replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\nnameserver 8.8.8.8\noptions edns0 trust-ad\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&managed).unwrap(),
+            "nameserver 75.75.75.75\n",
+            "the file the symlink pointed at must not be clobbered"
+        );
+
+        // No staging file is left behind for a later bake or fork to adopt.
+        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // And the golden carries the step: an AgentENV restore keeps the baked
+        // file, which is what the daemon the guest's systemd starts reads.
+        assert!(
+            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
+                .contains(&guest_resolver_stub_script()),
+            "the golden contract must carry the resolver step"
+        );
+    }
+
+    /// The runtime resolver step must wait out systemd's start: the SmolVM
+    /// agent writes the gateway resolver into `/etc/resolv.conf` during its own
+    /// network setup and only then execs the golden's `/sbin/init`, so a fork's
+    /// provisioning exec can arrive before systemd-resolved has created
+    /// `/run/systemd/resolve/stub-resolv.conf`. A one-shot check took the
+    /// "no stub" branch there and never ran again, leaving Docker the gateway
+    /// as its `ExtServers` — a compose `/etc/hosts` alias such as
+    /// `postgres.localhost` then came back NXDOMAIN.
+    #[cfg(unix)]
+    #[test]
+    fn guest_resolver_stub_waits_for_resolved_to_appear() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // `sleep` is on PATH because the wait really runs here; `resolvectl`
+        // exists but answers nothing, which is a guest whose systemd (and so
+        // its resolved) is still starting.
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk", "sleep"] {
+            symlink_tool(&bin, tool);
+        }
+        hostname_harness_stub(&bin.join("resolvectl"), "#!/bin/sh\nexit 1\n");
+        std::fs::write(&resolv, "nameserver 100.96.0.1\n").unwrap();
+
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+            20,
+            "0.1",
+        );
+        // resolved publishes the stub after the first checks, as it does on a
+        // clone that resumes right after the workload was exec'd.
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "sleep 0.4; printf 'nameserver 127.0.0.53\\n' > {}",
+                    shell_quote(stub.to_str().unwrap())
+                ),
+            ])
+            .spawn()
+            .expect("the stub writer must start");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the resolver shell must run");
+        writer.wait().unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("no resolved stub resolver"),
+            "the step must wait for resolved instead of taking the no-stub branch: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 100.96.0.1\noptions edns0 trust-ad\n",
+            "the stub must come first and the guest's gateway upstream must survive"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("pointed"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    }
+
+    /// A guest that genuinely has no resolved stub is checked a bounded number
+    /// of times and left alone — provisioning never hangs on it — and the
+    /// reason (with the wait) reaches the engine log. A guest that does not
+    /// even look like a systemd boot is not waited on at all.
+    #[cfg(unix)]
+    #[test]
+    fn guest_resolver_stub_wait_is_bounded_and_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk", "sleep"] {
+            symlink_tool(&bin, tool);
+        }
+        hostname_harness_stub(&bin.join("resolvectl"), "#!/bin/sh\nexit 1\n");
+        std::fs::write(&resolv, "nameserver 100.96.0.1\n").unwrap();
+
+        // The production bound is the field requirement, not a test detail: a
+        // loaded host's fork had not published the stub after six seconds, and
+        // the machine then kept the gateway resolver.
+        const {
+            assert!(
+                RESOLVER_STUB_WAIT_ATTEMPTS >= 60,
+                "the runtime wait must cover a loaded fork's systemd start"
+            )
+        };
+        assert!(
+            guest_resolver_stub_script().contains(&format!("-lt {}", RESOLVER_STUB_WAIT_ATTEMPTS)),
+            "the production step must carry the bounded wait"
+        );
+
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+            4,
+            "0.1",
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the resolver shell must run")
+        };
+
+        let started = std::time::Instant::now();
+        let output = run();
+        let elapsed = started.elapsed();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 100.96.0.1\n",
+            "a guest without the stub keeps its own resolver"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("no resolved stub resolver"), "{stderr}");
+        assert!(
+            stderr.contains("waited 4 of 4 checks"),
+            "the report must say the wait was exhausted: {stderr}"
+        );
+        assert!(
+            stderr.contains("resolvectl=yes"),
+            "the report must say what the guest has, so the next run can tell \
+             'resolved was slow' from 'resolved never starts': {stderr}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the wait must be bounded; took {elapsed:?}"
+        );
+
+        // No systemd and no `resolvectl`: the one-shot path, no wait.
+        std::fs::remove_file(bin.join("resolvectl")).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("waited 0 of 4 checks"),
+            "a guest that cannot boot resolved must not be waited on: {stderr}"
+        );
+        assert!(
+            stderr.contains("resolvectl=no"),
+            "the report must say the guest ships no resolvectl: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 100.96.0.1\n"
+        );
+    }
+
+    /// The bake-time systemd preparation: resolved's upstream, the stub in
+    /// `/etc/resolv.conf`, and the unit masks — gated on the systemd binaries,
+    /// because the SmolVM builder has no systemd PID 1 and a "resolved is
+    /// active" gate would skip exactly there.
+    #[cfg(unix)]
+    #[test]
+    fn golden_systemd_parity_prepares_the_guest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(unit_dir.join("fake-parity.service"), "[Unit]\n").unwrap();
+        std::fs::write(etc.join("resolv.conf"), "nameserver 100.96.0.1\n").unwrap();
+
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // No `systemctl` in the harness PATH: the mask falls back to the
+        // `/dev/null` symlink, which is the builder's case and what
+        // `systemctl mask` creates.
+        for tool in ["awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln"] {
+            symlink_tool(&bin, tool);
+        }
+
+        let units = ["fake-parity.service", "absent-unit.service"];
+        let script = golden_systemd_parity_script_at(
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &units,
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the systemd preparation shell must run")
+        };
+        let resolv_conf = etc.join("resolv.conf");
+        let resolved_conf = etc.join("systemd/resolved.conf");
+        let masked = etc.join("systemd/system/fake-parity.service");
+
+        let first = run();
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        // resolved's upstream is the image's own nameserver, so naming the stub
+        // in resolv.conf cannot leave resolved without one.
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=100.96.0.1\n"
+        );
+        // The upstream line is what lets glibc resolve before resolved starts:
+        // an AgentENV restore resumes mid-boot, so a stub-only file leaves the
+        // guest with a dead socket as its only server for ~40-90 s.
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 100.96.0.1\noptions edns0 trust-ad\n"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&resolv_conf)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the stub must be a regular file: a symlink breaks SmolVM's start"
+        );
+        assert_eq!(
+            std::fs::read_link(&masked).unwrap(),
+            std::path::Path::new("/dev/null"),
+            "a shipped unit must be masked"
+        );
+        assert!(
+            !etc.join("systemd/system/absent-unit.service").exists(),
+            "a unit the image does not ship must be skipped"
+        );
+        assert!(
+            String::from_utf8_lossy(&first.stdout).contains("masked 1 systemd units"),
+            "{}",
+            String::from_utf8_lossy(&first.stdout)
+        );
+
+        // Idempotent: nothing is appended, rewritten or re-staged.
+        let second = run();
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=100.96.0.1\n",
+            "a second run must not append a second DNS= line"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 100.96.0.1\noptions edns0 trust-ad\n",
+            "a second run must not duplicate the upstream line"
+        );
+        assert!(
+            String::from_utf8_lossy(&second.stderr).contains("already sets DNS="),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&etc)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // An image with systemd but a resolver it cannot name: the fallback is
+        // a public resolver, and a `DNS=` the image configured is never touched.
+        std::fs::remove_file(&resolved_conf).unwrap();
+        std::fs::write(&resolv_conf, "search only.example\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=1.1.1.1\n",
+            "a guest whose resolver is itself the stub needs a public upstream"
+        );
+        std::fs::write(&resolved_conf, "DNS=9.9.9.9\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=9.9.9.9\n",
+            "a configured DNS= must survive"
+        );
+
+        // No systemd in the image: nothing is touched, and the reason is said.
+        let absent = golden_systemd_parity_script_at(
+            &[root.join("nope/systemd").to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &units,
+        );
+        std::fs::write(&resolv_conf, "nameserver 8.8.8.8\n").unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &absent])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the systemd preparation shell must run");
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 8.8.8.8\n"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no systemd"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // And the golden contract carries the step.
+        assert!(
+            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
+                .contains(&golden_systemd_parity_script()),
+            "the golden contract must carry the systemd preparation"
+        );
+    }
+
+    /// The goldens cut before the upstream line existed carry the stub alone.
+    /// Re-running the bake preparation must add an upstream rather than
+    /// conclude the file is already right: an AgentENV restore resumes
+    /// mid-boot, so a stub-only file is a dead socket until resolved starts,
+    /// and every DNS lookup in that window fails.
+    #[cfg(unix)]
+    #[test]
+    fn golden_systemd_parity_upgrades_a_stub_only_resolver_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Exactly what the older goldens carry.
+        std::fs::write(
+            etc.join("resolv.conf"),
+            "nameserver 127.0.0.53\noptions edns0 trust-ad\n",
+        )
+        .unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln"] {
+            symlink_tool(&bin, tool);
+        }
+        let script = golden_systemd_parity_script_at(
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &["absent-unit.service"],
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the systemd preparation shell must run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(etc.join("resolv.conf")).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 1.1.1.1\noptions edns0 trust-ad\n",
+            "a stub-only file must gain an upstream, not count as already prepared"
+        );
+    }
+
+    /// The composed init run end to end against scratch roots: the fork's own
+    /// name resolves, the sysctls reach the hosted values and the resolver file
+    /// names the stub in one exec, and a second run changes nothing. Textual
+    /// order alone would not catch a half whose `exit 0` swallows the others —
+    /// this runs every half in one shell, the way provisioning does.
+    #[cfg(unix)]
+    #[test]
+    fn hosted_runtime_init_applies_every_half_in_one_run() {
         let temp = tempfile::tempdir().unwrap();
         let hosts = temp.path().join("hosts");
         let root = temp.path().join("sys");
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(root.join("vm")).unwrap();
         std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        std::fs::write(&resolv, "nameserver 75.75.75.75\n").unwrap();
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
         std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_instances"), "128").unwrap();
         // The sysctl half's procps is absent here, so the apply writes the
         // scratch tree directly — the same branch a guest without procps
-        // takes. Every other tool both halves call is linked in, so the test
-        // exercises the real scripts rather than the harness PATH.
+        // takes. Every other tool all three halves call is linked in, so the
+        // test exercises the real scripts rather than the harness PATH.
         for tool in [
             "cat", "tr", "id", "base64", "sh", "awk", "sed", "sort", "cut", "grep", "mktemp",
-            "tee", "rm", "uname", "head",
+            "tee", "rm", "uname", "head", "printf", "chmod", "mv",
         ] {
             symlink_tool(&bin, tool);
         }
@@ -9289,7 +10795,16 @@ done
         );
         hostname_harness_stub(&bin.join("sudo"), SUDO_STUB);
 
-        let script = hosted_runtime_init_script_at(hosts.to_str().unwrap(), root.to_str().unwrap());
+        let script = hosted_runtime_init_script_at(
+            hosts.to_str().unwrap(),
+            root.to_str().unwrap(),
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            temp.path()
+                .join("absent-resolved-resolv.conf")
+                .to_str()
+                .unwrap(),
+        );
         let run = || {
             std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
@@ -9317,6 +10832,11 @@ done
             std::fs::read_to_string(root.join("fs/inotify/max_user_instances")).unwrap(),
             "1280"
         );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n",
+            "the resolver half must land in the same run, keeping the guest's upstream"
+        );
         // Idempotent: the second run writes nothing at all.
         let second = run();
         assert!(
@@ -9327,6 +10847,10 @@ done
         assert_eq!(
             std::fs::read_to_string(&hosts).unwrap(),
             "127.0.0.1 localhost\n127.0.0.1 fork-7c1f\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n"
         );
     }
 
@@ -9879,11 +11403,83 @@ done
         );
     }
 
-    /// Unset and root still skip the account switch, but not the limits: the
-    /// launch is wrapped around the same argv, so the exec channel's identity
-    /// is untouched while the runner and every step it spawns inherit the
-    /// hosted stack, and the descriptor pair best-effort (a hard limit can
-    /// only be raised by root, and this path cannot assume it).
+    /// The runner launch must write the resolver stub itself, after the agent's
+    /// refresh. A stub the runtime init wrote does not survive the launch: the
+    /// launch is an interactive `Run` (`machine exec --stream` →
+    /// `run_streaming_with`), and the agent re-points a persistent container's
+    /// `/etc/resolv.conf` at the gateway before such a run's command starts. So
+    /// the account branch carries the step in its root-only provisioning, which
+    /// runs before the privilege drop on a root exec and through sudo otherwise,
+    /// and the root branch carries it in the prelude ahead of the limits.
+    #[test]
+    fn runner_launch_rewrites_the_resolver_stub_before_the_job_starts() {
+        let stub = guest_resolver_stub_script();
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+            "--once".to_owned(),
+        ];
+
+        let mut account = test_config(false);
+        account.runner_user = Some("runner".to_owned());
+        account.runner_uid = Some(1001);
+        let script = &as_runner_user(&account, &argv)[2];
+        // The root branch runs the provisioning as written; the account branch
+        // base64s it. Both carry the same step, so check the raw text here.
+        assert!(
+            script.contains(&stub),
+            "a root exec must rewrite the resolver stub before the drop: {script}"
+        );
+        let blobs: Vec<String> = script
+            .split("| base64 -d")
+            .filter_map(|part| {
+                let close = part.rfind('\'')?;
+                let open = part[..close].rfind('\'')?;
+                Some(part[open + 1..close].to_owned())
+            })
+            .collect();
+        let decoded: Vec<String> = blobs
+            .iter()
+            .map(|b| {
+                String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let provisioning = decoded
+            .iter()
+            .find(|text| text.contains("useradd"))
+            .expect("the account branch carries the root provisioning");
+        assert!(
+            provisioning.contains(&stub),
+            "the root provisioning must rewrite the resolver stub before the launch \
+             drops privileges: {provisioning}"
+        );
+        let drop = decoded
+            .iter()
+            .find(|text| text.contains("setpriv"))
+            .expect("the account branch drops privileges");
+        assert!(
+            !drop.contains(&stub),
+            "the stub belongs before the drop, not after it: {drop}"
+        );
+
+        let mut root = test_config(false);
+        root.runner_user = Some("root".to_owned());
+        let wrapped = as_runner_user(&root, &argv);
+        assert!(
+            wrapped[2].starts_with(&stub),
+            "the root launch must rewrite the resolver stub ahead of its limits: {}",
+            wrapped[2]
+        );
+    }
+
+    /// Unset and root still skip the account switch, but not the limits or the
+    /// resolver step: the launch is wrapped around the same argv, so the exec
+    /// channel's identity is untouched while the runner and every step it spawns
+    /// inherit the hosted stack, and the descriptor pair best-effort (a hard limit
+    /// can only be raised by root, and this path cannot assume it). The resolver
+    /// step runs first, in the same shell, so the stub is in place when the
+    /// runner starts.
     #[test]
     fn runner_user_wrapper_passes_root_and_unset_through_with_the_hosted_limits() {
         let mut config = test_config(false);
@@ -9901,10 +11497,12 @@ done
             assert_eq!(
                 wrapped[2],
                 format!(
-                    "{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; \
-                     exec \"$@\""
+                    "{resolver}; {GUEST_STACK_ULIMIT_BEST_EFFORT}; \
+                     {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\"",
+                    resolver = guest_resolver_stub_script(),
                 ),
-                "the pass-through launch must run on the hosted limits best-effort: {user:?}"
+                "the pass-through launch must rewrite the resolver stub and run on the \
+                 hosted limits best-effort: {user:?}"
             );
             // The original argv travels as the shell's positional parameters,
             // so nothing is re-quoted and the launch is untouched.
@@ -10405,8 +12003,8 @@ fi"#,
                 scope_rosetta_apt_sources("/etc/apt"),
             ),
             (
-                "with_guest_hosted_limits".to_owned(),
-                with_guest_hosted_limits(&argv)[2].clone(),
+                "with_guest_launch_prelude".to_owned(),
+                with_guest_launch_prelude(&argv)[2].clone(),
             ),
             (
                 "as_runner_user (pass-through)".to_owned(),
@@ -11943,6 +13541,8 @@ fi"#,
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
         let surviving = MachineName::new("lifecycle-test-golden").unwrap();
         let foreign = MachineName::new("foreign-vm").unwrap();
@@ -12506,6 +14106,8 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
+                guest_volumes: Vec::new(),
+                workload_init: None,
             })
             .await
             .unwrap();
@@ -12578,6 +14180,8 @@ fi"#,
                 sockets: Vec::new(),
                 dns: None,
                 rosetta: false,
+                guest_volumes: Vec::new(),
+                workload_init: None,
             })
             .await
             .unwrap();
@@ -12735,6 +14339,8 @@ fi"#,
                     sockets: Vec::new(),
                     dns: None,
                     rosetta: false,
+                    guest_volumes: Vec::new(),
+                    workload_init: None,
                 })
                 .await
                 .unwrap();
