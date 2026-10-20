@@ -2559,18 +2559,58 @@ const SYSTEMD_MASKED_UNITS: &[&str] = &[
 /// idempotent: a file that already matches is left byte for byte and logged.
 ///
 /// `upstream_file` is resolved's own `resolv.conf` on the runtime path and
-/// `/dev/null` at bake time. Only nameservers actually configured in those
-/// files are used; the bake host's resolver is never consulted.
-fn resolver_stub_rewrite_shell(resolv_conf: &str, upstream_file: &str) -> String {
+/// `/dev/null` at bake time. When neither it nor the target file carries a
+/// non-stub nameserver, the fallback is the effective `DNS=` from
+/// `resolved.conf` and its sorted `resolved.conf.d` drop-ins (later non-empty
+/// assignments append, an empty assignment resets the list, matching
+/// systemd-resolved); `1.1.1.1` is used only when that configured list is also
+/// empty. The bake host's resolver is never consulted.
+fn resolver_stub_rewrite_shell(
+    resolv_conf: &str,
+    upstream_file: &str,
+    resolved_etc: &str,
+) -> String {
     let conf = shell_quote(resolv_conf);
     let upstream = shell_quote(upstream_file);
+    let resolved_etc = shell_quote(resolved_etc);
     format!(
-        "prs_conf={conf}; prs_upstream_file={upstream}; \
+        "prs_etc={resolved_etc}; prs_conf={conf}; prs_upstream_file={upstream}; \
          prs_tmp=$prs_conf.preloop.$$; prs_keep=$prs_tmp.keep; \
          prs_upstreams=$(cat \"$prs_conf\" \"$prs_upstream_file\" 2>/dev/null \
            | awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2 }}' \
            | grep -v '^127\\.0\\.0\\.53$' | grep -v '^::1$' | grep -v '^0\\.0\\.0\\.0$' | grep -v '^::$' \
            | awk '!seen[$0]++'); \
+         if [ -z \"$prs_upstreams\" ]; then \
+           prs_upstreams=$(for prs_resolved in \"$prs_etc/systemd/resolved.conf\" \
+               \"$prs_etc/systemd/resolved.conf.d\"/*.conf; do \
+             [ -f \"$prs_resolved\" ] || continue; \
+             cat \"$prs_resolved\"; \
+             printf '\\n'; \
+           done | awk ' \
+             function is_ip(s) {{ \
+               if (s ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$/) return 1; \
+               if (s ~ /:/) return 1; \
+               return 0; \
+             }} \
+             function clean(s) {{ \
+               sub(/#.*/, \"\", s); \
+               if (s ~ /^\\[[^]]+\\](:[0-9]+)?$/) {{ sub(/^\\[/, \"\", s); sub(/\\].*/, \"\", s); }} \
+               else if (s ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:[0-9]+$/) {{ sub(/:[0-9]+$/, \"\", s); }} \
+               return s; \
+             }} \
+             /^[[:space:]]*DNS[[:space:]]*=/ {{ \
+               line=$0; sub(/^[^=]*=[[:space:]]*/, \"\", line); sub(/[[:space:]]+$/, \"\", line); \
+               if (line == \"\") {{ count=0; next }} \
+               n=split(line, parts, /[[:space:]]+/); \
+               for (i=1; i<=n; i++) {{ \
+                 token=clean(parts[i]); \
+                 if (token != \"\" && is_ip(token)) dns[++count]=token; \
+               }} \
+             }} \
+             END {{ for (i=1; i<=count; i++) print dns[i] }}' \
+             | grep -v '^127\\.0\\.0\\.53$' | grep -v '^::1$' | grep -v '^0\\.0\\.0\\.0$' | grep -v '^::$' \
+             | awk '!seen[$0]++'); \
+         fi; \
          if [ -z \"$prs_upstreams\" ]; then prs_upstreams=1.1.1.1; fi; \
          prs_ok=1; \
          if [ -f \"$prs_conf\" ]; then \
@@ -2697,7 +2737,8 @@ fn golden_systemd_parity_script_at(
         .join(" ");
     let etc_path = etc;
     let etc = shell_quote(etc_path);
-    let rewrite = resolver_stub_rewrite_shell(&format!("{etc_path}/resolv.conf"), "/dev/null");
+    let rewrite =
+        resolver_stub_rewrite_shell(&format!("{etc_path}/resolv.conf"), "/dev/null", etc_path);
     format!(
         "prsys_etc={etc}; \
          if {gate}; then \
@@ -3061,6 +3102,7 @@ pub fn guest_resolver_stub_script() -> String {
         "/etc/resolv.conf",
         "/run/systemd/resolve/stub-resolv.conf",
         "/run/systemd/resolve/resolv.conf",
+        "/etc",
         RESOLVER_STUB_WAIT_ATTEMPTS,
         RESOLVER_STUB_WAIT_INTERVAL,
     )
@@ -3080,9 +3122,10 @@ pub fn guest_resolver_stub_script() -> String {
 const RESOLVER_STUB_WAIT_ATTEMPTS: u32 = 60;
 const RESOLVER_STUB_WAIT_INTERVAL: &str = "0.5";
 
-/// `resolv_conf`, `stub` and `upstream_file` are the scratch paths the shell
-/// tests substitute for `/etc/resolv.conf`, the stub's own file and resolved's
-/// upstream list; `wait_attempts` and `wait_interval` are the runtime wait
+/// `resolv_conf`, `stub`, `upstream_file` and `resolved_etc` are the scratch
+/// paths the shell tests substitute for `/etc/resolv.conf`, the stub's own
+/// file, resolved's upstream list and the `/etc` tree holding `resolved.conf`
+/// and its drop-ins; `wait_attempts` and `wait_interval` are the runtime wait
 /// ([`RESOLVER_STUB_WAIT_ATTEMPTS`], [`RESOLVER_STUB_WAIT_INTERVAL`], shortened
 /// by the tests). No `#` comments in the text: the golden contract's statements
 /// are joined into one physical line.
@@ -3090,10 +3133,11 @@ fn guest_resolver_stub_script_at(
     resolv_conf: &str,
     stub: &str,
     upstream_file: &str,
+    resolved_etc: &str,
     wait_attempts: u32,
     wait_interval: &str,
 ) -> String {
-    let rewrite = resolver_stub_rewrite_shell(resolv_conf, upstream_file);
+    let rewrite = resolver_stub_rewrite_shell(resolv_conf, upstream_file, resolved_etc);
     format!(
         "prs_conf={conf}; prs_stub={stub}; \
          prs_tries=0; \
@@ -3162,13 +3206,15 @@ pub fn guest_hosted_runtime_init_script(policy: GoldenResiduePolicy) -> String {
         "/etc/resolv.conf",
         "/run/systemd/resolve/stub-resolv.conf",
         "/run/systemd/resolve/resolv.conf",
+        "/etc",
     )
 }
 
-/// `hosts`, `sysctl_root`, `resolv_conf`, `stub` and `upstream_file` are the
-/// scratch paths the shell tests substitute for `/etc/hosts`, `/proc/sys`,
-/// `/etc/resolv.conf`, the stub's own file and resolved's upstream list;
-/// production passes those.
+/// `hosts`, `sysctl_root`, `resolv_conf`, `stub`, `upstream_file` and
+/// `resolved_etc` are the scratch paths the shell tests substitute for
+/// `/etc/hosts`, `/proc/sys`, `/etc/resolv.conf`, the stub's own file,
+/// resolved's upstream list and the `/etc` tree holding `resolved.conf` and
+/// its drop-ins; production passes those.
 fn hosted_runtime_init_script_at(
     policy: GoldenResiduePolicy,
     hosts: &str,
@@ -3176,6 +3222,7 @@ fn hosted_runtime_init_script_at(
     resolv_conf: &str,
     stub: &str,
     upstream_file: &str,
+    resolved_etc: &str,
 ) -> String {
     let hostname = format!("( {} )", guest_hostname_script_at(hosts));
     if policy == GoldenResiduePolicy::Preserve {
@@ -3191,6 +3238,7 @@ fn hosted_runtime_init_script_at(
             resolv_conf,
             stub,
             upstream_file,
+            resolved_etc,
             RESOLVER_STUB_WAIT_ATTEMPTS,
             RESOLVER_STUB_WAIT_INTERVAL,
         )
@@ -10752,6 +10800,7 @@ done
             resolv.to_str().unwrap(),
             stub.to_str().unwrap(),
             upstream.to_str().unwrap(),
+            temp.path().to_str().unwrap(),
             // The runtime wait is irrelevant to this test's branches: PATH has
             // no `resolvectl`, so the step never waits, and a present stub
             // satisfies the gate on the first check.
@@ -10809,7 +10858,8 @@ done
             "nameserver 100.96.0.1\n\
              search internal.example corp.example\n\
              domain corp.example\n\
-             options ndots:5 rotate\n",
+             options ndots:5 rotate\n\
+             options timeout:2 attempts:3\n",
         )
         .unwrap();
         std::fs::write(&upstream, "nameserver 127.0.0.53\nnameserver 8.8.8.8\n").unwrap();
@@ -10821,7 +10871,8 @@ done
                         options edns0 trust-ad\n\
                         search internal.example corp.example\n\
                         domain corp.example\n\
-                        options ndots:5 rotate\n";
+                        options ndots:5 rotate\n\
+                        options timeout:2 attempts:3\n";
         assert_eq!(std::fs::read_to_string(&resolv).unwrap(), prepared);
 
         // Idempotent: the second run rewrites nothing.
@@ -10898,6 +10949,59 @@ done
         );
     }
 
+    /// The runtime rewrite uses the image's configured systemd-resolved
+    /// upstream when the guest's file has only the stub. Falling back to a
+    /// public resolver there would leak corporate lookups even though
+    /// `resolved.conf` names the internal resolvers.
+    #[cfg(unix)]
+    #[test]
+    fn guest_resolver_stub_uses_configured_dns_for_a_stub_only_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let etc = temp.path().join("etc");
+        std::fs::create_dir_all(etc.join("systemd/resolved.conf.d")).unwrap();
+        let resolv = etc.join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("absent-resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk"] {
+            symlink_tool(&bin, tool);
+        }
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
+        std::fs::write(&resolv, "nameserver 127.0.0.53\noptions edns0 trust-ad\n").unwrap();
+        std::fs::write(
+            etc.join("systemd/resolved.conf.d/10-corp.conf"),
+            "DNS=10.30.0.53 10.30.0.54\n",
+        )
+        .unwrap();
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+            etc.to_str().unwrap(),
+            2,
+            "0.1",
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the resolver shell must run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\n\
+             nameserver 10.30.0.53\n\
+             nameserver 10.30.0.54\n\
+             options edns0 trust-ad\n",
+            "the configured corporate DNS must be the fallback, not 1.1.1.1"
+        );
+    }
+
     /// The runtime resolver step must wait out systemd's start: the SmolVM
     /// agent writes the gateway resolver into `/etc/resolv.conf` during its own
     /// network setup and only then execs the golden's `/sbin/init`, so a fork's
@@ -10928,6 +11032,7 @@ done
             resolv.to_str().unwrap(),
             stub.to_str().unwrap(),
             upstream.to_str().unwrap(),
+            temp.path().to_str().unwrap(),
             20,
             "0.1",
         );
@@ -11015,6 +11120,7 @@ done
             resolv.to_str().unwrap(),
             stub.to_str().unwrap(),
             upstream.to_str().unwrap(),
+            temp.path().to_str().unwrap(),
             4,
             "0.1",
         );
@@ -11417,6 +11523,87 @@ done
         assert_eq!(std::fs::read_to_string(&managed).unwrap(), managed_fixture);
     }
 
+    /// A stub-only image whose upstream is configured in `resolved.conf` or a
+    /// drop-in must use that upstream, not a public resolver. The effective
+    /// list follows systemd-resolved: main file first, sorted drop-ins next,
+    /// non-empty `DNS=` assignments append, and an empty assignment resets.
+    #[cfg(unix)]
+    #[test]
+    fn golden_systemd_parity_uses_configured_dns_for_the_upstream_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd/resolved.conf.d")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolv = etc.join("resolv.conf");
+        let stub_only = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
+        std::fs::write(&resolv, stub_only).unwrap();
+        // The main file is cleared by a drop-in, then a later drop-in sets the
+        // corporate resolvers: only the last pair is effective.
+        std::fs::write(etc.join("systemd/resolved.conf"), "DNS=10.10.0.53\n").unwrap();
+        std::fs::write(etc.join("systemd/resolved.conf.d/10-clear.conf"), "DNS=\n").unwrap();
+        std::fs::write(
+            etc.join("systemd/resolved.conf.d/20-corp.conf"),
+            "DNS=10.20.0.53#corp.example 10.20.0.54:5353\n",
+        )
+        .unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in [
+            "awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln", "cat",
+        ] {
+            symlink_tool(&bin, tool);
+        }
+        let script = golden_systemd_parity_script_at(
+            GoldenResiduePolicy::Clean,
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &["absent-unit.service"],
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the systemd preparation shell must run")
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\n\
+             nameserver 10.20.0.53\n\
+             nameserver 10.20.0.54\n\
+             options edns0 trust-ad\n",
+            "the configured corporate DNS must be the fallback, not 1.1.1.1"
+        );
+        // The configured file is policy: the bake must not rewrite it.
+        assert_eq!(
+            std::fs::read_to_string(etc.join("systemd/resolved.conf")).unwrap(),
+            "DNS=10.10.0.53\n"
+        );
+
+        // An empty reset with no later assignment leaves no configured DNS;
+        // only then does the public fallback apply.
+        std::fs::remove_file(etc.join("systemd/resolved.conf.d/20-corp.conf")).unwrap();
+        std::fs::write(&resolv, stub_only).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 1.1.1.1\noptions edns0 trust-ad\n"
+        );
+    }
+
     /// The composed init run end to end against scratch roots: the fork's own
     /// name resolves, the sysctls reach the hosted values and the resolver file
     /// names the stub in one exec, and a second run changes nothing. Textual
@@ -11477,6 +11664,7 @@ done
                 .join("absent-resolved-resolv.conf")
                 .to_str()
                 .unwrap(),
+            temp.path().to_str().unwrap(),
         );
         let run = || {
             std::process::Command::new("/bin/sh")
@@ -11583,6 +11771,7 @@ done
             resolv.to_str().unwrap(),
             stub.to_str().unwrap(),
             temp.path().join("resolved-resolv.conf").to_str().unwrap(),
+            temp.path().to_str().unwrap(),
         );
         let run = || {
             std::process::Command::new("/bin/sh")

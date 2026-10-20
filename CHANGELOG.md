@@ -78,9 +78,14 @@ Releases before v0.27.0 predate the changelog.
   resolving in guest steps and containers. Both paths now keep every
   configured upstream nameserver, all `search`/`domain` directives and the
   image's options (adding the hosted defaults only when absent), and remain
-  idempotent. The write is still atomic and replaces a symlinked file with a
-  regular one, and the per-machine application follows the base's policy:
-  only the official or explicitly opted-in hosted policy rewrites it.
+  idempotent. When the file carries only the stub, the fallback upstream comes
+  from the effective `DNS=` in `resolved.conf` and its sorted drop-ins —
+  non-empty assignments append and an empty assignment clears the list, as in
+  systemd-resolved — so an internal resolver is used instead of `1.1.1.1`;
+  the public fallback remains only when no upstream is configured anywhere.
+  The write is still atomic and replaces a symlinked file with a regular one,
+  and the per-machine application follows the base's policy: only the
+  official or explicitly opted-in hosted policy rewrites it.
 - **The job workspace uses the hosted `work` folder.** A job's checkout now
   lands at `<runner-root>/work/<repo>/<repo>` and `RUNNER_WORKSPACE` is
   exported; `_work` is the official runner's self-hosted default, and workflows
