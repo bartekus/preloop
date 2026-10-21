@@ -13,8 +13,6 @@ on:
 
 permissions:
   contents: read
-  security-events: write
-  actions: read
 
 concurrency:
   group: codeql-${{ github.ref }}
@@ -23,7 +21,7 @@ concurrency:
 jobs:
   analyze:
     name: Analyze ${{ matrix.language }}
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -51,3 +49,17 @@ jobs:
         uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: "/language:${{ matrix.language }}"
+          # Preloop engine runs have no GitHub code-scanning backend. Keep the
+          # SARIF in the run artifact until the SARIF ingestion endpoint exists.
+          upload: never
+          upload-database: false
+          output: ${{ runner.temp }}/codeql-results
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codeql-${{ matrix.language }}-sarif
+          path: ${{ runner.temp }}/codeql-results
+          if-no-files-found: warn
+          retention-days: 14

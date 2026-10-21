@@ -18,7 +18,7 @@ concurrency:
 jobs:
   semgrep:
     name: Semgrep
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 20
     steps:
       - name: Check out repository
