@@ -26,6 +26,14 @@ Releases before v0.27.0 predate the changelog.
   by the flow recorder ahead of the route's own admission.
 ### Fixed
 
+- **Self-built pull-request merges can fetch missing LFS objects.** A run on
+  an engine-built merge is served from a repository that exists only in the
+  engine, but its Git LFS objects still live upstream. The attached snapshot
+  recorded no upstream repository, so the LFS batch route treated every miss
+  as a 404 and jobs could not check out golden or other LFS-backed fixtures.
+  `attach_merge` and `attach_prebuilt_merge` now record the merge's upstream
+  `owner/repo`, with visibility left unknown so the existing route attempts a
+  fetch — App or PAT credentials when configured, anonymously otherwise.
 - **Snapshot cache deepening uses the GitHub App installation token.** A
   shallow or partial workspace whose GitHub origin is private used to deepen
   only with the static PAT over HTTPS, so an App-only deployment could not
@@ -62,7 +70,6 @@ Releases before v0.27.0 predate the changelog.
   and the parent stopped draining stdout, so the submission sat there until
   the client gave up. Git's stdin is now written while stdout and stderr are
   drained concurrently.
-
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
