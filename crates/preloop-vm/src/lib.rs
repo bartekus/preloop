@@ -605,8 +605,9 @@ impl MachineSpec {
 /// PID 1. The check is the program's file name — the managed default is
 /// `/sbin/init`, and an operator naming the binary explicitly uses `systemd`
 /// (for example `/lib/systemd/systemd --system`). Any other command, such as
-/// `["/bin/sh", "-c", "sleep infinity"]`, cannot answer on the stub, so it
-/// keeps the resolver smolvm would otherwise configure.
+/// `["/bin/sh", "-c", "sleep infinity"]` or one that starts systemd
+/// indirectly, keeps the resolver smolvm would otherwise configure: the stub
+/// is only emitted when systemd is certain to answer on it.
 fn workload_init_is_systemd(workload: Option<&[String]>) -> bool {
     workload
         .and_then(|command| command.first())
@@ -5637,7 +5638,10 @@ mod tests {
         let workload = |command: &[&str]| -> Option<Vec<String>> {
             Some(command.iter().map(|arg| (*arg).to_owned()).collect())
         };
-        for command in [&["/sbin/init"][..], &["/lib/systemd/systemd", "--system"][..]] {
+        for command in [
+            &["/sbin/init"][..],
+            &["/lib/systemd/systemd", "--system"][..],
+        ] {
             assert!(
                 workload_init_is_systemd(workload(command).as_deref()),
                 "{command:?}"

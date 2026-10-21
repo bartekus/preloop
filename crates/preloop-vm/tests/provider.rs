@@ -780,6 +780,41 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
         );
     }
 
+    /// An arbitrary workload override does not make the guest a systemd host.
+    /// A shell that never starts `systemd-resolved` must keep the resolver
+    /// smolvm would configure instead of being pointed at a stub nothing
+    /// answers on.
+    #[tokio::test]
+    async fn a_custom_workload_without_systemd_gets_no_stub_resolver() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("acme.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("acme-shell").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::CustomPack;
+        spec.network = NetworkPolicy::Unrestricted;
+        spec.workload_init = Some(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "sleep infinity".to_owned(),
+        ]);
+
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+
+        let args = captured_args(&executable);
+        assert!(
+            args.windows(2).any(|pair| pair == ["--", "/bin/sh"]),
+            "the explicit workload must still be passed: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--dns"),
+            "a non-systemd workload has nothing answering on the stub: {args:?}"
+        );
+    }
+
     /// A custom pack is the operator's data. Its `/var/lib/docker` may hold
     /// the preloaded images the pack exists for, so no default guest-local
     /// volume may be mounted over it, and its own entrypoint/cmd is what runs
