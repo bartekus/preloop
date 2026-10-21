@@ -26,6 +26,15 @@ Releases before v0.27.0 predate the changelog.
   by the flow recorder ahead of the route's own admission.
 ### Fixed
 
+- **Snapshot cache deepening uses the GitHub App installation token.** A
+  shallow or partial workspace whose GitHub origin is private used to deepen
+  only with the static PAT over HTTPS, so an App-only deployment could not
+  recover the full history, and an SSH origin never received a credential at
+  all. The deepen fetch now prefers a contents-read App installation token,
+  falls back to the PAT, and fetches an SSH origin over HTTPS with that token.
+  The credential is scoped to the configured forge origin and never sent over
+  plaintext HTTP.
+
 - **Workspace snapshots build when the state directory is on another
   filesystem.** The snapshot object cache initialized itself with
   `git clone --bare --local`, which hardlinks object files; a workspace on a

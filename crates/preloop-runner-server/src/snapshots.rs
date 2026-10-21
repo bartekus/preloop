@@ -481,6 +481,7 @@ pub async fn create_workspace_snapshot(
             &staging_repository,
             &staging_index,
             &final_repository,
+            shared,
             github_pat,
             merge,
             origin_url.as_deref(),
@@ -1184,6 +1185,7 @@ async fn create_workspace_snapshot_inner(
     staging_repository: &FsPath,
     staging_index: &FsPath,
     final_repository: &FsPath,
+    shared: Option<&SharedState>,
     github_pat: Option<&str>,
     merge: Option<&crate::merge_builder::LocalPullRequestMerge>,
     origin_url: Option<&str>,
@@ -1223,6 +1225,7 @@ async fn create_workspace_snapshot_inner(
         workspace,
         &common_dir,
         source_head.as_deref(),
+        shared,
         github_pat,
     )
     .await?;
@@ -2804,6 +2807,7 @@ async fn ensure_object_cache(
     workspace: &FsPath,
     common_dir: &FsPath,
     source_head: Option<&str>,
+    shared: Option<&SharedState>,
     github_pat: Option<&str>,
 ) -> Result<ObjectCache, ApiError> {
     use sha2::Digest;
@@ -2945,7 +2949,7 @@ async fn ensure_object_cache(
     }
     if !ancestry_complete {
         ancestry_complete =
-            deepen_object_cache_from_remote(&repository, workspace, github_pat).await;
+            deepen_object_cache_from_remote(&repository, workspace, shared, github_pat).await;
         if ancestry_complete {
             ancestry_complete = missing_snapshot_objects(&repository).await? == 0;
         }
@@ -3021,11 +3025,18 @@ async fn present_objects(
 /// plus a promisor remote it can reach); until then, correctness first.
 ///
 /// Best effort by design. No remote, no network, or a private repository
-/// without credentials simply leaves the cache shallow and the caller falls
-/// back to rewriting.
+/// without credentials simply leaves the cache incomplete. A shallow cache
+/// then falls back to rewriting its history; a partial clone has no boundary
+/// to rewrite around, so `ensure_object_cache` refuses it rather than serving
+/// a graph the first clone cannot read.
+///
+/// The engine's App installation token is preferred over the static PAT (an
+/// App-only deployment has no PAT), and the credential is scoped to the
+/// workspace's forge origin.
 async fn deepen_object_cache_from_remote(
     repository: &FsPath,
     workspace: &FsPath,
+    shared: Option<&SharedState>,
     github_pat: Option<&str>,
 ) -> bool {
     let remote = Command::new("git")
@@ -3056,19 +3067,18 @@ async fn deepen_object_cache_from_remote(
         // Refetch asks Git to transfer those promisor objects too.
         fetch.arg("--refetch");
     }
-    if let Some((key, value)) = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat))
-    {
-        // A private remote rejects the anonymous unshallow; the engine's own
-        // GitHub credential (already used for action downloads) closes it.
-        // Scoped by `github_auth_header_for_remote` so the PAT is never sent
-        // to a host the operator did not configure it for.
+    // A private remote rejects the anonymous unshallow. The engine's read
+    // credential (App installation token first, then the PAT) closes it; see
+    // `deepen_remote` for where that credential may be sent.
+    let (fetch_url, auth) = deepen_remote(shared, &url, github_pat).await;
+    if let Some((key, value)) = auth {
         fetch
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", key)
             .env("GIT_CONFIG_VALUE_0", value);
     }
     fetch
-        .arg(&url)
+        .arg(&fetch_url)
         .arg("+refs/heads/*:refs/remotes/preloop-upstream/*");
     match run_git(&mut fetch, "deepen snapshot object cache").await {
         Ok(_) => !shallow_marker.is_file(),
@@ -3147,35 +3157,40 @@ pub(crate) async fn forge_read_token(shared: &SharedState, repository: &str) -> 
     shared.state.static_github_pat()
 }
 
-/// Extra-header config that authenticates a deepen fetch against the engine's
-/// GitHub credential, or `None` when the remote is not GitHub.
+/// Where a deepen fetch goes, and the credential it carries.
 ///
-/// The static PAT is a GitHub credential; attaching it to any other host would
-/// leak it to a remote the operator never vouched for. Scope strictly: only
-/// `https://github.com/...` remotes get the header, matching what
-/// `actions/checkout` configures for its own auth.
-fn github_auth_header_for_remote(remote_url: &str, pat: &str) -> Option<(&'static str, String)> {
-    // The credential rides only over https to github.com: never over a
-    // plaintext remote, and never over an SSH remote (no scheme at all —
-    // SSH has its own key auth).
-    let (scheme, rest) = remote_url.split_once("://")?;
-    if scheme != "https" {
-        return None;
+/// A GitHub remote gets the engine's read credential: the App installation
+/// token when one covers the repository, otherwise the static PAT. The token
+/// rides only over HTTPS and only to the configured forge. An SSH origin is
+/// fetched over HTTPS to the same repository so the token can reach it; a
+/// plaintext `http://` origin never carries one. Every other remote keeps its
+/// URL and transport (SSH keys, or anonymous).
+async fn deepen_remote(
+    shared: Option<&SharedState>,
+    remote_url: &str,
+    github_pat: Option<&str>,
+) -> (String, Option<(String, String)>) {
+    let host = configured_github_host(shared);
+    let slug = parse_github_remote_slug(remote_url, &host)
+        .or_else(|| parse_github_remote_slug(&sanitize_remote_url(remote_url), &host));
+    let Some(slug) = slug.filter(|_| !remote_url.starts_with("http://")) else {
+        return (remote_url.to_owned(), None);
+    };
+    let token = match shared {
+        Some(shared) => forge_read_token(shared, &slug).await,
+        None => None,
     }
-    // Strip userinfo (`https://user:pass@github.com/...`) before extracting
-    // the host; the port separator `:` must not truncate a host either.
-    let authority = rest.rsplit('@').next().unwrap_or(rest);
-    let host = authority.split(['/', ':']).next().unwrap_or("");
-    if host != "github.com" {
-        return None;
-    }
-    use base64::Engine as _;
-    let encoded = base64::engine::general_purpose::STANDARD
-        .encode(format!("x-access-token:{pat}").as_bytes());
-    Some((
-        "http.https://github.com/.extraheader",
-        format!("AUTHORIZATION: basic {encoded}"),
-    ))
+    .or_else(|| github_pat.map(str::to_owned));
+    let Some(token) = token else {
+        return (remote_url.to_owned(), None);
+    };
+    let fetch_url = if remote_url.starts_with("https://") {
+        remote_url.to_owned()
+    } else {
+        format!("https://{host}/{slug}.git")
+    };
+    let header = scoped_fetch_auth_header(&fetch_url, &token);
+    (fetch_url, header)
 }
 /// Persist the workspace HEAD the cache was last synced to.
 ///
@@ -5282,18 +5297,24 @@ mod auth_scoping_tests {
         assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[test]
-    fn github_remote_gets_scoped_basic_header() {
-        let (key, value) = github_auth_header_for_remote(
+    #[tokio::test]
+    async fn deepen_remote_scopes_the_token_to_the_github_origin() {
+        let (url, auth) = deepen_remote(
+            None,
             "https://github.com/preloopdev/preloop-trigger-e2e-20260715.git",
-            "gho_secret",
+            Some("gho_secret"),
         )
-        .expect("github.com remote should get the header");
-        assert_eq!(key, "http.https://github.com/.extraheader");
+        .await;
+        assert_eq!(
+            url,
+            "https://github.com/preloopdev/preloop-trigger-e2e-20260715.git"
+        );
+        let (key, value) = auth.expect("github.com remote should get the token");
+        assert_eq!(key, "http.https://github.com/.extraHeader");
         // base64("x-access-token:gho_secret")
         assert_eq!(
             value,
-            "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3NlY3JldA=="
+            "Authorization: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3NlY3JldA=="
         );
     }
 
@@ -5336,30 +5357,48 @@ mod auth_scoping_tests {
         }
     }
 
-    #[test]
-    fn userinfo_in_remote_url_is_stripped_before_host_matching() {
-        let header = github_auth_header_for_remote(
-            "https://x-access-token:gho_secret@github.com/owner/repo.git",
-            "gho_secret",
-        );
-        assert!(header.is_some(), "userinfo must not defeat host matching");
-    }
-
-    #[test]
-    fn non_github_remote_never_receives_the_pat() {
+    #[tokio::test]
+    async fn deepen_remote_moves_a_github_ssh_origin_onto_https() {
         for url in [
-            "https://git.example.com/owner/repo.git",
-            "https://github.example.net/owner/repo.git",
-            "git@github.com:owner/repo.git", // SSH remotes have no scheme
-            "http://github.com/owner/repo.git", // https-only credential
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
         ] {
-            assert_eq!(
-                github_auth_header_for_remote(url, "gho_secret"),
-                None,
-                "PAT must not be attached to {url}"
-            );
+            let (fetch_url, auth) = deepen_remote(None, url, Some("gho_secret")).await;
+            assert_eq!(fetch_url, "https://github.com/owner/repo.git", "from {url}");
+            let (key, _) = auth.expect("the token rides over the HTTPS form");
+            assert_eq!(key, "http.https://github.com/.extraHeader");
         }
     }
+
+    #[tokio::test]
+    async fn deepen_remote_never_sends_a_token_elsewhere() {
+        for url in [
+            "http://github.com/owner/repo.git",
+            "https://git.example.com/owner/repo.git",
+            "https://github.example.net/owner/repo.git",
+        ] {
+            let (fetch_url, auth) = deepen_remote(None, url, Some("gho_secret")).await;
+            assert_eq!(fetch_url, url, "the origin is fetched unchanged");
+            assert!(auth.is_none(), "credential must not be attached to {url}");
+        }
+        // No credential configured: an SSH origin keeps its SSH transport.
+        let (fetch_url, auth) = deepen_remote(None, "git@github.com:owner/repo.git", None).await;
+        assert_eq!(fetch_url, "git@github.com:owner/repo.git");
+        assert!(auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn deepen_remote_keeps_userinfo_out_of_the_header_key() {
+        let (_, auth) = deepen_remote(
+            None,
+            "https://x-access-token:gho_secret@github.com/owner/repo.git",
+            Some("gho_secret"),
+        )
+        .await;
+        let (key, _) = auth.expect("userinfo must not defeat host matching");
+        assert_eq!(key, "http.https://github.com/.extraHeader");
+    }
+
     #[test]
     fn fetch_credential_is_scoped_to_the_upstream_origin() {
         let (key, value) =
@@ -5462,7 +5501,7 @@ mod deepen_and_redirect_tests {
             .unwrap();
         assert!(status.success());
 
-        let deepened = deepen_object_cache_from_remote(&repository, &workspace, None).await;
+        let deepened = deepen_object_cache_from_remote(&repository, &workspace, None, None).await;
         assert!(
             !deepened,
             "the deepen must fail against a refused connection"
@@ -7605,7 +7644,7 @@ mod object_cache_tests {
         let (work, common_dir, _, detached) = detached_workspace(temp.path());
         let state = temp.path().join("state");
 
-        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None)
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
             .await
             .unwrap();
 
@@ -7622,13 +7661,13 @@ mod object_cache_tests {
         let (work, common_dir, on_branch, _) = detached_workspace(temp.path());
         let state = temp.path().join("state");
         git(&work, &["checkout", "main"]);
-        ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+        ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None, None)
             .await
             .unwrap();
 
         git(&work, &["checkout", "--detach"]);
         let later = commit(&work, "later.txt");
-        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&later), None)
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&later), None, None)
             .await
             .unwrap();
 
@@ -7647,7 +7686,7 @@ mod object_cache_tests {
         let on_branch = commit(&work, "a.txt");
         let common_dir = std::fs::canonicalize(work.join(".git")).unwrap();
         let state = temp.path().join("state");
-        let seeded = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+        let seeded = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None, None)
             .await
             .unwrap();
 
@@ -7661,7 +7700,7 @@ mod object_cache_tests {
         marker.push(".last-head");
         std::fs::write(PathBuf::from(marker), format!("{detached}\n")).unwrap();
 
-        let healed = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None)
+        let healed = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
             .await
             .unwrap();
 
@@ -7690,7 +7729,7 @@ mod object_cache_tests {
         std::fs::create_dir_all(&state).unwrap();
         assert!(!local_clone_can_hardlink(&common_dir, &state));
 
-        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None, None)
             .await
             .expect("a workspace on another filesystem must still build the cache");
 
@@ -7712,7 +7751,7 @@ mod object_cache_tests {
         let (work, common_dir, on_branch, _) = detached_workspace(temp.path());
         let state = temp.path().join("state");
 
-        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None, None)
             .await
             .unwrap();
 
