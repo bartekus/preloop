@@ -151,8 +151,9 @@ Releases before v0.27.0 predate the changelog.
   `/etc/hosts` mapping is dropped, and `/etc/fstab` entries naming Azure disks
   this guest does not have are commented out with their original text, so
   `systemd-remount-fs.service` no longer fails on every boot. Systemd guests
-  also get `systemd-resolved`'s upstream pinned in `resolved.conf` (an
-  image's own `DNS=`, including a `resolved.conf.d` drop-in, is never touched)
+  also get `systemd-resolved`'s upstream pinned through a
+  `resolved.conf.d` drop-in (an image's own `DNS=`, in `resolved.conf` or a
+  drop-in, is never touched)
   and the Azure/cloud-init/snap/apt units the hosted image never runs masked.
   A user-provided base now preserves all of that policy by default: its
   `/etc/hosts` and `/etc/fstab` stay unchanged, its `systemd-sysctl.service`

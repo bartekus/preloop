@@ -2681,9 +2681,12 @@ fn resolver_stub_rewrite_shell(
 ///   explicit and survives a rewrite of `/etc/resolv.conf`; when neither sets
 ///   it, the value is the first configured nameserver the image carries, and
 ///   `1.1.1.1` when there is none or it is loopback (an image whose resolver
-///   is itself the stub cannot supply one). A `DNS=` the image or the operator
-///   already set is never touched, and the bake host's own resolver is never
-///   consulted.
+///   is itself the stub cannot supply one). The bake writes that value to a
+///   `resolved.conf.d/90-preloop-upstream.conf` drop-in instead of editing the
+///   image's `resolved.conf`: a bare `DNS=` appended to a file that does not
+///   exist has no `[Resolve]` section, which systemd ignores. A `DNS=` the
+///   image or the operator already set is never touched, and the bake host's
+///   own resolver is never consulted.
 /// * **`/etc/resolv.conf` naming the stub**, as a regular file. This is the
 ///   golden half of [`guest_resolver_stub_script`]: it runs whether or not
 ///   systemd is *running* (the SmolVM builder has no systemd PID 1, and a
@@ -2766,11 +2769,12 @@ fn golden_systemd_parity_script_at(
                | grep -v '^127\\.' | grep -v '^::1$' | grep -v '^0\\.0\\.0\\.0$' | grep -v '^::$' \
                | awk 'NR == 1 {{ print; exit }}'); \
              if [ -z \"$prsys_ns\" ]; then prsys_ns=1.1.1.1; fi; \
-             mkdir -p \"$prsys_etc/systemd\" 2>/dev/null || true; \
-             if printf 'DNS=%s\\n' \"$prsys_ns\" >> \"$prsys_resolved\" 2>/dev/null; then \
+             mkdir -p \"$prsys_etc/systemd/resolved.conf.d\" 2>/dev/null || true; \
+             prsys_dropin=$prsys_etc/systemd/resolved.conf.d/90-preloop-upstream.conf; \
+             if printf '[Resolve]\\nDNS=%s\\n' \"$prsys_ns\" > \"$prsys_dropin\" 2>/dev/null; then \
                echo \"preloop: set the systemd-resolved upstream to $prsys_ns\"; \
              else \
-               echo \"preloop: warning: could not set DNS= in $prsys_resolved\" >&2; \
+               echo \"preloop: warning: could not write a systemd-resolved DNS= drop-in\" >&2; \
              fi; \
            fi; \
            {rewrite}; \
@@ -10872,6 +10876,11 @@ done
             !etc.join("systemd/resolved.conf").exists(),
             "a custom base's resolved configuration must not gain a forced DNS="
         );
+        assert!(
+            !etc.join("systemd/resolved.conf.d/90-preloop-upstream.conf")
+                .exists(),
+            "a custom base must not gain a resolver drop-in"
+        );
         assert_eq!(std::fs::read_to_string(&resolv).unwrap(), resolv_fixture);
         assert_eq!(
             std::fs::read_to_string(etc.join("sysctl.d/99-custom.conf")).unwrap(),
@@ -11413,6 +11422,7 @@ done
         };
         let resolv_conf = etc.join("resolv.conf");
         let resolved_conf = etc.join("systemd/resolved.conf");
+        let upstream_dropin = etc.join("systemd/resolved.conf.d/90-preloop-upstream.conf");
         let masked = etc.join("systemd/system/fake-parity.service");
 
         let first = run();
@@ -11422,10 +11432,16 @@ done
             String::from_utf8_lossy(&first.stderr)
         );
         // resolved's upstream is the image's own nameserver, so naming the stub
-        // in resolv.conf cannot leave resolved without one.
+        // in resolv.conf cannot leave resolved without one. It is written as a
+        // drop-in: a bare `DNS=` appended to a file that does not exist has no
+        // `[Resolve]` section, and systemd ignores it.
         assert_eq!(
-            std::fs::read_to_string(&resolved_conf).unwrap(),
-            "DNS=100.96.0.1\n"
+            std::fs::read_to_string(&upstream_dropin).unwrap(),
+            "[Resolve]\nDNS=100.96.0.1\n"
+        );
+        assert!(
+            !resolved_conf.exists(),
+            "the image's resolved.conf must not be created or edited"
         );
         // The upstream line is what lets glibc resolve before resolved starts:
         // an AgentENV restore resumes mid-boot, so a stub-only file leaves the
@@ -11470,9 +11486,9 @@ done
             String::from_utf8_lossy(&second.stderr)
         );
         assert_eq!(
-            std::fs::read_to_string(&resolved_conf).unwrap(),
-            "DNS=100.96.0.1\n",
-            "a second run must not append a second DNS= line"
+            std::fs::read_to_string(&upstream_dropin).unwrap(),
+            "[Resolve]\nDNS=100.96.0.1\n",
+            "a second run must not rewrite the drop-in or duplicate DNS="
         );
         assert_eq!(
             std::fs::read_to_string(&resolv_conf).unwrap(),
@@ -11498,15 +11514,16 @@ done
 
         // An image with systemd but a resolver it cannot name: the fallback is
         // a public resolver, and a `DNS=` the image configured is never touched.
-        std::fs::remove_file(&resolved_conf).unwrap();
+        std::fs::remove_file(&upstream_dropin).unwrap();
         std::fs::write(&resolv_conf, "search only.example\n").unwrap();
         let output = run();
         assert!(output.status.success());
         assert_eq!(
-            std::fs::read_to_string(&resolved_conf).unwrap(),
-            "DNS=1.1.1.1\n",
+            std::fs::read_to_string(&upstream_dropin).unwrap(),
+            "[Resolve]\nDNS=1.1.1.1\n",
             "a guest whose resolver is itself the stub needs a public upstream"
         );
+        std::fs::remove_file(&upstream_dropin).unwrap();
         std::fs::write(&resolved_conf, "DNS=9.9.9.9\n").unwrap();
         let output = run();
         assert!(output.status.success());
@@ -11515,9 +11532,12 @@ done
             "DNS=9.9.9.9\n",
             "a configured DNS= must survive"
         );
+        assert!(
+            !upstream_dropin.exists(),
+            "a configured DNS= must not get a competing drop-in"
+        );
         // systemd-resolved also accepts DNS= in a drop-in; that is the image's
-        // configuration too, so the bake must not append a competing line to
-        // the main file.
+        // configuration too, so the bake must not write a competing one.
         std::fs::remove_file(&resolved_conf).unwrap();
         let dropin = etc.join("systemd/resolved.conf.d/10-upstream.conf");
         std::fs::create_dir_all(dropin.parent().unwrap()).unwrap();
@@ -11527,6 +11547,10 @@ done
         assert!(
             !resolved_conf.exists(),
             "a drop-in DNS= must not cause the main resolved.conf to be created"
+        );
+        assert!(
+            !upstream_dropin.exists(),
+            "an image drop-in DNS= must not be supplemented"
         );
         assert_eq!(
             std::fs::read_to_string(&dropin).unwrap(),
