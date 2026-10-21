@@ -51,6 +51,50 @@ Releases before v0.27.0 predate the changelog.
   `SMOLVM_AGENT_ROOTFS` pins a tree that does not hold the host's agent. A
   refused stop now also names the rootfs Preloop exported and the agent version
   the guest logged at boot.
+- **Self-built pull-request merges can fetch missing LFS objects.** A run on
+  an engine-built merge is served from a repository that exists only in the
+  engine, but its Git LFS objects still live upstream. The attached snapshot
+  recorded no upstream repository, so the LFS batch route treated every miss
+  as a 404 and jobs could not check out golden or other LFS-backed fixtures.
+  `attach_merge` and `attach_prebuilt_merge` now record the merge's upstream
+  `owner/repo`, with visibility left unknown so the existing route attempts a
+  fetch — App or PAT credentials when configured, anonymously otherwise.
+- **Snapshot cache deepening uses the GitHub App installation token.** A
+  shallow or partial workspace whose GitHub origin is private used to deepen
+  only with the static PAT over HTTPS, so an App-only deployment could not
+  recover the full history, and an SSH origin never received a credential at
+  all. The deepen fetch now prefers a contents-read App installation token,
+  falls back to the PAT, and fetches an SSH origin over HTTPS with that token.
+  The credential is scoped to the configured forge origin and never sent over
+  plaintext HTTP.
+
+- **Partial-clone workspaces fail the submission instead of publishing a
+  broken snapshot.** A workspace cloned with `--filter` whose objects the
+  remote could not supply left holes in the object cache. A reused cache
+  skipped the connectivity check, so the snapshot could publish a HEAD whose
+  trees or blobs no job could read. The submission is now refused with an
+  operator message when HEAD's own history is incomplete. Holes that only other
+  branches or tags reach are still published, as before; publish skips only refs
+  whose target object is absent.
+  Cache deepening also fetches tags, so objects reachable only from a tag are
+  recovered.
+
+- **Workspace snapshots build when the state directory is on another
+  filesystem.** The snapshot object cache initialized itself with
+  `git clone --bare --local`, which hardlinks object files; a workspace on a
+  bind mount, overlay or shared volume makes the kernel refuse the link with
+  `EXDEV` ("Invalid cross-device link"), and the submission failed with a 500
+  before any job ran. The clone now copies objects (`--no-hardlinks`) when the
+  workspace and the cache root are on different devices, and retries as a copy
+  if a hardlinked clone fails anyway, keeping the same-filesystem fast path.
+
+- **Submissions for repositories with thousands of refs no longer hang while
+  staging the snapshot.** `git cat-file --batch-check` was fed thousands of
+  object ids over a pipe and its answer was read only after every id had been
+  written; once the 64 KiB stdout pipe filled, the child stopped reading stdin
+  and the parent stopped draining stdout, so the submission sat there until
+  the client gave up. Git's stdin is now written while stdout and stderr are
+  drained concurrently.
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
@@ -81,6 +125,35 @@ Releases before v0.27.0 predate the changelog.
   unparseable `gitHubUrl` is an error, and job execution reuses the
   registration state validated at worker startup rather than re-reading
   `.runner` per job.
+
+### Changed
+
+- **Webhook installation-coverage lookups are cached per App.** The receiver
+  called `GET /repos/{owner}/{repo}/installation` on every signed delivery
+  before enqueueing it, so each delivery paid a GitHub API round trip inside
+  the ingress' upload slot and spent one request of the App's rate limit.
+  Only a validated positive is retained, for ten minutes. A definitive 404,
+  timeout, rate limit, 5xx, unparseable body, missing/mismatched `app_id`, or
+  suspended installation denies that delivery without being cached, so the
+  next delivery can discover a new grant immediately. Simultaneous deliveries
+  for one repository share one lookup; unrelated repositories and Apps do not
+  serialize. Signature-verified `installation` and `installation_repositories`
+  events invalidate the signer's affected answers before ordinary gating —
+  deleted/suspended installations clear all of that App's answers, and
+  added/removed repositories are re-confirmed on the next ordinary delivery.
+  Lifecycle payloads never grant access, and a payload's `app_id` is never
+  used in place of the verified signer. The cache is process-local: a
+  lifecycle event missed by a process leaves its positive valid for at most
+  the ten-minute fallback TTL, so this is not immediate distributed
+  revocation. At capacity the oldest checked answer is evicted individually,
+  and setup/doctor installation checks stay uncached.
+- **Webhook processing keeps the verified signer's App identity.** The signer
+  App id is persisted with the durable delivery and pins credential selection
+  throughout that delivery's processing (including its spawned processing task
+  and check-run reporting), so a delivery signed by App B is not processed with
+  another App's installation credentials just because that App sorts first in
+  the registry. Job-runtime token minting remains a separate repository-scoped
+  selection path; this change does not alter it.
 
 ## [0.35.0] - 2026-10-19
 
