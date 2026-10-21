@@ -35,6 +35,16 @@ Releases before v0.27.0 predate the changelog.
   The credential is scoped to the configured forge origin and never sent over
   plaintext HTTP.
 
+- **Partial-clone workspaces fail the submission instead of publishing a
+  broken snapshot.** A workspace cloned with `--filter` whose objects the
+  remote could not supply left holes in the object cache. A reused cache
+  skipped the connectivity check, so the snapshot could publish a HEAD whose
+  trees or blobs no job could read. The submission is now refused with an
+  operator message when HEAD's own history is incomplete. Holes only other
+  branches or tags reach are still published, with those refs left out.
+  Cache deepening also fetches tags, so objects reachable only from a tag are
+  recovered.
+
 - **Workspace snapshots build when the state directory is on another
   filesystem.** The snapshot object cache initialized itself with
   `git clone --bare --local`, which hardlinks object files; a workspace on a

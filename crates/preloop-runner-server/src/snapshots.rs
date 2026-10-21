@@ -1179,6 +1179,23 @@ async fn missing_snapshot_objects(repository: &FsPath) -> Result<u64, ApiError> 
         .count() as u64)
 }
 
+/// Count the objects that `rev` reaches and the cache lacks.
+///
+/// Unlike [`missing_snapshot_objects`], which walks every ref, this sees only
+/// what one commit needs. A hole that only a dangling or unfetched ref reaches
+/// does not count against the snapshot built on `rev`.
+async fn missing_objects_reachable_from(repository: &FsPath, rev: &str) -> Result<u64, ApiError> {
+    let mut verify = Command::new("git");
+    verify
+        .env("GIT_DIR", repository)
+        .args(["rev-list", "--objects", "--missing=print", rev]);
+    let output = run_git(&mut verify, "verify snapshot object cache HEAD history").await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with('?'))
+        .count() as u64)
+}
+
 async fn create_workspace_snapshot_inner(
     state_dir: &FsPath,
     workspace: &FsPath,
@@ -2925,6 +2942,9 @@ async fn ensure_object_cache(
     // remote while the lock is held; once complete it stays complete and
     // later runs skip the fetch entirely.
     let mut ancestry_complete = !repository.join("shallow").is_file();
+    // Set only when a partial clone left holes. A shallow cache has a boundary
+    // the snapshot can rewrite around, so it never takes the refusal below.
+    let mut holes = false;
     if ancestry_complete {
         // A cache cloned from a `--filter=blob:none` workspace inherits the
         // promisor pack contents (commits and trees but no blobs) without
@@ -2945,6 +2965,7 @@ async fn ensure_object_cache(
                 "snapshot object cache is missing objects (partial-clone workspace?); deepening from the remote"
             );
             ancestry_complete = false;
+            holes = true;
         }
     }
     if !ancestry_complete {
@@ -2954,6 +2975,23 @@ async fn ensure_object_cache(
             ancestry_complete = missing_snapshot_objects(&repository).await? == 0;
         }
         refreshed = refreshed || ancestry_complete;
+    }
+    // The snapshot is served from its HEAD commit: the staged tree is checked
+    // out, and the parent chain is what fetches and diffs walk. So HEAD's own
+    // history must be complete. Holes that only other refs reach (a branch a
+    // partial clone never fetched, a dangling tag) are tolerated: publish
+    // advertises only refs whose targets exist, and deep history a job cannot
+    // read is rerouted to the forge. A reused cache skips fsck, so this check
+    // is what keeps an incomplete HEAD history out of the snapshot.
+    if let Some(head) = source_head.filter(|_| holes && !ancestry_complete)
+        && missing_objects_reachable_from(&repository, head).await? > 0
+    {
+        return Err(ApiError::internal(format!(
+            "snapshot object cache {} is missing objects that HEAD {head} reaches; the \
+             workspace remote could not supply them, so the workspace is likely a partial \
+             clone. Fetch the missing objects (or clone without `--filter`), then resubmit",
+            repository.display()
+        )));
     }
     let mut index = repository.as_os_str().to_owned();
     index.push(".index");
@@ -3027,12 +3065,11 @@ async fn present_objects(
 /// Best effort by design. No remote, no network, or a private repository
 /// without credentials simply leaves the cache incomplete. A shallow cache
 /// then falls back to rewriting its history; a partial clone has no boundary
-/// to rewrite around, so `ensure_object_cache` refuses it rather than serving
-/// a graph the first clone cannot read.
+/// to rewrite around, so `ensure_object_cache` refuses it when HEAD's own
+/// history is still incomplete.
 ///
-/// The engine's App installation token is preferred over the static PAT (an
-/// App-only deployment has no PAT), and the credential is scoped to the
-/// workspace's forge origin.
+/// Heads and tags are both fetched: an object reachable only from a tag is
+/// absent from every head. The credential is chosen by `deepen_remote`.
 async fn deepen_object_cache_from_remote(
     repository: &FsPath,
     workspace: &FsPath,
@@ -3077,9 +3114,12 @@ async fn deepen_object_cache_from_remote(
             .env("GIT_CONFIG_KEY_0", key)
             .env("GIT_CONFIG_VALUE_0", value);
     }
+    // Tags are fetched into their own namespace: an object reachable only from
+    // a tag (a release tag on a deleted branch) is absent from every head.
     fetch
         .arg(&fetch_url)
-        .arg("+refs/heads/*:refs/remotes/preloop-upstream/*");
+        .arg("+refs/heads/*:refs/remotes/preloop-upstream/*")
+        .arg("+refs/tags/*:refs/remotes/preloop-upstream-tags/*");
     match run_git(&mut fetch, "deepen snapshot object cache").await {
         Ok(_) => !shallow_marker.is_file(),
         Err(error) => {
@@ -7705,6 +7745,107 @@ mod object_cache_tests {
             .unwrap();
 
         assert!(cache_has(&healed, &detached));
+    }
+
+    /// A remote whose only route to a blob is the `v1` tag: the `side` branch
+    /// that carried `tagged.txt` is deleted before anyone clones. Returns the
+    /// remote and the `main` tip.
+    fn tag_only_history(root: &FsPath) -> (PathBuf, String) {
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["config", "uploadpack.allowFilter", "true"]);
+        commit(&source, "m1.txt");
+        let head = commit(&source, "m2.txt");
+        git(&source, &["checkout", "-b", "side"]);
+        commit(&source, "tagged.txt");
+        git(&source, &["tag", "v1"]);
+        git(&source, &["checkout", "main"]);
+        git(&source, &["branch", "-D", "side"]);
+        (source, head)
+    }
+
+    /// A reused cache whose HEAD history lost a blob must be refused. The
+    /// reused path skips fsck, so nothing else would catch it, and the staged
+    /// tree would name objects no job can read.
+    #[tokio::test]
+    async fn reused_cache_with_holes_under_head_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let (work, common_dir, _, detached) = detached_workspace(temp.path());
+        let state = temp.path().join("state");
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
+            .await
+            .unwrap();
+        let blob = git(&work, &["rev-parse", "HEAD:a.txt"]);
+        let object = loose_object(&cache.objects, &blob);
+        assert!(object.is_file(), "the fixture blob must be loose");
+        std::fs::remove_file(&object).unwrap();
+
+        let error = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
+            .await
+            .err()
+            .expect("a hole HEAD reaches, with no remote to repair it, must be refused");
+        assert!(
+            error.message().contains("missing objects"),
+            "unexpected error: {}",
+            error.message()
+        );
+    }
+
+    /// A hole only another branch reaches must not refuse the snapshot: HEAD is
+    /// complete, and publish leaves out refs whose targets are absent.
+    #[tokio::test]
+    async fn holes_off_head_do_not_refuse_the_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (work, common_dir, _, detached) = detached_workspace(temp.path());
+        git(&work, &["checkout", "-b", "side"]);
+        let side = commit(&work, "side.txt");
+        git(&work, &["checkout", "--detach", detached.as_str()]);
+        let state = temp.path().join("state");
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
+            .await
+            .unwrap();
+        assert!(cache_has(&cache, &side));
+        let spec = format!("{side}:side.txt");
+        let side_blob = git(&work, &["rev-parse", spec.as_str()]);
+        std::fs::remove_file(loose_object(&cache.objects, &side_blob)).unwrap();
+
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None, None)
+            .await
+            .expect("a hole only the side branch reaches must not refuse HEAD");
+        assert!(!cache.ancestry_complete, "the hole is still there");
+    }
+
+    /// A partial clone whose origin is reachable must recover objects that only
+    /// a tag reaches, not just those on the branches.
+    #[tokio::test]
+    async fn deepen_fetches_objects_reachable_only_from_tags() {
+        let temp = tempfile::tempdir().unwrap();
+        let (source, head) = tag_only_history(temp.path());
+        let partial = temp.path().join("partial");
+        let origin = format!("file://{}", source.display());
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--filter=blob:none",
+                origin.as_str(),
+                "partial",
+            ],
+        );
+        let common_dir = std::fs::canonicalize(partial.join(".git")).unwrap();
+        let state = temp.path().join("state");
+
+        let cache = ensure_object_cache(&state, &partial, &common_dir, Some(&head), None, None)
+            .await
+            .expect("a partial clone with a reachable origin must build the cache");
+
+        assert!(
+            cache.ancestry_complete,
+            "the tag-only blob must be fetched too"
+        );
     }
 
     /// Path of a loose object inside an object directory.
