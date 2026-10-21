@@ -1799,7 +1799,10 @@ impl VmProvider for SmolVmProvider {
         if let Some(dns) = resolved_guest_dns(
             spec.dns.as_deref(),
             !matches!(spec.network, NetworkPolicy::Disabled),
-            public_only_net_backend(self.env_lookup),
+            match spec.network {
+                NetworkPolicy::PublicOnly => public_only_net_backend(self.env_lookup),
+                _ => "tsi",
+            },
             workload_init.is_some(),
         ) {
             args.extend(["--dns".into(), dns]);

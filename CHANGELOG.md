@@ -17,6 +17,9 @@ Releases before v0.27.0 predate the changelog.
 - **Direct Docker actions retain their image reference.** Job messages carrying
   a `containerRegistry` reference now select the `docker://` action handler
   instead of being reconstructed as an empty remote-action reference.
+- **Guest DNS follows the selected network backend unless explicitly overridden.**
+  Unset `PRELOOP_RUNNER_DNS` no longer forces a public resolver over provider
+  defaults; unrestricted TSI systemd launches select the resolved stub.
 - **Container DNS reaches systemd-resolved's stub, so `/etc/hosts` aliases
   resolve inside a compose network.** A GitHub-hosted runner's container
   resolves a `postgres.localhost`-style service alias because its host's

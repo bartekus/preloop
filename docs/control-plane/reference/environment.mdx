@@ -130,7 +130,7 @@ Numeric values in this group are decimal integers. Retention, cache, and job-lim
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Prefix for runner machine names. |
 | `PRELOOP_RUNNER_USER` | `runner` for `serve`; `root` for `build-golden` | Guest account used for job steps. An empty value disables account switching in `serve`; `root` restores root. |
 | `PRELOOP_RUNNER_UID` | `1001` | Numeric guest runner UID. |
-| `PRELOOP_RUNNER_DNS` | `8.8.8.8` | DNS resolver presented to guest networking. |
+| `PRELOOP_RUNNER_DNS` | Provider default | Explicit SmolVM guest DNS override. When unset or empty, preserve provider selection: TSI with a systemd workload uses the resolved stub, virtio-net uses its gateway. AgentENV uses its node resolver. |
 | `PRELOOP_RUNNER_PACK_PROXY` | Falls back to `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` | HTTP proxy for packed-golden export traffic. |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Falls back to `NO_PROXY`, `no_proxy` | Proxy bypass list for packed-golden export traffic. |
 | `PRELOOP_RUNNER_BUNDLE` | Auto-discovered Linux `preloop-runner` bundle | Directory containing the Linux guest runner. Invalid paths fall through discovery and then fail startup if no bundle is found. On the AgentENV backend the host tree is archived into a content-addressed read-only volume, so a bundle change publishes a new volume. |

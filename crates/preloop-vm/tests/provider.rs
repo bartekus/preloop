@@ -759,6 +759,27 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
         assert_eq!(&args[separator + 1..], ["/sbin/init"], "{args:?}");
     }
 
+    #[tokio::test]
+    async fn unrestricted_systemd_pack_uses_the_tsi_stub_without_a_backend_override() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory.path().join("official.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("unrestricted-systemd").unwrap());
+        spec.image = pack.display().to_string();
+        spec.role = MachineRole::OfficialPack;
+        spec.network = NetworkPolicy::Unrestricted;
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+        let args = captured_args(&executable);
+        assert!(!args.iter().any(|arg| arg == "--net-backend"));
+        assert!(
+            args.windows(2).any(|pair| pair == ["--dns", "127.0.0.53"]),
+            "{args:?}"
+        );
+    }
+
     /// A custom pack is the operator's data. Its `/var/lib/docker` may hold
     /// the preloaded images the pack exists for, so no default guest-local
     /// volume may be mounted over it, and its own entrypoint/cmd is what runs
