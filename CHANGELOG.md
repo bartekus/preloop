@@ -35,6 +35,18 @@ Releases before v0.27.0 predate the changelog.
   repository, commit, ref, tool and sorted finding fingerprints — not on raw
   bytes — so the same analysis is returned instead of stored twice.
 
+### Security
+
+- **CI security gates cover PRs, main, dependencies, and the runner image.**
+  Semgrep runs on every pull request (`p/github-actions`, `p/secrets`)
+  and fails on findings; CodeQL runs on merge to `main` for
+  Actions and Rust; dependency review blocks high-severity additions; and
+  OpenSSF Scorecard runs weekly. The published runner image is now signed with
+  keyless cosign and has a registry-backed provenance attestation. The golden
+  scan also requires the aarch64 apt SBOM and scans it with Grype, and the
+  main ruleset no longer allows direct pushes (admins may still merge a PR),
+  and the release-tag ruleset restricts tag creation.
+
 ## [0.35.5] - 2026-10-21
 
 ### Security
