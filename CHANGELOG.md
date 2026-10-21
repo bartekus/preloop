@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.35.5] - 2026-10-21
+
 ### Security
 
 - **Webhook ingress bounds and times out body uploads.** The GitHub webhook
@@ -26,6 +28,39 @@ Releases before v0.27.0 predate the changelog.
   by the flow recorder ahead of the route's own admission.
 ### Fixed
 
+- **A stale pinned guest-agent rootfs can no longer make every VM
+  unstoppable.** The engine exports `SMOLVM_AGENT_ROOTFS` to every smolvm
+  child (the child's `HOME`/data directory is isolated), and an inherited
+  variable wins over the rootfs that ships beside the binary — so after a
+  hand-upgraded smolvm prefix the engine kept booting the old agent found in
+  the data directory, and smolvm ≥ 1.16 refused every `machine stop` with
+  `running guest agent does not support safe shutdown; VM left unchanged;
+  update the guest agent before retrying`, which the pool retried for hours.
+  On Linux the rootfs shipped next to the resolved binary is now the first
+  candidate, and on every platform a candidate that agrees with it is
+  preferred; a boot from a provably mismatched agent is refused up front with
+  both rootfs paths, both agent hashes, the host version, and the remedy. Two
+  identical trees are not enough on their own: when the agent they hold
+  advertises no `quiesced-shutdown-v1` while the resolved host requires it,
+  the boot is refused too — that is what a smolvm upgraded without its rootfs
+  looks like. `preloop update --ensure-runtime` refreshes the rootfs the engine
+  exports (`<data dir>/agent-rootfs`, where `<data dir>` is `SMOLVM_DATA_DIR`
+  or the effective Preloop home's `smolvm`), keeps the rootfs beside the
+  resolved binary in step, records the version in `.preloop-agent-version`, and
+  repairs the install whenever either tree stops matching the installed
+  smolvm — not only when the binary is reinstalled. It never installs a sibling
+  it has just proven stale, and it refuses to claim a repair while
+  `SMOLVM_AGENT_ROOTFS` pins a tree that does not hold the host's agent. A
+  refused stop now also names the rootfs Preloop exported and the agent version
+  the guest logged at boot.
+- **Self-built pull-request merges can fetch missing LFS objects.** A run on
+  an engine-built merge is served from a repository that exists only in the
+  engine, but its Git LFS objects still live upstream. The attached snapshot
+  recorded no upstream repository, so the LFS batch route treated every miss
+  as a 404 and jobs could not check out golden or other LFS-backed fixtures.
+  `attach_merge` and `attach_prebuilt_merge` now record the merge's upstream
+  `owner/repo`, with visibility left unknown so the existing route attempts a
+  fetch — App or PAT credentials when configured, anonymously otherwise.
 - **Snapshot cache deepening uses the GitHub App installation token.** A
   shallow or partial workspace whose GitHub origin is private used to deepen
   only with the static PAT over HTTPS, so an App-only deployment could not
@@ -62,7 +97,6 @@ Releases before v0.27.0 predate the changelog.
   and the parent stopped draining stdout, so the submission sat there until
   the client gave up. Git's stdin is now written while stdout and stderr are
   drained concurrently.
-
 - **Retries preserve nested-action authorization.** Retrying a claimed job now
   updates `system.orchestrationId` to the new attempt in both Lite and PostgreSQL.
   Previously it still named the abandoned attempt, so nested action resolution
@@ -3097,7 +3131,8 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.0...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.35.5...HEAD
+[0.35.5]: https://github.com/preloopdev/preloop/compare/v0.35.0...v0.35.5
 [0.35.0]: https://github.com/preloopdev/preloop/compare/v0.34.4...v0.35.0
 [0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7
 [0.33.6]: https://github.com/preloopdev/preloop/compare/v0.33.5...v0.33.6

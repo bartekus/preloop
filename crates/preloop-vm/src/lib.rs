@@ -14,6 +14,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+pub mod agent_rootfs;
 pub mod agentenv;
 pub mod guest_privilege;
 pub mod telemetry;
@@ -597,6 +598,24 @@ impl MachineSpec {
     }
 }
 
+/// Whether a pack machine's resolved workload starts systemd as PID 1.
+///
+/// The implicit resolver stub is only useful when the guest actually runs
+/// systemd: `systemd-resolved` is started by the systemd instance that owns
+/// PID 1. The check is the program's file name — the managed default is
+/// `/sbin/init`, and an operator naming the binary explicitly uses `systemd`
+/// (for example `/lib/systemd/systemd --system`). Any other command, such as
+/// `["/bin/sh", "-c", "sleep infinity"]` or one that starts systemd
+/// indirectly, keeps the resolver smolvm would otherwise configure: the stub
+/// is only emitted when systemd is certain to answer on it.
+fn workload_init_is_systemd(workload: Option<&[String]>) -> bool {
+    workload
+        .and_then(|command| command.first())
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|program| program.to_str())
+        .is_some_and(|program| matches!(program, "init" | "systemd"))
+}
+
 /// The `--dns` resolver a machine is launched with.
 ///
 /// An explicit [`MachineSpec::dns`] always wins, and a machine with no
@@ -606,7 +625,9 @@ impl MachineSpec {
 /// runner's view: `systemd-resolved` answers `/etc/hosts` names and
 /// synthesizes `.localhost`, so a user-defined network's embedded resolver
 /// (127.0.0.11 forwarding to the host's `/etc/resolv.conf` nameserver) reaches
-/// them.
+/// them. `systemd_workload` is that condition, resolved by
+/// [`workload_init_is_systemd`]: a custom workload that does not start systemd
+/// gets no stub, because nothing would listen on it.
 ///
 /// This flag only reaches the guest on smolvm's TSI backend. With virtio-net
 /// the host overwrites the guest resolver with the network gateway whatever
@@ -620,12 +641,12 @@ pub fn resolved_guest_dns(
     spec_dns: Option<&str>,
     network_enabled: bool,
     backend: &str,
-    workload_init: bool,
+    systemd_workload: bool,
 ) -> Option<String> {
     if let Some(dns) = spec_dns.map(str::trim).filter(|dns| !dns.is_empty()) {
         return Some(dns.to_owned());
     }
-    let want_stub = network_enabled && workload_init && backend == "tsi";
+    let want_stub = network_enabled && systemd_workload && backend == "tsi";
     want_stub.then(|| SYSTEMD_RESOLVED_STUB_DNS.to_owned())
 }
 
@@ -781,6 +802,20 @@ pub enum VmError {
         value: String,
         /// Modes upstream accepts.
         expected: &'static str,
+    },
+    /// The guest agent Preloop would export to smolvm cannot serve the
+    /// resolved binary (see [`agent_rootfs`]).
+    ///
+    /// Booting from it means every machine is unstoppable: smolvm refuses
+    /// `machine stop` with "running guest agent does not support safe
+    /// shutdown; VM left unchanged" and the runner pool retries forever, so
+    /// failing the boot with the diagnosis up front is the only useful
+    /// outcome.
+    #[error("{report}")]
+    GuestAgentMismatch {
+        /// One-read diagnosis: both rootfs paths, both agent hashes, the
+        /// host version, and the remedy.
+        report: String,
     },
 }
 
@@ -1197,11 +1232,97 @@ impl SmolVmProvider {
     /// the sandbox reaches any command that can spawn or restart SmolVM's
     /// `_boot-vm` subprocess — create, start, start_forkable, fork, exec,
     /// pack — not just machine creation.
+    ///
+    /// The guest-agent rootfs guard runs first: a command that could boot a
+    /// guest from an agent the resolved binary cannot stop is refused before
+    /// it starts, once per provider, instead of failing hours later inside
+    /// the pool's retry loop (see [`agent_rootfs`]).
     fn sandboxed_command(&self) -> Result<Command, VmError> {
+        if let Some(report) = self.agent_mismatch() {
+            return Err(VmError::GuestAgentMismatch { report });
+        }
         let mut command = self.command();
         apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
         apply_sandbox_env(&mut command, self.env_lookup)?;
         Ok(command)
+    }
+
+    /// The guest-agent guard verdict: the one-read refusal report when the
+    /// agent Preloop would export cannot serve this binary.
+    ///
+    /// The guard reads and hashes whole rootfs trees (and may run `smolvm
+    /// --version`), so [`agent_rootfs::check_cached`] reuses its verdict while
+    /// the binary and the candidate rootfs trees are unchanged — a repair or a
+    /// replacement is picked up without restarting the engine.
+    fn agent_mismatch(&self) -> Option<String> {
+        agent_rootfs::check_cached(&agent_rootfs::Runtime::from_env(), &self.binary)
+            .err()
+            .and_then(|error| match error {
+                VmError::GuestAgentMismatch { report } => Some(report),
+                _ => None,
+            })
+    }
+
+    /// Append the guest-agent context to SmolVM's "this guest cannot be
+    /// stopped" failure.
+    ///
+    /// The message alone ("running guest agent does not support safe
+    /// shutdown; VM left unchanged; update the guest agent before retrying")
+    /// names neither the rootfs Preloop pinned nor the agent that actually
+    /// booted, which is what an operator needs to repair the install. Both are
+    /// gathered here: the rootfs the engine exports, and the version the
+    /// guest logged at boot into the machine's console log. Every failure that
+    /// is not a shutdown refusal passes through untouched.
+    async fn diagnose_shutdown_refusal(&self, name: &MachineName, error: VmError) -> VmError {
+        let VmError::Command {
+            operation,
+            exit_code,
+            message,
+        } = error
+        else {
+            return error;
+        };
+        if !is_shutdown_refusal(&message) {
+            return VmError::Command {
+                operation,
+                exit_code,
+                message,
+            };
+        }
+        let mut details = vec![format!("resolved smolvm {}", self.binary.display())];
+        if let Some(rootfs) = agent_rootfs::resolve_exported_rootfs(
+            &agent_rootfs::Runtime::from_env(),
+            Some(&self.binary),
+        ) {
+            details.push(format!(
+                "guest-agent rootfs {} ({})",
+                rootfs.display(),
+                agent_rootfs::AgentRootfs::inspect(&rootfs).describe()
+            ));
+        }
+        match self.machine_data_dir_direct(name).await {
+            Ok(dir) => {
+                let console = dir.join(agent_rootfs::CONSOLE_LOG);
+                let version = std::fs::read_to_string(&console)
+                    .ok()
+                    .and_then(|text| agent_rootfs::agent_boot_version(&text));
+                details.push(format!(
+                    "guest agent boot version {} (console log {})",
+                    version.as_deref().unwrap_or("unknown"),
+                    console.display()
+                ));
+            }
+            Err(error) => details.push(format!("machine data dir unknown: {error}")),
+        }
+        VmError::Command {
+            operation,
+            exit_code,
+            message: format!(
+                "{message} [guest-agent diagnostics: {}; run `preloop update --ensure-runtime` to \
+                 reinstall the guest agent that matches the resolved smolvm]",
+                details.join("; ")
+            ),
+        }
     }
 
     /// A command for an operation that can never boot or restart `_boot-vm`
@@ -1803,7 +1924,7 @@ impl VmProvider for SmolVmProvider {
                 NetworkPolicy::PublicOnly => public_only_net_backend(self.env_lookup),
                 _ => "tsi",
             },
-            workload_init.is_some(),
+            workload_init_is_systemd(workload_init.as_deref()),
         ) {
             args.extend(["--dns".into(), dns]);
         }
@@ -2081,17 +2202,21 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
-        self.recovery(
-            "stop",
-            &[
-                "machine".into(),
-                "stop".into(),
-                "--name".into(),
-                name.as_str().into(),
-            ],
-        )
-        .await
-        .map(|_| ())
+        let result = self
+            .recovery(
+                "stop",
+                &[
+                    "machine".into(),
+                    "stop".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                ],
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.diagnose_shutdown_refusal(name, error).await),
+        }
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
@@ -2191,19 +2316,20 @@ impl VmProvider for SmolVmProvider {
             }
             ok => ok,
         };
-        if result.is_ok() {
-            let mut forked = self.forked_machines.lock().await;
-            forked.remove(name.as_str());
-            // Deleting a golden must evict every clone forked from it. Without
-            // this, a rebaked or recreated golden name would report live
-            // clones forever, silently disabling the re-arm recovery.
-            forked.retain(|_, owner| owner != name.as_str());
-            // The device ledger is diagnostics for a machine that exists: a
-            // deleted name must not keep its inventory (or its memory) around,
-            // and a later machine created under the same name records its own.
-            self.declared_devices.lock().await.remove(name.as_str());
+        if let Err(error) = result {
+            return Err(self.diagnose_shutdown_refusal(name, error).await);
         }
-        result
+        let mut forked = self.forked_machines.lock().await;
+        forked.remove(name.as_str());
+        // Deleting a golden must evict every clone forked from it. Without
+        // this, a rebaked or recreated golden name would report live
+        // clones forever, silently disabling the re-arm recovery.
+        forked.retain(|_, owner| owner != name.as_str());
+        // The device ledger is diagnostics for a machine that exists: a
+        // deleted name must not keep its inventory (or its memory) around,
+        // and a later machine created under the same name records its own.
+        self.declared_devices.lock().await.remove(name.as_str());
+        Ok(())
     }
 
     async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
@@ -2863,24 +2989,55 @@ fn parse_df_available_kib(output: &str) -> Option<u64> {
 /// may isolate the child's `HOME` on macOS, so the REAL host locations must
 /// be probed explicitly or a standard install's agent rootfs is never found
 /// (the isolated HOME sends smolvm to an empty directory).
-fn agent_rootfs_candidates(host_home: Option<&Path>, data_dir: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+///
+/// `binary` adds the rootfs that ships next to the resolved smolvm, which is
+/// the only copy guaranteed to match it. On Linux it leads (see
+/// [`agent_rootfs::resolve_exported_rootfs`]) so a stale data-dir copy can
+/// never override the agent that shipped with the binary; elsewhere it is
+/// appended, keeping the layouts the platform installers established.
+fn agent_rootfs_candidates(
+    host_home: Option<&Path>,
+    data_dir: Option<&Path>,
+    binary: Option<&Path>,
+) -> Vec<PathBuf> {
+    let shipped = binary.and_then(agent_rootfs::shipped_rootfs);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Some(shipped) = &shipped {
+        push_unique(&mut candidates, shipped.clone());
+    }
     if let Some(data_dir) = data_dir {
-        candidates.push(data_dir.join("agent-rootfs"));
+        push_unique(&mut candidates, data_dir.join("agent-rootfs"));
     }
     if let Some(home) = host_home {
         #[cfg(target_os = "macos")]
         {
-            candidates.push(home.join("Library/Application Support/smolvm/agent-rootfs"));
-            candidates.push(home.join(".smolvm/agent-rootfs"));
+            push_unique(
+                &mut candidates,
+                home.join("Library/Application Support/smolvm/agent-rootfs"),
+            );
+            push_unique(&mut candidates, home.join(".smolvm/agent-rootfs"));
         }
         #[cfg(not(target_os = "macos"))]
         {
-            candidates.push(home.join(".local/share/smolvm/agent-rootfs"));
-            candidates.push(home.join(".smolvm/agent-rootfs"));
+            push_unique(
+                &mut candidates,
+                home.join(".local/share/smolvm/agent-rootfs"),
+            );
+            push_unique(&mut candidates, home.join(".smolvm/agent-rootfs"));
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(shipped) = shipped {
+        push_unique(&mut candidates, shipped);
+    }
     candidates
+}
+
+fn push_unique(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.contains(&path) {
+        candidates.push(path);
+    }
 }
 
 /// Executable name libkrun's hypervisor shows up as in `ps`.
@@ -3293,6 +3450,27 @@ fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
     Ok(killed)
 }
 
+/// SmolVM phrasings that mean the guest agent could not confirm a safe
+/// shutdown, so the machine was left running.
+///
+/// Upstream's current wording is "running guest agent does not support safe
+/// shutdown; VM left unchanged; update the guest agent before retrying"; the
+/// pre-1.16 agents fail one layer later, in the storage sync step, with "guest
+/// did not confirm filesystem synchronization; left the VM alive for retry".
+const SHUTDOWN_REFUSAL_MARKERS: &[&str] = &[
+    "does not support safe shutdown",
+    "did not confirm filesystem synchronization",
+];
+
+/// Whether an error message is SmolVM's refusal to stop a guest agent whose
+/// capabilities it cannot trust.
+fn is_shutdown_refusal(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    SHUTDOWN_REFUSAL_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
 /// Declared-size ceiling for SmolVM pack extraction (512 GiB): above the
 /// official golden's sparse disk sizes, still finite.
 const PACK_MAX_EXTRACT_BYTES: u64 = 512 * 1024 * 1024 * 1024;
@@ -3327,11 +3505,13 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
 
     // HOME may be isolated above, so preserve the host installation assets
     // explicitly for the child SmolVM process: the agent rootfs lives in the
-    // REAL host's platform data dir, which the isolated HOME would miss.
+    // REAL host's platform data dir, which the isolated HOME would miss. The
+    // rootfs that ships next to the resolved binary outranks a data-dir copy
+    // that disagrees with it, so a stale copy can never pin an old guest
+    // agent (see [`agent_rootfs`]).
     if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none()
-        && let Some(path) = agent_rootfs_candidates(host_home.as_deref(), data_dir.as_deref())
-            .into_iter()
-            .find(|path| path.is_dir())
+        && let Some(path) =
+            agent_rootfs::exported_rootfs_cached(&agent_rootfs::Runtime::from_env(), binary)
     {
         env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
     }
@@ -4654,7 +4834,7 @@ mod tests {
         let legacy = home.join(".smolvm/agent-rootfs");
         std::fs::create_dir_all(&platform).expect("platform agent rootfs");
         std::fs::create_dir_all(&legacy).expect("legacy agent rootfs");
-        let found = agent_rootfs_candidates(Some(home), None)
+        let found = agent_rootfs_candidates(Some(home), None, None)
             .into_iter()
             .find(|path| path.is_dir())
             .expect("a candidate exists");
@@ -4666,11 +4846,53 @@ mod tests {
         // An explicit SMOLVM_DATA_DIR wins over the platform defaults.
         let explicit = home.join("custom/agent-rootfs");
         std::fs::create_dir_all(&explicit).expect("explicit agent rootfs");
-        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()))
+        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()), None)
             .into_iter()
             .find(|path| path.is_dir())
             .expect("explicit candidate exists");
         assert_eq!(found, explicit);
+    }
+
+    /// The rootfs shipped next to the resolved binary is a candidate, and on
+    /// Linux it leads: a stale data-directory copy must never outrank the
+    /// agent that came out of the same release as the binary.
+    #[test]
+    fn agent_rootfs_candidates_place_the_binaries_sibling_first_on_linux() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // macOS resolves `/var` to `/private/var`; the guard canonicalizes the
+        // binary it inspects, so build the fixture under the canonical root.
+        let root = dir.path().canonicalize().expect("canonical temp dir");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&prefix).expect("prefix");
+        let binary = prefix.join("smolvm");
+        std::fs::write(&binary, b"#!/bin/sh\n").expect("binary");
+        let shipped = prefix.join("agent-rootfs");
+        std::fs::create_dir_all(shipped.join("sbin")).expect("shipped rootfs");
+        std::fs::write(shipped.join("sbin/init"), b"#!/bin/sh\n").expect("init");
+        assert_eq!(
+            super::agent_rootfs::shipped_rootfs(&binary).as_deref(),
+            Some(shipped.as_path()),
+            "the fixture must look like an install prefix"
+        );
+        let data_dir = root.join("data");
+        let candidates = agent_rootfs_candidates(
+            Some(root.as_path()),
+            Some(data_dir.as_path()),
+            Some(binary.as_path()),
+        );
+        assert!(candidates.contains(&shipped), "{candidates:?}");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            candidates.first(),
+            Some(&shipped),
+            "Linux must prefer the binary's sibling over the data-directory copy"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(data_dir.join("agent-rootfs").as_path()),
+            "the data-directory candidate keeps its place on this platform"
+        );
     }
 
     use super::*;
@@ -5405,6 +5627,57 @@ mod tests {
         assert_eq!(
             resolved_guest_dns(Some("  "), true, "virtio-net", true),
             None
+        );
+    }
+
+    /// Only a workload that starts systemd gets the implicit stub: the managed
+    /// `/sbin/init` default and an operator-named `systemd` binary qualify, an
+    /// arbitrary command does not, and anything unrecognized fails closed.
+    #[test]
+    fn the_implicit_stub_requires_a_systemd_workload() {
+        let workload = |command: &[&str]| -> Option<Vec<String>> {
+            Some(command.iter().map(|arg| (*arg).to_owned()).collect())
+        };
+        for command in [
+            &["/sbin/init"][..],
+            &["/lib/systemd/systemd", "--system"][..],
+        ] {
+            assert!(
+                workload_init_is_systemd(workload(command).as_deref()),
+                "{command:?}"
+            );
+        }
+        for command in [
+            &["/bin/sh", "-c", "sleep infinity"][..],
+            &["sleep", "infinity"][..],
+            &[""][..],
+        ] {
+            assert!(
+                !workload_init_is_systemd(workload(command).as_deref()),
+                "{command:?}"
+            );
+        }
+        assert!(!workload_init_is_systemd(None));
+        assert!(!workload_init_is_systemd(Some(&[])));
+        assert_eq!(
+            resolved_guest_dns(
+                None,
+                true,
+                "tsi",
+                workload_init_is_systemd(workload(&["/bin/sh", "-c", "sleep infinity"]).as_deref())
+            ),
+            None,
+            "a custom non-systemd workload has nothing answering on the stub"
+        );
+        assert_eq!(
+            resolved_guest_dns(
+                Some("8.8.8.8"),
+                true,
+                "tsi",
+                workload_init_is_systemd(workload(&["/bin/sh"]).as_deref())
+            ),
+            Some("8.8.8.8".to_owned()),
+            "an explicit resolver still wins"
         );
     }
 
