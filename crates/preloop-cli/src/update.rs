@@ -341,8 +341,13 @@ async fn update_linux_runner_bundle(client: &Client, release: &Release) -> anyho
 /// Tests point these at tempdirs.
 #[derive(Debug, Clone)]
 struct SmolvmInstall {
-    /// `~/.smolvm`: the wrapper, binary, `lib/`, and disk templates.
+    /// `~/.smolvm`: the wrapper, binary, `lib/`, and disk templates. The
+    /// archive installer always writes here.
     prefix: PathBuf,
+    /// Directory of the `smolvm` that `PATH` resolves (symlinks followed).
+    /// Its `agent-rootfs` is the tree the engine prefers, so refreshes repair
+    /// this sibling; it is never an install destination.
+    resolved_prefix: PathBuf,
     /// macOS: `~/Library/Application Support/smolvm`; Linux:
     /// `$XDG_DATA_HOME/smolvm` or `~/.local/share/smolvm`. SmolVM's own
     /// registry and `init.krun` live here.
@@ -378,12 +383,18 @@ fn resolved_smolvm_install() -> Option<SmolvmInstall> {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local").join("share"))
         .join("smolvm");
-    let prefix = preloop_vm::agent_rootfs::resolve_binary(Path::new("smolvm"))
+    // The managed prefix is fixed: the archive installer owns its layout, and
+    // a system or package-manager binary must not turn `/usr/local/bin` into a
+    // second `lib/` tree. The PATH-resolved prefix is tracked separately so a
+    // rootfs refresh repairs the sibling the engine actually boots from.
+    let prefix = home.join(".smolvm");
+    let resolved_prefix = preloop_vm::agent_rootfs::resolve_binary(Path::new("smolvm"))
         .and_then(|binary| binary.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| home.join(".smolvm"));
+        .unwrap_or_else(|| prefix.clone());
     let runtime = preloop_vm::agent_rootfs::Runtime::from_env();
     Some(SmolvmInstall {
         prefix,
+        resolved_prefix,
         agent_dir: engine_agent_dir(&runtime, &data_dir),
         data_dir,
         bin_dir: home.join(".local").join("bin"),
@@ -634,7 +645,7 @@ async fn ensure_agent_rootfs(
             target.display(),
         );
     }
-    let shipped = install.prefix.join("agent-rootfs");
+    let shipped = install.resolved_prefix.join("agent-rootfs");
     // smolvm's own data directory is a candidate too — the tree an install
     // with no sibling rootfs boots from — so a stale copy there is a stale
     // boot as well.
@@ -764,6 +775,7 @@ fn install_agent_rootfs(
     // that already exist are filled — laying one down is the smolvm
     // installer's job, not ours.
     for other in [
+        install.resolved_prefix.join("agent-rootfs"),
         install.prefix.join("agent-rootfs"),
         install.data_dir.join("agent-rootfs"),
     ] {
@@ -1980,6 +1992,7 @@ mod tests {
 
         let install = SmolvmInstall {
             prefix: directory.path().join("prefix"),
+            resolved_prefix: directory.path().join("path-bin"),
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
             agent_dir: directory.path().join("data"),
@@ -2084,6 +2097,10 @@ mod tests {
             std::fs::read_link(install.bin_dir.join("smolvm")).unwrap(),
             install.prefix.join("smolvm")
         );
+        assert!(
+            !install.resolved_prefix.exists(),
+            "the archive install must never write into the PATH-resolved prefix"
+        );
     }
 
     /// Fixture for the agent-rootfs refresh tests: a data-dir rootfs holding
@@ -2096,6 +2113,7 @@ mod tests {
     ) -> (SmolvmInstall, std::path::PathBuf) {
         let install = SmolvmInstall {
             prefix: directory.path().join("prefix"),
+            resolved_prefix: directory.path().join("prefix"),
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
             agent_dir: directory.path().join("data"),
@@ -2285,6 +2303,41 @@ mod tests {
         );
     }
 
+    /// The rootfs the engine prefers is the one beside the `PATH`-resolved
+    /// binary, which can live outside the managed `~/.smolvm` prefix (a
+    /// system or package-manager install). Refresh that sibling, and do not
+    /// create a rootfs in the managed prefix that was not there before.
+    #[tokio::test]
+    async fn the_refresh_repairs_the_resolved_sibling_not_the_managed_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut install, target) =
+            agent_rootfs_fixture(&directory, "1.30.1", Some("1.30.1"), None);
+        install.resolved_prefix = directory.path().join("usr/local/bin");
+        let shipped = install.resolved_prefix.join("agent-rootfs");
+        std::fs::create_dir_all(shipped.join("usr/local/bin")).unwrap();
+        std::fs::write(
+            shipped.join("usr/local/bin/smolvm-agent"),
+            agent_bytes("1.14.2", true),
+        )
+        .unwrap();
+
+        let client = Client::builder().build().unwrap();
+        ensure_agent_rootfs(&client, &install, Some("1.30.1"))
+            .await
+            .expect("the matching data-dir copy repairs the resolved sibling");
+
+        assert_eq!(
+            agent_rootfs_version(&shipped).as_deref(),
+            Some("1.30.1"),
+            "the tree beside the resolved binary is the one the engine boots from"
+        );
+        assert!(
+            !install.prefix.join("agent-rootfs").exists(),
+            "only trees that already exist are refreshed"
+        );
+        assert_eq!(agent_rootfs_version(&target).as_deref(), Some("1.30.1"));
+    }
+
     #[tokio::test]
     async fn an_agent_rootfs_from_another_release_is_refreshed_from_the_binarys_sibling() {
         let directory = tempfile::tempdir().unwrap();
@@ -2366,6 +2419,7 @@ mod tests {
 
         let install = SmolvmInstall {
             prefix: directory.path().join("prefix"),
+            resolved_prefix: directory.path().join("prefix"),
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
             agent_dir: directory.path().join("data"),

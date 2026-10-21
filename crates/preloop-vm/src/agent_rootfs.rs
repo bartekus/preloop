@@ -557,8 +557,11 @@ pub fn exported_rootfs_cached(runtime: &Runtime, binary: Option<&Path>) -> Optio
 /// assets it was computed from.
 pub fn check_cached(runtime: &Runtime, binary: &Path) -> Result<GuardReport, VmError> {
     let fingerprint = inputs_fingerprint(runtime, binary);
+    // A cached verdict was already logged when it was computed; only a fresh
+    // verdict carries a warning to log. Logging the stored one again would
+    // repeat the same line for every boot-capable command.
     let cached = cached_entry(&VERDICT, &fingerprint, |entry| {
-        (entry.fresh_warning.clone(), entry.verdict.clone())
+        (None, entry.verdict.clone())
     });
     let (fresh_warning, verdict) = match cached {
         Some(cached) => cached,
@@ -577,7 +580,6 @@ pub fn check_cached(runtime: &Runtime, binary: &Path) -> Result<GuardReport, VmE
                 Verdict {
                     fingerprint,
                     verdict: verdict.clone(),
-                    fresh_warning: fresh_warning.clone(),
                 },
             );
             (fresh_warning, verdict)
@@ -601,7 +603,6 @@ struct Resolved {
 struct Verdict {
     fingerprint: String,
     verdict: Result<GuardReport, String>,
-    fresh_warning: Option<String>,
 }
 
 /// Last resolution and last verdict, both keyed by [`inputs_fingerprint`].

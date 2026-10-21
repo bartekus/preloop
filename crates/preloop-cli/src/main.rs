@@ -2193,12 +2193,6 @@ async fn cmd_engine(
             tracing::error!("{error}");
             tracing::error!("runner pool disabled until the smolvm guest agent is repaired");
             pool_status.set_mode(preloop_observability::status::PoolMode::Disabled);
-            // The machines this agent left unstoppable are still running:
-            // `machine stop` refuses them, so the hypervisors that could not
-            // be reaped wait for exactly this sweep. The pool's own startup
-            // cleanup is not going to run — it is the thing being disabled —
-            // and the exit backstop only fires when this engine goes away.
-            purge_stuck_vms();
             agent_guard_error = Some(error);
         }
     }
@@ -2252,6 +2246,14 @@ async fn cmd_engine(
     tokio::select! {
         result = &mut server => return result?,
         result = wait_for_engine_socket(&socket, listen) => result?,
+    }
+    // This process now owns the engine socket, so no other engine on this home
+    // is provisioning. The machines the stale agent left unstoppable are still
+    // running: `machine stop` refuses them, and the pool's own startup cleanup
+    // will not run because the pool is disabled. Reap them here, where the
+    // purge cannot race a live engine.
+    if agent_guard_error.is_some() {
+        purge_stuck_vms();
     }
 
     // Every way out of this process — the normal shutdown below, a pool that
