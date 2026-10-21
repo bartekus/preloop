@@ -1129,6 +1129,139 @@ pub(crate) mod suite {
         assert!(backend.artifact_scopes(&[]).await.unwrap().is_empty());
     }
 
+    /// SARIF analyses: the insert is idempotent on `(run_id, dedupe_key)`, a
+    /// replay returns the original analysis with its findings intact, and the
+    /// read paths answer by id, by dedupe slot and by run on both backends.
+    pub(crate) async fn sarif_analyses_roundtrip_and_dedupe(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let findings = vec![
+            SarifFinding {
+                fingerprint: "fp-1".to_owned(),
+                tool_name: "CodeQL".to_owned(),
+                rule_id: Some("js/sql-injection".to_owned()),
+                rule_name: Some("SQL injection".to_owned()),
+                level: "error".to_owned(),
+                message: "Query built from user input".to_owned(),
+                path: Some("src/db.js".to_owned()),
+                start_line: Some(12),
+                end_line: Some(14),
+                start_column: Some(3),
+                end_column: Some(20),
+                partial_fingerprint: Some("partial=1".to_owned()),
+                suppression: None,
+            },
+            SarifFinding {
+                fingerprint: "fp-2".to_owned(),
+                tool_name: "CodeQL".to_owned(),
+                rule_id: Some("js/unused-variable".to_owned()),
+                rule_name: None,
+                level: "note".to_owned(),
+                message: "Unused variable".to_owned(),
+                path: Some("src/util.js".to_owned()),
+                start_line: Some(4),
+                end_line: None,
+                start_column: None,
+                end_column: None,
+                partial_fingerprint: None,
+                suppression: Some("inSource".to_owned()),
+            },
+        ];
+        let analysis = NewSarifAnalysis {
+            analysis_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            run_id,
+            repository: "owner/repo".to_owned(),
+            commit_sha: "abc1234".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            tool_name: "CodeQL".to_owned(),
+            source: SarifAnalysisSource::Github,
+            uploader: "job-1".to_owned(),
+            dedupe_key: "dedupe-1".to_owned(),
+            storage_key: "11111111-1111-4111-8111-111111111111".to_owned(),
+            size_bytes: 512,
+            raw_size_bytes: 4096,
+            finding_count: 2,
+            errors: None,
+            checkout_uri: Some("file:///work/repo".to_owned()),
+            analysis_key: Some("codeql.yml:analyze".to_owned()),
+            environment: Some("{\"language\":\"javascript\"}".to_owned()),
+            started_at: Some("2026-10-21T09:00:00Z".to_owned()),
+        };
+        let (record, inserted) = backend
+            .put_sarif_analysis(analysis.clone(), findings.clone())
+            .await
+            .unwrap();
+        assert!(inserted, "the first upload inserts");
+        assert_eq!(record.analysis_id, analysis.analysis_id);
+        assert_eq!(record.status, SarifAnalysisStatus::Complete);
+        assert_eq!(record.finding_count, 2);
+        assert_eq!(record.size_bytes, 512);
+        assert!(record.completed_at_us.is_some());
+
+        // Re-uploading the same content with a new id/dedupe slot collision
+        // returns the original row and does not duplicate findings.
+        let mut replay = analysis.clone();
+        replay.analysis_id = "22222222-2222-4222-8222-222222222222".to_owned();
+        replay.storage_key = replay.analysis_id.clone();
+        replay.size_bytes = 999;
+        let (replayed, inserted) = backend
+            .put_sarif_analysis(replay, findings.clone())
+            .await
+            .unwrap();
+        assert!(!inserted, "a re-upload dedupes on the content key");
+        assert_eq!(replayed.analysis_id, analysis.analysis_id);
+        assert_eq!(replayed.size_bytes, 512, "the original row wins");
+
+        let by_id = backend
+            .sarif_analysis(&analysis.analysis_id)
+            .await
+            .unwrap()
+            .expect("stored analysis");
+        assert_eq!(by_id.dedupe_key, "dedupe-1");
+        assert_eq!(by_id.uploader, "job-1");
+        assert_eq!(
+            backend
+                .sarif_analysis_by_dedupe(run_id, "dedupe-1")
+                .await
+                .unwrap()
+                .map(|record| record.analysis_id),
+            Some(analysis.analysis_id.clone())
+        );
+        assert!(
+            backend
+                .sarif_analysis_by_dedupe(run_id, "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .sarif_analysis("33333333-3333-4333-8333-333333333333")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let listed = backend.sarif_analyses(run_id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].analysis_id, analysis.analysis_id);
+        assert!(
+            backend
+                .sarif_analyses(RunId::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let stored = backend.sarif_findings(&analysis.analysis_id).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        // `src/db.js` sorts before `src/util.js`.
+        assert_eq!(stored[0].fingerprint, "fp-1");
+        assert_eq!(stored[0].level, "error");
+        assert_eq!(stored[0].start_line, Some(12));
+        assert_eq!(stored[1].fingerprint, "fp-2");
+        assert_eq!(stored[1].suppression.as_deref(), Some("inSource"));
+    }
+
     pub(crate) async fn cancel_run_queues_cancellation(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -8416,6 +8549,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn sarif_analyses_roundtrip_and_dedupe() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::sarif_analyses_roundtrip_and_dedupe(&backend).await;
+    }
+
+    #[tokio::test]
     async fn status_events_are_stamped_with_row_versions() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -9959,6 +10100,12 @@ mod lite {
             .await
             .unwrap();
         backend.claim_expansion().await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn sarif_analyses_roundtrip_and_dedupe() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::sarif_analyses_roundtrip_and_dedupe(&backend).await;
     }
 
     /// Cancelling an already-terminal run must not append a second
