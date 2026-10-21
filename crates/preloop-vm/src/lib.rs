@@ -597,6 +597,23 @@ impl MachineSpec {
     }
 }
 
+/// Whether a pack machine's resolved workload starts systemd as PID 1.
+///
+/// The implicit resolver stub is only useful when the guest actually runs
+/// systemd: `systemd-resolved` is started by the systemd instance that owns
+/// PID 1. The check is the program's file name — the managed default is
+/// `/sbin/init`, and an operator naming the binary explicitly uses `systemd`
+/// (for example `/lib/systemd/systemd --system`). Any other command, such as
+/// `["/bin/sh", "-c", "sleep infinity"]`, cannot answer on the stub, so it
+/// keeps the resolver smolvm would otherwise configure.
+fn workload_init_is_systemd(workload: Option<&[String]>) -> bool {
+    workload
+        .and_then(|command| command.first())
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|program| program.to_str())
+        .is_some_and(|program| matches!(program, "init" | "systemd"))
+}
+
 /// The `--dns` resolver a machine is launched with.
 ///
 /// An explicit [`MachineSpec::dns`] always wins, and a machine with no
@@ -606,7 +623,9 @@ impl MachineSpec {
 /// runner's view: `systemd-resolved` answers `/etc/hosts` names and
 /// synthesizes `.localhost`, so a user-defined network's embedded resolver
 /// (127.0.0.11 forwarding to the host's `/etc/resolv.conf` nameserver) reaches
-/// them.
+/// them. `systemd_workload` is that condition, resolved by
+/// [`workload_init_is_systemd`]: a custom workload that does not start systemd
+/// gets no stub, because nothing would listen on it.
 ///
 /// This flag only reaches the guest on smolvm's TSI backend. With virtio-net
 /// the host overwrites the guest resolver with the network gateway whatever
@@ -620,12 +639,12 @@ pub fn resolved_guest_dns(
     spec_dns: Option<&str>,
     network_enabled: bool,
     backend: &str,
-    workload_init: bool,
+    systemd_workload: bool,
 ) -> Option<String> {
     if let Some(dns) = spec_dns.map(str::trim).filter(|dns| !dns.is_empty()) {
         return Some(dns.to_owned());
     }
-    let want_stub = network_enabled && workload_init && backend == "tsi";
+    let want_stub = network_enabled && systemd_workload && backend == "tsi";
     want_stub.then(|| SYSTEMD_RESOLVED_STUB_DNS.to_owned())
 }
 
@@ -1803,7 +1822,7 @@ impl VmProvider for SmolVmProvider {
                 NetworkPolicy::PublicOnly => public_only_net_backend(self.env_lookup),
                 _ => "tsi",
             },
-            workload_init.is_some(),
+            workload_init_is_systemd(workload_init.as_deref()),
         ) {
             args.extend(["--dns".into(), dns]);
         }
@@ -5405,6 +5424,54 @@ mod tests {
         assert_eq!(
             resolved_guest_dns(Some("  "), true, "virtio-net", true),
             None
+        );
+    }
+
+    /// Only a workload that starts systemd gets the implicit stub: the managed
+    /// `/sbin/init` default and an operator-named `systemd` binary qualify, an
+    /// arbitrary command does not, and anything unrecognized fails closed.
+    #[test]
+    fn the_implicit_stub_requires_a_systemd_workload() {
+        let workload = |command: &[&str]| -> Option<Vec<String>> {
+            Some(command.iter().map(|arg| (*arg).to_owned()).collect())
+        };
+        for command in [&["/sbin/init"][..], &["/lib/systemd/systemd", "--system"][..]] {
+            assert!(
+                workload_init_is_systemd(workload(command).as_deref()),
+                "{command:?}"
+            );
+        }
+        for command in [
+            &["/bin/sh", "-c", "sleep infinity"][..],
+            &["sleep", "infinity"][..],
+            &[""][..],
+        ] {
+            assert!(
+                !workload_init_is_systemd(workload(command).as_deref()),
+                "{command:?}"
+            );
+        }
+        assert!(!workload_init_is_systemd(None));
+        assert!(!workload_init_is_systemd(Some(&[])));
+        assert_eq!(
+            resolved_guest_dns(
+                None,
+                true,
+                "tsi",
+                workload_init_is_systemd(workload(&["/bin/sh", "-c", "sleep infinity"]).as_deref())
+            ),
+            None,
+            "a custom non-systemd workload has nothing answering on the stub"
+        );
+        assert_eq!(
+            resolved_guest_dns(
+                Some("8.8.8.8"),
+                true,
+                "tsi",
+                workload_init_is_systemd(workload(&["/bin/sh"]).as_deref())
+            ),
+            Some("8.8.8.8".to_owned()),
+            "an explicit resolver still wins"
         );
     }
 

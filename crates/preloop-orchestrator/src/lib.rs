@@ -2312,10 +2312,12 @@ pub enum GoldenResiduePolicy {
 /// Opt a custom base into the official image's hosted-runner adaptations.
 ///
 /// The official golden always applies them regardless of this variable. A
-/// custom base applies them only when the operator sets this to a value other
-/// than empty, `0`, or `false`, which is the escape hatch for a custom base
-/// that is itself a cloud VM dump or an image whose systemd/resolver setup is
-/// meant to be replaced by the hosted runner's. Enabling it can drop an
+/// custom base applies them only when the operator sets this to `1`, `true`,
+/// `yes`, or `on` (surrounding whitespace ignored, otherwise case-sensitive).
+/// Every other value, including a typo, keeps the Preserve policy. This is the
+/// escape hatch for a custom base that is itself a cloud VM dump or an image
+/// whose systemd/resolver setup is meant to be replaced by the hosted
+/// runner's. Enabling it can drop an
 /// intentional routable `/etc/hosts` mapping, comment out an `/etc/fstab`
 /// device that is not present at bake time, mask the image's cloud/snap/apt
 /// and `systemd-sysctl` units, change `ping`'s file capability, and replace
