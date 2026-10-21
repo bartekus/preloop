@@ -74,6 +74,35 @@ Releases before v0.27.0 predate the changelog.
   registration state validated at worker startup rather than re-reading
   `.runner` per job.
 
+### Changed
+
+- **Webhook installation-coverage lookups are cached per App.** The receiver
+  called `GET /repos/{owner}/{repo}/installation` on every signed delivery
+  before enqueueing it, so each delivery paid a GitHub API round trip inside
+  the ingress' upload slot and spent one request of the App's rate limit.
+  Only a validated positive is retained, for ten minutes. A definitive 404,
+  timeout, rate limit, 5xx, unparseable body, missing/mismatched `app_id`, or
+  suspended installation denies that delivery without being cached, so the
+  next delivery can discover a new grant immediately. Simultaneous deliveries
+  for one repository share one lookup; unrelated repositories and Apps do not
+  serialize. Signature-verified `installation` and `installation_repositories`
+  events invalidate the signer's affected answers before ordinary gating —
+  deleted/suspended installations clear all of that App's answers, and
+  added/removed repositories are re-confirmed on the next ordinary delivery.
+  Lifecycle payloads never grant access, and a payload's `app_id` is never
+  used in place of the verified signer. The cache is process-local: a
+  lifecycle event missed by a process leaves its positive valid for at most
+  the ten-minute fallback TTL, so this is not immediate distributed
+  revocation. At capacity the oldest checked answer is evicted individually,
+  and setup/doctor installation checks stay uncached.
+- **Webhook processing keeps the verified signer's App identity.** The signer
+  App id is persisted with the durable delivery and pins credential selection
+  throughout that delivery's processing (including its spawned processing task
+  and check-run reporting), so a delivery signed by App B is not processed with
+  another App's installation credentials just because that App sorts first in
+  the registry. Job-runtime token minting remains a separate repository-scoped
+  selection path; this change does not alter it.
+
 ## [0.35.0] - 2026-10-19
 
 ### Security
