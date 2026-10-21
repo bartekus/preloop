@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **CI security gates cover PRs, main, dependencies, and the runner image.**
+  Semgrep runs on every pull request (`p/rust`, `p/github-actions`,
+  `p/secrets`) and fails on findings; CodeQL runs on merge to `main` for
+  Actions and Rust; dependency review blocks high-severity additions; and
+  OpenSSF Scorecard runs weekly. The published runner image is now signed with
+  keyless cosign and has a registry-backed provenance attestation. The golden
+  scan also requires the aarch64 apt SBOM and scans it with Grype, and the
+  main/release-tag rulesets no longer allow an admin bypass or unrestricted
+  tag creation.
+
+
 ## [0.35.5] - 2026-10-21
 
 ### Security
