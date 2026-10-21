@@ -110,42 +110,47 @@ async fn admit_webhook_upload(
     }
 }
 
-/// What the gated body reports to the middleware while it is being read.
-enum UploadEvent {
-    /// A data frame arrived, so the upload is still making progress.
-    Progress,
-    /// The body was read to its end, failed, or was dropped with the request.
-    Complete,
-}
-
 /// Wrap `body` so the middleware can watch the upload it is gating.
 ///
 /// The handler's extractor is what reads the body, so the only way to tell a
 /// progressing upload from a dormant one is to observe the frames it yields:
-/// `Progress` for every data frame, `Complete` at the body's end or error, and
-/// — because the sender is dropped with the body — `Complete` again through
-/// the channel closing when a request is dropped before it is read (a payload
-/// rejected as oversized), so such a request is never timed out on its way
-/// out. Progress is coalesced (`try_send` on a one-slot channel): the
-/// middleware only needs to know that the body moved, not how often. Only data
+/// `progress` for every data frame and `complete` once at the body's end or
+/// error. The two signals are separate on purpose.
+///
+/// Progress is coalesced (`try_send` on a one-slot channel): the middleware
+/// only needs to know that the body moved, not how often, so a chunked or
+/// HTTP/2 upload made of arbitrarily many small frames cannot queue one
+/// allocation per frame.
+///
+/// `complete` is a lossless oneshot because it must never be lost behind a
+/// queued `Progress`: a tiny body emits both before the middleware drains
+/// them, and a dropped `Complete` turns a successful upload into a spurious
+/// 408. It also covers the dropped-request path — the body owns the sender, so
+/// a request dropped before it is read (a payload rejected as oversized)
+/// resolves the oneshot with an error, which the middleware treats as
+/// complete, and such a request is never timed out on its way out. Only data
 /// frames pass through; a webhook delivery carries no trailers, and the
 /// `Bytes` extractor ignores them in any case.
-fn report_upload_events(body: Body, events: tokio::sync::mpsc::Sender<UploadEvent>) -> Body {
+fn report_upload_events(
+    body: Body,
+    progress: tokio::sync::mpsc::Sender<()>,
+    complete: tokio::sync::oneshot::Sender<()>,
+) -> Body {
     use futures::Stream as _;
 
     let mut body = body.into_data_stream();
-    let mut events = Some(events);
+    let mut signals = Some((progress, complete));
     Body::from_stream(stream::poll_fn(move |cx| {
         let next = Pin::new(&mut body).poll_next(cx);
         match &next {
             Poll::Ready(Some(Ok(_))) => {
-                if let Some(events) = &events {
-                    let _ = events.try_send(UploadEvent::Progress);
+                if let Some((progress, _)) = &signals {
+                    let _ = progress.try_send(());
                 }
             }
             Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
-                if let Some(events) = events.take() {
-                    let _ = events.try_send(UploadEvent::Complete);
+                if let Some((_, complete)) = signals.take() {
+                    let _ = complete.send(());
                 }
             }
             Poll::Pending => {}
@@ -171,10 +176,11 @@ async fn limit_webhook_uploads(
 ) -> Result<Response, StatusCode> {
     let _permit = admit_webhook_upload(&gate).await?;
     let (parts, body) = request.into_parts();
-    let (events_tx, mut events) = tokio::sync::mpsc::channel(1);
+    let (progress_tx, mut progress) = tokio::sync::mpsc::channel(1);
+    let (complete_tx, mut complete) = tokio::sync::oneshot::channel();
     let handler = next.run(Request::from_parts(
         parts,
-        report_upload_events(body, events_tx),
+        report_upload_events(body, progress_tx, complete_tx),
     ));
     tokio::pin!(handler);
 
@@ -192,10 +198,15 @@ async fn limit_webhook_uploads(
             () = tokio::time::sleep(gate.idle_budget) => {
                 return Err(StatusCode::REQUEST_TIMEOUT);
             }
-            event = events.recv() => match event {
-                Some(UploadEvent::Progress) => {}
-                Some(UploadEvent::Complete) | None => ingested = true,
-            },
+            // Lossless: the body ended, failed, or was dropped (`Err`).
+            _ = &mut complete => ingested = true,
+            // Coalesced: one slot says the body moved; a closed channel means
+            // the body was dropped before it finished.
+            event = progress.recv() => {
+                if event.is_none() {
+                    ingested = true;
+                }
+            }
         }
     }
     Ok(handler.await)
@@ -1461,6 +1472,42 @@ mod tests {
         let mut gate = WebhookUploadGate::new(MAX_CONCURRENT_WEBHOOK_UPLOADS);
         configure(&mut gate);
         Arc::new(gate)
+    }
+
+    /// Progress is coalesced through a one-slot channel, so arbitrarily many
+    /// small frames cannot queue one allocation each, while `Complete` is
+    /// delivered through its own lossless signal: a body that emits both
+    /// before the middleware drains anything must still report the end of the
+    /// upload.
+    #[tokio::test]
+    async fn upload_events_coalesce_progress_without_losing_complete() {
+        use futures::StreamExt as _;
+
+        let frames = 1024;
+        let body = Body::from_stream(futures::stream::iter(
+            (0..frames).map(|_| Ok::<_, std::io::Error>(Bytes::new())),
+        ));
+        let (progress_tx, mut progress) = tokio::sync::mpsc::channel(1);
+        let (complete_tx, complete) = tokio::sync::oneshot::channel();
+        let gated = report_upload_events(body, progress_tx, complete_tx);
+
+        let drained: Vec<_> = gated.into_data_stream().collect().await;
+        assert_eq!(drained.len(), frames);
+        assert!(drained.iter().all(Result::is_ok));
+        assert_eq!(
+            progress.len(),
+            1,
+            "a one-slot channel must coalesce per-frame progress"
+        );
+        assert!(
+            complete.await.is_ok(),
+            "Complete must not be lost behind queued progress"
+        );
+        assert!(progress.recv().await.is_some());
+        assert!(
+            progress.recv().await.is_none(),
+            "the body drops its senders when it ends"
+        );
     }
 
     /// The upload gate over a stub handler that reads its body, so admission
