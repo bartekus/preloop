@@ -2346,7 +2346,11 @@ fn golden_residue_policy_with(base: &str, opted_in: bool) -> GoldenResiduePolicy
 
 fn clean_cloud_residue_opted_in() -> bool {
     std::env::var(GOLDEN_CLEAN_CLOUD_RESIDUE_ENV)
-        .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false"))
+        .is_ok_and(|value| clean_cloud_residue_enabled(&value))
+}
+
+fn clean_cloud_residue_enabled(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "yes" | "on")
 }
 
 /// Strip the bake host's own mapping out of `/etc/hosts`.
@@ -10505,6 +10509,16 @@ done
             GoldenResiduePolicy::Preserve,
             "residue must never be inferred from an address or hostname"
         );
+    }
+
+    #[test]
+    fn destructive_cleanup_requires_a_documented_positive_opt_in() {
+        for disabled in ["", "0", "false", "off", "no", "typo", "FALSE"] {
+            assert!(!clean_cloud_residue_enabled(disabled), "{disabled}");
+        }
+        for enabled in ["1", "true", "yes", "on", "  true  "] {
+            assert!(clean_cloud_residue_enabled(enabled), "{enabled}");
+        }
     }
 
     /// A custom base's `/etc/hosts` routable alias and its `/etc/fstab` entry

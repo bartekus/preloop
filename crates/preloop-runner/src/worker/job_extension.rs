@@ -826,8 +826,12 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                             .unwrap_or("")
                             .to_string()
                     } else if ref_type.eq_ignore_ascii_case("containerRegistry") {
-                        let image = ref_val.get("image").and_then(|v| v.as_str()).unwrap_or("");
-                        format!("docker://{image}")
+                        ref_val
+                            .get("image")
+                            .and_then(|value| value.as_str())
+                            .filter(|image| !image.is_empty())
+                            .map(|image| format!("docker://{image}"))
+                            .unwrap_or_default()
                     } else if repo_type.eq_ignore_ascii_case("selfRepository") {
                         // v2.336.0 $/ self-repository action reference
                         // (PipelineConstants.SelfRepositoryAlias).

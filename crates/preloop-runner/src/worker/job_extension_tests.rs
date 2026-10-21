@@ -513,6 +513,20 @@ fn container_registry_reference_selects_docker_action() {
 }
 
 #[test]
+fn malformed_container_reference_does_not_dispatch_an_empty_docker_image() {
+    for reference in [
+        serde_json::json!({"type": "containerRegistry"}),
+        serde_json::json!({"type": "containerRegistry", "image": null}),
+        serde_json::json!({"type": "containerRegistry", "image": 7}),
+        serde_json::json!({"type": "containerRegistry", "image": ""}),
+    ] {
+        let steps = [serde_json::json!({"id": "invalid-image", "reference": reference})];
+        let result = build_step_list(&steps, &serde_json::json!({}));
+        assert!(matches!(&result[0].step_type, StepType::Action { uses, .. } if uses.is_empty()));
+    }
+}
+
+#[test]
 fn build_step_list_parses_github_template_token_maps() {
     let steps = vec![serde_json::json!({
         "id": "step1",
