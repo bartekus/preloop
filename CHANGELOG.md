@@ -40,8 +40,9 @@ Releases before v0.27.0 predate the changelog.
   remote could not supply left holes in the object cache. A reused cache
   skipped the connectivity check, so the snapshot could publish a HEAD whose
   trees or blobs no job could read. The submission is now refused with an
-  operator message when HEAD's own history is incomplete. Holes only other
-  branches or tags reach are still published, with those refs left out.
+  operator message when HEAD's own history is incomplete. Holes that only other
+  branches or tags reach are still published, as before; publish skips only refs
+  whose target object is absent.
   Cache deepening also fetches tags, so objects reachable only from a tag are
   recovered.
 
